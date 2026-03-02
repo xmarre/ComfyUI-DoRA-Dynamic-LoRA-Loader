@@ -1,9 +1,12 @@
-from .nodes import DoraDynamicLoraLoader
+from .nodes import DoraPowerLoraLoader
+
+# Tell ComfyUI to load our frontend extension.
+WEB_DIRECTORY = "./web"
 
 NODE_CLASS_MAPPINGS = {
-    "DoRA Dynamic LoRA Loader": DoraDynamicLoraLoader,
+    "DoRA Power LoRA Loader": DoraPowerLoraLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "DoRA Dynamic LoRA Loader": "DoRA Dynamic LoRA Loader (fix OneTrainer/Flux keys)",
+    "DoRA Power LoRA Loader": "DoRA Power LoRA Loader (DoRA + Flux2/OneTrainer key-fix)",
 }
