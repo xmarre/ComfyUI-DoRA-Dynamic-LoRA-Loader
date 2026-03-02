@@ -61,12 +61,7 @@ async function fetchLoras() {
 }
 
 function removeAllWidgets(node) {
-  // Be resilient across ComfyUI/LiteGraph variants.
-  if (!node.widgets) {
-    node.widgets = [];
-    return;
-  }
-  // Some builds don't expose removeWidget; clearing array works.
+  node.widgets = node.widgets || [];
   node.widgets.length = 0;
 }
 
@@ -79,8 +74,9 @@ function makeRowDefaults() {
   };
 }
 
+// Back-compat for old workflows that saved widgets_values.
 function parseRowsFromWidgetValues(widgetsValues) {
-  // Our serialized widgets are:
+  // old serialized layout:
   //   per-row: enabled, name, strengthModel, strengthClip  (4)
   //   globals: stack_enabled, verbose, log_unloaded_keys   (3)
   const vals = Array.isArray(widgetsValues) ? widgetsValues : [];
@@ -88,7 +84,10 @@ function parseRowsFromWidgetValues(widgetsValues) {
   const PER_ROW = 4;
   const rows = [];
 
-  if (vals.length < GLOBALS) return { rows, globals: { stack_enabled: true, verbose: false, log_unloaded_keys: false } };
+  if (vals.length < GLOBALS) {
+    return { rows: [], globals: { stack_enabled: true, verbose: false, log_unloaded_keys: false } };
+  }
+
   const rowsCount = Math.max(0, Math.floor((vals.length - GLOBALS) / PER_ROW));
   let idx = 0;
   for (let i = 0; i < rowsCount; i++) {
@@ -108,127 +107,157 @@ function parseRowsFromWidgetValues(widgetsValues) {
   return { rows, globals };
 }
 
-function normalizeState(state) {
-  const rows = Array.isArray(state?.rows) ? state.rows : [];
-  const globals = state?.globals && typeof state.globals === "object" ? state.globals : {};
+function defaultState() {
   return {
-    rows: rows.length ? rows.map((r) => ({
-      enabled: !!r.enabled,
-      name: typeof r.name === "string" ? r.name : "None",
-      strengthModel: Number.isFinite(+r.strengthModel) ? +r.strengthModel : 1.0,
-      strengthClip: Number.isFinite(+r.strengthClip) ? +r.strengthClip : (Number.isFinite(+r.strengthModel) ? +r.strengthModel : 1.0),
-    })) : [makeRowDefaults()],
+    rows: [makeRowDefaults()],
     globals: {
-      stack_enabled: globals.stack_enabled !== undefined ? !!globals.stack_enabled : true,
-      verbose: globals.verbose !== undefined ? !!globals.verbose : false,
-      log_unloaded_keys: globals.log_unloaded_keys !== undefined ? !!globals.log_unloaded_keys : false,
+      stack_enabled: true,
+      verbose: false,
+      log_unloaded_keys: false,
+      broadcast_auto_scale: true,
+      broadcast_scale: 1.0,
     },
   };
 }
 
-function getStateFromNode(node) {
-  const p = node?.properties?.dora_power_lora;
-  if (p && typeof p === "object") return normalizeState(p);
-  return normalizeState({ rows: [makeRowDefaults()], globals: { stack_enabled: true, verbose: false, log_unloaded_keys: false } });
+function sanitizeState(st) {
+  const s = st && typeof st === "object" ? st : defaultState();
+  const rowsIn = Array.isArray(s.rows) ? s.rows : [];
+  const globalsIn = s.globals && typeof s.globals === "object" ? s.globals : {};
+
+  const rows = rowsIn.length
+    ? rowsIn.map((r) => ({
+        enabled: !!r.enabled,
+        name: typeof r.name === "string" ? r.name : "None",
+        strengthModel: Number.isFinite(+r.strengthModel) ? +r.strengthModel : 1.0,
+        strengthClip: Number.isFinite(+r.strengthClip) ? +r.strengthClip : (Number.isFinite(+r.strengthModel) ? +r.strengthModel : 1.0),
+      }))
+    : [makeRowDefaults()];
+
+  const globals = {
+    stack_enabled: globalsIn.stack_enabled !== undefined ? !!globalsIn.stack_enabled : true,
+    verbose: globalsIn.verbose !== undefined ? !!globalsIn.verbose : false,
+    log_unloaded_keys: globalsIn.log_unloaded_keys !== undefined ? !!globalsIn.log_unloaded_keys : false,
+    broadcast_auto_scale: globalsIn.broadcast_auto_scale !== undefined ? !!globalsIn.broadcast_auto_scale : true,
+    broadcast_scale: Number.isFinite(+globalsIn.broadcast_scale) ? +globalsIn.broadcast_scale : 1.0,
+  };
+
+  return { rows, globals };
 }
 
-function setStateOnNode(node, state) {
-  if (!node.properties) node.properties = {};
-  node.properties.dora_power_lora = normalizeState(state);
+function getState(node) {
+  node.properties = node.properties || {};
+  const st = node.properties.dora_power_lora;
+  return sanitizeState(st);
 }
 
-function noSerialize(widget) {
-  if (!widget) return widget;
-  widget.serialize = false;
+function setState(node, st) {
+  node.properties = node.properties || {};
+  node.properties.dora_power_lora = sanitizeState(st);
+}
+
+function setButtonCallback(widget, cb) {
+  // ComfyUI/LiteGraph variants differ; force callback into the widget object.
+  if (!widget) return;
+  widget.callback = cb;
   widget.options = widget.options || {};
-  widget.options.serialize = false;
-  return widget;
+  widget.options.callback = cb;
 }
 
-function buildUI(node, rows, globals, loraValues) {
+function rebuild(node) {
+  const st = getState(node);
+  const lorasNow = _cachedLoras || ["None"];
+  buildUI(node, st, lorasNow);
+  fetchLoras().then((loras) => {
+    buildUI(node, getState(node), loras);
+    node.setDirtyCanvas(true, true);
+  });
+}
+
+function buildUI(node, state, loraValues) {
+  const st = sanitizeState(state);
+  setState(node, st);
   removeAllWidgets(node);
 
-  node._doraRows = rows || [];
-  node._doraGlobals = globals || { stack_enabled: true, verbose: false, log_unloaded_keys: false };
-  setStateOnNode(node, { rows: node._doraRows, globals: node._doraGlobals });
+  node._doraRows = st.rows;
+  node._doraGlobals = st.globals;
 
   const loras = Array.isArray(loraValues) ? loraValues : ["None"];
 
   // Refresh button (helps if new LoRAs are added without restarting)
-  const wRefresh = node.addWidget("button", "↻ Refresh LoRAs", null, () => {
+  const wRefresh = node.addWidget("button", "refresh_loras", "↻ Refresh LoRAs");
+  setButtonCallback(wRefresh, () => {
     invalidateLorasCache();
-    fetchLoras().then((newList) => {
-      buildUI(node, node._doraRows || [], node._doraGlobals || globals, newList);
-      node.setDirtyCanvas(true, true);
-    });
+    rebuild(node);
   });
-  noSerialize(wRefresh);
+  wRefresh.serialize = false;
 
   // Rows
   node._doraRows.forEach((row, i) => {
     const n = i + 1;
 
-    const wEnabled = node.addWidget("toggle", `LoRA ${n} Enabled`, !!row.enabled, (v) => {
+    const wEnabled = node.addWidget("toggle", `lora_${n}_enabled`, !!row.enabled, (v) => {
       row.enabled = !!v;
-      setStateOnNode(node, { rows: node._doraRows, globals: node._doraGlobals });
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
     });
     wEnabled.label = `LoRA ${n} Enabled`;
-    noSerialize(wEnabled);
 
-    const wName = node.addWidget("combo", `LoRA ${n}`, row.name ?? "None", (v) => {
-      row.name = v;
-      setStateOnNode(node, { rows: node._doraRows, globals: node._doraGlobals });
-    }, {
+    const wName = node.addWidget("combo", `lora_${n}_name`, row.name ?? "None", (v) => (row.name = v), {
       values: loras,
     });
     wName.label = `LoRA ${n}`;
-    noSerialize(wName);
+    // ensure state persists
+    const _origNameCb = wName.callback;
+    wName.callback = (v) => {
+      if (_origNameCb) _origNameCb(v);
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+    };
 
     const wSm = node.addWidget(
       "number",
-      `Strength (Model) ${n}`,
+      `lora_${n}_strength_model`,
       Number.isFinite(row.strengthModel) ? row.strengthModel : 1.0,
       (v) => {
         row.strengthModel = Number(v);
-        setStateOnNode(node, { rows: node._doraRows, globals: node._doraGlobals });
+        setState(node, { rows: node._doraRows, globals: node._doraGlobals });
       },
       { min: -10.0, max: 10.0, step: 0.05 }
     );
     wSm.label = `Strength (Model)`;
-    noSerialize(wSm);
 
     const wSc = node.addWidget(
       "number",
-      `Strength (Clip) ${n}`,
+      `lora_${n}_strength_clip`,
       Number.isFinite(row.strengthClip) ? row.strengthClip : (Number.isFinite(row.strengthModel) ? row.strengthModel : 1.0),
       (v) => {
         row.strengthClip = Number(v);
-        setStateOnNode(node, { rows: node._doraRows, globals: node._doraGlobals });
+        setState(node, { rows: node._doraRows, globals: node._doraGlobals });
       },
       { min: -10.0, max: 10.0, step: 0.05 }
     );
     wSc.label = `Strength (Clip)`;
-    noSerialize(wSc);
 
-    const wRemove = node.addWidget("button", `✖ Remove LoRA ${n}`, null, () => {
+    const wRemove = node.addWidget("button", `lora_${n}_remove`, "✖ Remove");
+    setButtonCallback(wRemove, () => {
       node._doraRows.splice(i, 1);
       if (!node._doraRows.length) node._doraRows.push(makeRowDefaults());
-      setStateOnNode(node, { rows: node._doraRows, globals: node._doraGlobals });
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
       // Rebuild with current cached loras (or "None")
-      buildUI(node, node._doraRows, node._doraGlobals, _cachedLoras || ["None"]);
+      buildUI(node, getState(node), _cachedLoras || ["None"]);
       node.setDirtyCanvas(true, true);
     });
-    noSerialize(wRemove);
+    wRemove.serialize = false;
   });
 
   // Add row button
-  const wAdd = node.addWidget("button", "➕ Add LoRA", null, () => {
+  const wAdd = node.addWidget("button", "add_lora", "➕ Add LoRA");
+  setButtonCallback(wAdd, () => {
     node._doraRows.push(makeRowDefaults());
-    setStateOnNode(node, { rows: node._doraRows, globals: node._doraGlobals });
-    buildUI(node, node._doraRows, node._doraGlobals, _cachedLoras || ["None"]);
+    setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+    buildUI(node, getState(node), _cachedLoras || ["None"]);
     node.setDirtyCanvas(true, true);
   });
-  noSerialize(wAdd);
+  wAdd.serialize = false;
 
   // Globals (serialized)
   const wStackEnabled = node.addWidget(
@@ -237,18 +266,16 @@ function buildUI(node, rows, globals, loraValues) {
     !!node._doraGlobals.stack_enabled,
     (v) => {
       node._doraGlobals.stack_enabled = !!v;
-      setStateOnNode(node, { rows: node._doraRows, globals: node._doraGlobals });
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
     }
   );
   wStackEnabled.label = "Stack Enabled";
-  noSerialize(wStackEnabled);
 
   const wVerbose = node.addWidget("toggle", "verbose", !!node._doraGlobals.verbose, (v) => {
     node._doraGlobals.verbose = !!v;
-    setStateOnNode(node, { rows: node._doraRows, globals: node._doraGlobals });
+    setState(node, { rows: node._doraRows, globals: node._doraGlobals });
   });
   wVerbose.label = "Verbose";
-  noSerialize(wVerbose);
 
   const wLogMissing = node.addWidget(
     "toggle",
@@ -256,11 +283,33 @@ function buildUI(node, rows, globals, loraValues) {
     !!node._doraGlobals.log_unloaded_keys,
     (v) => {
       node._doraGlobals.log_unloaded_keys = !!v;
-      setStateOnNode(node, { rows: node._doraRows, globals: node._doraGlobals });
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
     }
   );
   wLogMissing.label = "Log Unloaded Keys";
-  noSerialize(wLogMissing);
+
+  const wAutoScale = node.addWidget(
+    "toggle",
+    "broadcast_auto_scale",
+    !!node._doraGlobals.broadcast_auto_scale,
+    (v) => {
+      node._doraGlobals.broadcast_auto_scale = !!v;
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+    }
+  );
+  wAutoScale.label = "Auto-scale broadcast (fix pink/NaNs)";
+
+  const wScale = node.addWidget(
+    "number",
+    "broadcast_scale",
+    Number.isFinite(node._doraGlobals.broadcast_scale) ? node._doraGlobals.broadcast_scale : 1.0,
+    (v) => {
+      node._doraGlobals.broadcast_scale = Number(v);
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+    },
+    { min: 0.0, max: 64.0, step: 0.05 }
+  );
+  wScale.label = "Broadcast scale";
 
   // Ensure node is tall enough
   const size = node.computeSize();
@@ -276,59 +325,55 @@ app.registerExtension({
     const origOnNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const r = origOnNodeCreated?.apply(this, arguments);
-      // Default persisted state
-      const state = getStateFromNode(this);
-      buildUI(this, state.rows, state.globals, _cachedLoras || ["None"]);
-      // async populate lora dropdown
-      fetchLoras().then((loras) => {
-        const st = getStateFromNode(this);
-        buildUI(this, st.rows, st.globals, loras);
-        this.setDirtyCanvas(true, true);
-      });
+      rebuild(this);
       return r;
     };
 
     // Make workflow loading safe:
-    // - NEVER allow base configure to try to apply widgets_values (it causes "Widget not found" and aborts workflow load)
-    // - Load/save state via node.properties.dora_power_lora instead of widgets_values.
+    // - NEVER let base configure apply widgets_values to our dynamic widget list.
+    // - Persist state in node.properties.dora_power_lora.
     const origConfigure = nodeType.prototype.configure;
     nodeType.prototype.configure = function (info) {
       try {
-        // 1) Restore state from properties if present (new format)
-        let state = null;
+        // 1) Use new persisted state if present
+        let st = null;
         if (info?.properties?.dora_power_lora) {
-          state = normalizeState(info.properties.dora_power_lora);
-        } else if (Array.isArray(info?.widgets_values)) {
-          // 2) Backward compat: old workflows saved widget values
-          const parsed = parseRowsFromWidgetValues(info.widgets_values);
-          state = normalizeState({ rows: parsed.rows, globals: parsed.globals });
+          st = sanitizeState(info.properties.dora_power_lora);
         } else {
-          state = normalizeState(null);
+          // Back-compat: migrate old widgets_values into properties once.
+          if (Array.isArray(info?.widgets_values) && info.widgets_values.length) {
+            const parsed = parseRowsFromWidgetValues(info.widgets_values);
+            st = sanitizeState({
+              rows: parsed.rows,
+              globals: {
+                ...parsed.globals,
+                // new fields default
+                broadcast_auto_scale: true,
+                broadcast_scale: 1.0,
+              },
+            });
+          } else {
+            st = defaultState();
+          }
         }
-        setStateOnNode(this, state);
+        setState(this, st);
 
-        // Call base configure but strip widgets_values to prevent workflow load aborts.
+        // 2) Call base configure with widgets_values removed so it cannot abort workflow loading.
         if (origConfigure) {
           const safeInfo = info ? { ...info } : info;
-          if (safeInfo) safeInfo.widgets_values = [];
-          origConfigure.call(this, safeInfo);
+          if (safeInfo) delete safeInfo.widgets_values;
+          try {
+            origConfigure.call(this, safeInfo);
+          } catch (_) {}
         }
 
-        // Build UI from restored state
-        buildUI(this, state.rows, state.globals, _cachedLoras || ["None"]);
-
-        // async populate lora dropdown
-        fetchLoras().then((loras) => {
-          const st = getStateFromNode(this);
-          buildUI(this, st.rows, st.globals, loras);
-          this.setDirtyCanvas(true, true);
-        });
+        rebuild(this);
       } catch (e) {
         console.warn(`[${EXT_NAME}] configure failed (swallowed to prevent workflow abort)`, e);
         try {
           if (origConfigure) {
             const safeInfo = info ? { ...info } : info;
-            if (safeInfo) safeInfo.widgets_values = [];
+            if (safeInfo) delete safeInfo.widgets_values;
             origConfigure.call(this, safeInfo);
           }
         } catch (_) {}
@@ -336,15 +381,14 @@ app.registerExtension({
       return this;
     };
 
-    // Ensure future saves don't store widgets_values (we store our state in properties instead).
+    // Ensure saves never include widgets_values (avoids "Widget not found" on future loads).
     const origOnSerialize = nodeType.prototype.onSerialize;
     nodeType.prototype.onSerialize = function (o) {
       try {
         if (origOnSerialize) origOnSerialize.call(this, o);
       } catch (_) {}
       o.properties = o.properties || {};
-      o.properties.dora_power_lora = getStateFromNode(this);
-      // prevent "Widget not found" across versions
+      o.properties.dora_power_lora = getState(this);
       o.widgets_values = [];
     };
   },
