@@ -6,6 +6,7 @@ import comfy.lora
 import comfy.lora_convert
 import comfy.utils
 import folder_paths
+import torch
 
 _LOG = logging.getLogger(__name__)
 
@@ -68,6 +69,30 @@ _BASE_SUFFIXES = [
     ".reshape_weight",
 ]
 
+_SCALEABLE_SUFFIXES = (
+    ".lora_up.weight",
+    ".lora_down.weight",
+    ".lora_A.weight",
+    ".lora_B.weight",
+    ".lora_A.default.weight",
+    ".lora_B.default.weight",
+    "_lora.up.weight",
+    "_lora.down.weight",
+    ".lora.up.weight",
+    ".lora.down.weight",
+    ".lora_linear_layer.up.weight",
+    ".lora_linear_layer.down.weight",
+    ".alpha",
+    ".dora_scale",
+    ".diff",
+    ".diff_b",
+    ".set_weight",
+    ".reshape_weight",
+    # mochi-style (no .weight suffix)
+    ".lora_A",
+    ".lora_B",
+)
+
 
 def _delete_prefix_keys(lora_sd: Dict[str, Any], prefix: str) -> int:
     """
@@ -99,7 +124,7 @@ def _rename_prefix_keys(lora_sd: Dict[str, Any], from_prefix: str, to_prefix: st
     return created
 
 
-def _clone_base_block(lora_sd: Dict[str, Any], from_base: str, to_base: str) -> int:
+def _clone_base_block(lora_sd: Dict[str, Any], from_base: str, to_base: str, scale: float = 1.0) -> int:
     """
     Clone all entries under from_base.* to to_base.* (by prefix), preserving suffixes.
     Returns number of keys created.
@@ -113,7 +138,12 @@ def _clone_base_block(lora_sd: Dict[str, Any], from_base: str, to_base: str) -> 
         nk = to_base + k[len(from_base) :]
         if nk in lora_sd:
             continue
-        lora_sd[nk] = lora_sd[k]
+        v = lora_sd[k]
+        if scale != 1.0 and isinstance(v, torch.Tensor) and k.endswith(_SCALEABLE_SUFFIXES):
+            # clone() to avoid sharing tensor storage across many broadcasted keys
+            lora_sd[nk] = (v * scale).clone()
+        else:
+            lora_sd[nk] = v
         created += 1
     return created
 
@@ -171,6 +201,8 @@ def _apply_flux2_onetrainer_dora_compat(
     model,
     model_sd_keys: Optional[Set[str]],
     verbose: bool = False,
+    broadcast_auto_scale: bool = True,
+    broadcast_scale: float = 1.0,
 ) -> None:
     """
     Flux2 / OneTrainer DoRA compat:
@@ -202,6 +234,21 @@ def _apply_flux2_onetrainer_dora_compat(
     if verbose:
         _LOG.info("[DoRA Power LoRA Loader] flux2 compat: inferred blocks: double=%s single=%s", depth, depth_single)
 
+    # Broadcasting the same LoRA onto many per-block targets can easily blow up (pink output / NaNs).
+    # Auto-scale reduces the per-target delta so total effect is closer to the original "global module" intent.
+    depth_d = max(1, int(depth) or 1)
+    depth_s = max(1, int(depth_single) or 1)
+    scale_d = float(broadcast_scale) / float(depth_d) if broadcast_auto_scale else float(broadcast_scale)
+    scale_s = float(broadcast_scale) / float(depth_s) if broadcast_auto_scale else float(broadcast_scale)
+    if verbose:
+        _LOG.info(
+            "[DoRA Power LoRA Loader] flux2 compat: broadcast scales: double=%s single=%s (auto=%s base=%s)",
+            scale_d,
+            scale_s,
+            broadcast_auto_scale,
+            broadcast_scale,
+        )
+
     # 2) Broadcast global modulations if present
     # Source bases from OneTrainer export (the ones you logged as missing).
     src_img = "transformer.double_stream_modulation_img.linear"
@@ -217,7 +264,7 @@ def _apply_flux2_onetrainer_dora_compat(
         created = 0
         for i in range(depth):
             dst = f"transformer.transformer_blocks.{i}.norm1.linear"
-            created += _clone_base_block(lora_sd, src_img, dst)
+            created += _clone_base_block(lora_sd, src_img, dst, scale=scale_d)
         if verbose:
             _LOG.info(
                 "[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> transformer_blocks.*.norm1.linear (keys=%s)",
@@ -231,7 +278,7 @@ def _apply_flux2_onetrainer_dora_compat(
         created = 0
         for i in range(depth):
             dst = f"transformer.transformer_blocks.{i}.norm1_context.linear"
-            created += _clone_base_block(lora_sd, src_txt, dst)
+            created += _clone_base_block(lora_sd, src_txt, dst, scale=scale_d)
         if verbose:
             _LOG.info(
                 "[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> transformer_blocks.*.norm1_context.linear (keys=%s)",
@@ -244,7 +291,7 @@ def _apply_flux2_onetrainer_dora_compat(
         created = 0
         for i in range(depth_single):
             dst = f"transformer.single_transformer_blocks.{i}.norm.linear"
-            created += _clone_base_block(lora_sd, src_single, dst)
+            created += _clone_base_block(lora_sd, src_single, dst, scale=scale_s)
         if verbose:
             _LOG.info(
                 "[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> single_transformer_blocks.*.norm.linear (keys=%s)",
@@ -504,6 +551,8 @@ class DoraPowerLoraLoader:
         strength_clip: float,
         verbose: bool,
         log_unloaded_keys: bool,
+        broadcast_auto_scale: bool,
+        broadcast_scale: float,
         model_sd_keys: Optional[Set[str]],
         model_sd_list: Optional[List[str]],
         clip_sd_keys: Optional[Set[str]],
@@ -529,6 +578,8 @@ class DoraPowerLoraLoader:
                 model=model,
                 model_sd_keys=model_sd_keys,
                 verbose=verbose,
+                broadcast_auto_scale=broadcast_auto_scale,
+                broadcast_scale=broadcast_scale,
             )
 
         # Extract base module names from file keys.
@@ -573,10 +624,35 @@ class DoraPowerLoraLoader:
                 loaded = comfy.lora.load_lora(lora_sd, key_map)
 
         # Apply patches to provided model/clip (already cloned by caller).
+        applied_m = []
+        applied_c = []
         if model is not None:
-            model.add_patches(loaded, strength_model)
+            try:
+                applied_m = model.add_patches(loaded, strength_model) or []
+            except Exception:
+                model.add_patches(loaded, strength_model)
         if clip is not None:
-            clip.add_patches(loaded, strength_clip)
+            try:
+                applied_c = clip.add_patches(loaded, strength_clip) or []
+            except Exception:
+                clip.add_patches(loaded, strength_clip)
+
+        if verbose:
+            def _n(x):
+                try:
+                    return len(x)
+                except Exception:
+                    return 0
+
+            _LOG.info(
+                "[DoRA Power LoRA Loader] %s: patches=%s applied(model)=%s applied(clip)=%s strengths(m/c)=%s/%s",
+                lora_name,
+                _n(loaded),
+                _n(applied_m),
+                _n(applied_c),
+                strength_model,
+                strength_clip,
+            )
 
         return model, clip
 
@@ -585,6 +661,11 @@ class DoraPowerLoraLoader:
         stack_enabled = bool(kwargs.get("stack_enabled", True))
         verbose = bool(kwargs.get("verbose", False))
         log_unloaded_keys = bool(kwargs.get("log_unloaded_keys", False))
+        broadcast_auto_scale = bool(kwargs.get("broadcast_auto_scale", True))
+        try:
+            broadcast_scale = float(kwargs.get("broadcast_scale", 1.0))
+        except Exception:
+            broadcast_scale = 1.0
 
         if not stack_enabled:
             return (model, clip)
@@ -629,6 +710,8 @@ class DoraPowerLoraLoader:
                 strength_clip=sc,
                 verbose=verbose,
                 log_unloaded_keys=log_unloaded_keys,
+                broadcast_auto_scale=broadcast_auto_scale,
+                broadcast_scale=broadcast_scale,
                 model_sd_keys=model_sd_keys,
                 model_sd_list=model_sd_list,
                 clip_sd_keys=clip_sd_keys,
