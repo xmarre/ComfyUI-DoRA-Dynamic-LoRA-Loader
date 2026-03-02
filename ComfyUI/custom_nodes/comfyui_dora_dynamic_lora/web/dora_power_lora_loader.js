@@ -2,9 +2,15 @@ import { app } from "../../scripts/app.js";
 
 const NODE_CLASS = "DoRA Power LoRA Loader";
 const EXT_NAME = "comfyui_dora_dynamic_lora.power_lora_loader";
+const LORA_API = "/dora_dynamic_lora/loras";
 
 let _cachedLoras = null;
 let _cachedLorasPromise = null;
+
+function invalidateLorasCache() {
+  _cachedLoras = null;
+  _cachedLorasPromise = null;
+}
 
 async function fetchLoras() {
   if (_cachedLoras) return _cachedLoras;
@@ -12,21 +18,40 @@ async function fetchLoras() {
 
   _cachedLorasPromise = (async () => {
     try {
-      // Use ComfyUI's object_info endpoint to read the lora dropdown values from the built-in LoraLoader node.
-      const resp = await fetch("/object_info/LoraLoader");
-      const json = await resp.json();
-      const nodeInfo = json?.LoraLoader ?? json?.[Object.keys(json || {})[0]];
-      const spec = nodeInfo?.input?.required?.lora_name;
-      const values = Array.isArray(spec) ? spec[0] : null;
-      const loras = Array.isArray(values) ? values.slice() : [];
-      // Normalize "None"
-      const out = ["None", ...loras.filter((x) => x && x !== "None" && x !== "NONE")];
+      let loras = null;
+
+      // 1) Preferred: our custom backend endpoint (stable across ComfyUI versions).
+      try {
+        const r = await fetch(LORA_API, { cache: "no-store" });
+        if (r.ok) {
+          const j = await r.json();
+          if (Array.isArray(j)) loras = j;
+        }
+      } catch (_) {}
+
+      // 2) Fallback: some builds expose /object_info (all nodes) but not /object_info/<NodeName>
+      if (!Array.isArray(loras)) {
+        try {
+          const r = await fetch("/object_info", { cache: "no-store" });
+          if (r.ok) {
+            const json = await r.json();
+            const nodeInfo = json?.LoraLoader;
+            const spec = nodeInfo?.input?.required?.lora_name;
+            const values = Array.isArray(spec) ? spec[0] : null;
+            if (Array.isArray(values)) loras = values.slice();
+          }
+        } catch (_) {}
+      }
+
+      // Normalize
+      const list = Array.isArray(loras) ? loras : [];
+      const out = ["None", ...list.filter((x) => x && x !== "None" && x !== "NONE")];
       _cachedLoras = out;
       return out;
     } catch (e) {
-      console.warn(`[${EXT_NAME}] Failed to fetch loras via /object_info/LoraLoader`, e);
-      _cachedLoras = ["None"];
-      return _cachedLoras;
+      console.warn(`[${EXT_NAME}] Failed to fetch LoRAs`, e);
+      // Don't permanently cache failure; allow refresh/retry.
+      return ["None"];
     } finally {
       _cachedLorasPromise = null;
     }
@@ -85,6 +110,16 @@ function buildUI(node, rows, globals, loraValues) {
   node._doraGlobals = globals || { stack_enabled: true, verbose: false, log_unloaded_keys: false };
 
   const loras = Array.isArray(loraValues) ? loraValues : ["None"];
+
+  // Refresh button (helps if new LoRAs are added without restarting)
+  const wRefresh = node.addWidget("button", "refresh_loras", "↻ Refresh LoRAs", () => {
+    invalidateLorasCache();
+    fetchLoras().then((newList) => {
+      buildUI(node, node._doraRows || [], node._doraGlobals || globals, newList);
+      node.setDirtyCanvas(true, true);
+    });
+  });
+  wRefresh.serialize = false;
 
   // Rows
   node._doraRows.forEach((row, i) => {
