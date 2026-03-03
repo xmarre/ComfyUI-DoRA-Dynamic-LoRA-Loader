@@ -118,20 +118,32 @@ def _patch_comfy_weight_decompose() -> None:
         cfg["call_i"] = call_i + 1
         do_dbg = bool(cfg.get("dbg", False)) and call_i < int(cfg.get("dbg_n", 30))
 
-        dora_scale_local = comfy.model_management.cast_to_device(dora_scale, weight.device, intermediate_dtype)
+        # IMPORTANT: do DoRA math in fp32 so tiny LoRA deltas don't underflow to 0 in fp16.
+        math_dtype = torch.float32
+        dora_scale_local = comfy.model_management.cast_to_device(dora_scale, weight.device, math_dtype)
 
-        lora_diff_scaled = lora_diff * alpha
-        delta = function(lora_diff_scaled).type(weight.dtype)
-        weight_calc = weight + delta
+        try:
+            a = float(alpha) if not isinstance(alpha, torch.Tensor) else float(alpha.item())
+        except Exception:
+            a = 1.0
 
-        # delta magnitude probe (debug only)
-        delta_abs_max = delta_rms = weight_abs_max = 0.0
-        if do_dbg:
-            d32 = delta.float()
-            w32 = weight.float()
-            delta_abs_max = float(d32.abs().max().item())
-            delta_rms = float((d32.pow(2).mean().sqrt()).item())
-            weight_abs_max = float(w32.abs().max().item())
+        # lora_diff_scaled in fp32
+        lora_diff_scaled = lora_diff.to(device=weight.device, dtype=math_dtype) * a
+
+        # delta in fp32 (do NOT cast to fp16 here)
+        try:
+            delta32 = function(lora_diff_scaled)
+        except Exception:
+            # fallback: keep behavior if some backend insists on fp16, but still measure in fp32
+            delta32 = function(lora_diff_scaled.to(dtype=intermediate_dtype)).to(dtype=math_dtype)
+
+        if not isinstance(delta32, torch.Tensor):
+            delta32 = torch.as_tensor(delta32, device=weight.device, dtype=math_dtype)
+        else:
+            delta32 = delta32.to(device=weight.device, dtype=math_dtype)
+
+        weight32 = weight.to(dtype=math_dtype)
+        weight_calc32 = weight32 + delta32
 
         # swap_scale_shift is applied to delta for adaLN_modulation weights.
         # If dora_scale is in unswapped ordering, apply the same swap so magnitude aligns.
@@ -156,7 +168,7 @@ def _patch_comfy_weight_decompose() -> None:
                     key_hint = ktmp if isinstance(ktmp, str) else ""
                     if ("adaLN_modulation" in key_hint) or ("adaln_modulation" in key_hint.lower()):
                         n0 = int(dora_scale_local.shape[0])
-                        if n0 == int(weight_calc.shape[0]) and (n0 % 2) == 0:
+                        if n0 == int(weight_calc32.shape[0]) and (n0 % 2) == 0:
                             h = n0 // 2
                             if dora_scale_local.ndim == 1:
                                 dora_scale_local = torch.cat([dora_scale_local[h:], dora_scale_local[:h]], dim=0)
@@ -176,7 +188,7 @@ def _patch_comfy_weight_decompose() -> None:
                     need = False
                 else:
                     ds0 = int(dora_scale_local.shape[0]) if hasattr(dora_scale_local, "shape") else -1
-                    need = (ds0 > 0) and (ds0 not in (int(weight_calc.shape[0]), int(weight_calc.shape[1])))
+                    need = (ds0 > 0) and (ds0 not in (int(weight_calc32.shape[0]), int(weight_calc32.shape[1])))
             except Exception:
                 need = False
             if need or do_dbg:
@@ -190,16 +202,16 @@ def _patch_comfy_weight_decompose() -> None:
                         b = int(b)
                         ds_len = int(dora_scale_local.shape[0])
                         if 0 <= a < b <= ds_len:
-                            if (b - a) == int(weight_calc.shape[0]):
+                            if (b - a) == int(weight_calc32.shape[0]):
                                 dora_scale_local = dora_scale_local[a:b]
-                            elif (b - a) == int(weight_calc.shape[1]):
+                            elif (b - a) == int(weight_calc32.shape[1]):
                                 dora_scale_local = dora_scale_local[a:b]
                     except Exception:
                         pass
 
-        wd_on_output_axis = int(dora_scale_local.shape[0]) == int(weight_calc.shape[0])
+        wd_on_output_axis = int(dora_scale_local.shape[0]) == int(weight_calc32.shape[0])
 
-        wc32 = weight_calc.float()
+        wc32 = weight_calc32
         if wd_on_output_axis:
             weight_norm = (
                 wc32.reshape(wc32.shape[0], -1)
@@ -216,26 +228,37 @@ def _patch_comfy_weight_decompose() -> None:
             )
 
         weight_norm = weight_norm + torch.finfo(torch.float32).eps
-        scale32 = dora_scale_local.float() / weight_norm
+        scale32 = dora_scale_local / weight_norm
+
+        weight_dora32 = weight_calc32 * scale32
 
         if do_dbg:
             try:
+                ld_max = float(lora_diff_scaled.abs().max().item())
+                ld_rms = float((lora_diff_scaled.pow(2).mean().sqrt()).item())
+                d_max = float(delta32.abs().max().item())
+                d_rms = float((delta32.pow(2).mean().sqrt()).item())
+                w_max = float(weight32.abs().max().item())
+                upd_max = float((weight_dora32 - weight32).abs().max().item())
                 _LOG.warning(
                     "[DoRA Power LoRA Loader] DoRA dbg[%d] key=%r off=%r axis=%s w=%s ds=%s alpha=%g strength=%g "
-                    "delta(max/rms)=%g/%g w(max)=%g delta/w=%g "
+                    "lora_diff(max/rms)=%g/%g delta(max/rms)=%g/%g update(max)=%g w(max)=%g delta/w=%g "
                     "norm(min/max)=%g/%g scale(max)=%g wc(max)=%g caller=%s",
                     call_i,
                     key_ctx,
                     off_ctx,
                     ("out" if wd_on_output_axis else "in"),
-                    tuple(weight_calc.shape),
+                    tuple(weight_calc32.shape),
                     tuple(dora_scale_local.shape),
-                    float(alpha),
+                    float(a),
                     float(strength) if not isinstance(strength, torch.Tensor) else float(strength.item()),
-                    delta_abs_max,
-                    delta_rms,
-                    weight_abs_max,
-                    (delta_abs_max / max(weight_abs_max, 1e-12)),
+                    ld_max,
+                    ld_rms,
+                    d_max,
+                    d_rms,
+                    upd_max,
+                    w_max,
+                    (d_max / max(w_max, 1e-12)),
                     float(weight_norm.min().item()),
                     float(weight_norm.max().item()),
                     float(scale32.abs().max().item()),
@@ -245,16 +268,15 @@ def _patch_comfy_weight_decompose() -> None:
             except Exception:
                 pass
 
-        weight_calc = weight_calc * scale32.type(weight_calc.dtype)
-
         try:
-            s = float(strength)
+            s = float(strength) if not isinstance(strength, torch.Tensor) else float(strength.item())
         except Exception:
             s = 1.0
         if s != 1.0:
-            weight[:] = weight + s * (weight_calc - weight)
+            out32 = weight32 + s * (weight_dora32 - weight32)
         else:
-            weight[:] = weight_calc
+            out32 = weight_dora32
+        weight[:] = out32.to(dtype=weight.dtype)
         return weight
 
     wa_base.weight_decompose = weight_decompose_fixed
