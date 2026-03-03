@@ -83,47 +83,62 @@ function parseRowsFromWidgetValues(widgetsValues) {
   //               dora_decompose_debug_stack_depth, dora_slice_fix (7)
   const vals = Array.isArray(widgetsValues) ? widgetsValues : [];
   const PER_ROW = 4;
-  const rows = [];
 
-  const pickGlobalCount = (arrLen) => {
-    // Prefer richer layout when divisible; otherwise fall back to original 3-globals layout.
-    if (arrLen >= 7 && (arrLen - 7) % PER_ROW === 0) return 7;
-    if (arrLen >= 3 && (arrLen - 3) % PER_ROW === 0) return 3;
-    // Last-resort back-compat for malformed saves.
-    return arrLen >= 3 ? 3 : 0;
+  const parseWithGlobals = (GLOBALS) => {
+    if (vals.length < GLOBALS) return null;
+    if ((vals.length - GLOBALS) % PER_ROW !== 0) return null;
+
+    const outRows = [];
+    let idx = 0;
+    const rowsCount = Math.max(0, Math.floor((vals.length - GLOBALS) / PER_ROW));
+    for (let i = 0; i < rowsCount; i++) {
+      const r = makeRowDefaults();
+      r.enabled = Boolean(vals[idx++]);
+      const nm = vals[idx++];
+      r.name = typeof nm === "string" ? nm : (nm ?? "None");
+      const sm = Number(vals[idx++]);
+      const sc = Number(vals[idx++]);
+      r.strengthModel = sm;
+      r.strengthClip = sc;
+      outRows.push(r);
+    }
+
+    const globals = {
+      stack_enabled: Boolean(vals[idx++]),
+      verbose: Boolean(vals[idx++]),
+      log_unloaded_keys: Boolean(vals[idx++]),
+    };
+
+    if (GLOBALS >= 7) {
+      globals.dora_decompose_debug = Boolean(vals[idx++]);
+      globals.dora_decompose_debug_n = Number(vals[idx++]);
+      globals.dora_decompose_debug_stack_depth = Number(vals[idx++]);
+      globals.dora_slice_fix = Boolean(vals[idx++]);
+      globals.dora_adaln_swap_fix = true; // legacy widgets_values never had this; default to on
+    }
+
+    return { rows: outRows, globals };
   };
 
-  const GLOBALS = pickGlobalCount(vals.length);
-  if (GLOBALS === 0) {
-    return { rows: [], globals: { stack_enabled: true, verbose: false, log_unloaded_keys: false } };
-  }
-
-  const rowsCount = Math.max(0, Math.floor((vals.length - GLOBALS) / PER_ROW));
-  let idx = 0;
-  for (let i = 0; i < rowsCount; i++) {
-    const r = makeRowDefaults();
-    r.enabled = Boolean(vals[idx++]);
-    r.name = typeof vals[idx] === "string" ? vals[idx] : (vals[idx] ?? "None");
-    idx++;
-    r.strengthModel = Number(vals[idx++]);
-    r.strengthClip = Number(vals[idx++]);
-    rows.push(r);
-  }
-
-  const globals = {
-    stack_enabled: Boolean(vals[idx++]),
-    verbose: Boolean(vals[idx++]),
-    log_unloaded_keys: Boolean(vals[idx++]),
+  const looksValid = (parsed) => {
+    if (!parsed) return false;
+    if (parsed.rows && parsed.rows.length) {
+      const r0 = parsed.rows[0];
+      if (typeof r0.name !== "string") return false;
+      if (!Number.isFinite(+r0.strengthModel)) return false;
+      if (!Number.isFinite(+r0.strengthClip)) return false;
+    }
+    return true;
   };
 
-  if (GLOBALS >= 7) {
-    globals.dora_decompose_debug = Boolean(vals[idx++]);
-    globals.dora_decompose_debug_n = Number(vals[idx++]);
-    globals.dora_decompose_debug_stack_depth = Number(vals[idx++]);
-    globals.dora_slice_fix = Boolean(vals[idx++]);
-  }
+  // Prefer v1 when ambiguous (e.g. len=7 can be one-row v1 or zero-row v2).
+  const v1 = parseWithGlobals(3);
+  if (looksValid(v1)) return v1;
 
-  return { rows, globals };
+  const v2 = parseWithGlobals(7);
+  if (looksValid(v2)) return v2;
+
+  return { rows: [], globals: { stack_enabled: true, verbose: false, log_unloaded_keys: false } };
 }
 
 function defaultState() {
@@ -141,6 +156,7 @@ function defaultState() {
       dora_decompose_debug_n: 30,
       dora_decompose_debug_stack_depth: 10,
       dora_slice_fix: true,
+      dora_adaln_swap_fix: true,
     },
   };
 }
@@ -173,6 +189,7 @@ function sanitizeState(st) {
       ? Math.max(2, Math.min(64, Math.floor(+globalsIn.dora_decompose_debug_stack_depth)))
       : 10,
     dora_slice_fix: globalsIn.dora_slice_fix !== undefined ? !!globalsIn.dora_slice_fix : true,
+    dora_adaln_swap_fix: globalsIn.dora_adaln_swap_fix !== undefined ? !!globalsIn.dora_adaln_swap_fix : true,
   };
 
   return { rows, globals };
@@ -377,6 +394,17 @@ function buildUI(node, state, loraValues) {
     }
   );
   wDoraSliceFix.label = "DoRA slice-fix for offset patches (Flux2)";
+
+  const wDoraAdaLNSwap = node.addWidget(
+    "toggle",
+    "dora_adaln_swap_fix",
+    !!node._doraGlobals.dora_adaln_swap_fix,
+    (v) => {
+      node._doraGlobals.dora_adaln_swap_fix = !!v;
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+    }
+  );
+  wDoraAdaLNSwap.label = "DoRA adaLN swap_scale_shift fix";
 
   const wDoraDbg = node.addWidget(
     "toggle",
