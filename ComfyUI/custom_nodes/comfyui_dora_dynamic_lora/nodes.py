@@ -121,7 +121,17 @@ def _patch_comfy_weight_decompose() -> None:
         dora_scale_local = comfy.model_management.cast_to_device(dora_scale, weight.device, intermediate_dtype)
 
         lora_diff_scaled = lora_diff * alpha
-        weight_calc = weight + function(lora_diff_scaled).type(weight.dtype)
+        delta = function(lora_diff_scaled).type(weight.dtype)
+        weight_calc = weight + delta
+
+        # delta magnitude probe (debug only)
+        delta_abs_max = delta_rms = weight_abs_max = 0.0
+        if do_dbg:
+            d32 = delta.float()
+            w32 = weight.float()
+            delta_abs_max = float(d32.abs().max().item())
+            delta_rms = float((d32.pow(2).mean().sqrt()).item())
+            weight_abs_max = float(w32.abs().max().item())
 
         # swap_scale_shift is applied to delta for adaLN_modulation weights.
         # If dora_scale is in unswapped ordering, apply the same swap so magnitude aligns.
@@ -212,6 +222,7 @@ def _patch_comfy_weight_decompose() -> None:
             try:
                 _LOG.warning(
                     "[DoRA Power LoRA Loader] DoRA dbg[%d] key=%r off=%r axis=%s w=%s ds=%s alpha=%g strength=%g "
+                    "delta(max/rms)=%g/%g w(max)=%g delta/w=%g "
                     "norm(min/max)=%g/%g scale(max)=%g wc(max)=%g caller=%s",
                     call_i,
                     key_ctx,
@@ -221,6 +232,10 @@ def _patch_comfy_weight_decompose() -> None:
                     tuple(dora_scale_local.shape),
                     float(alpha),
                     float(strength) if not isinstance(strength, torch.Tensor) else float(strength.item()),
+                    delta_abs_max,
+                    delta_rms,
+                    weight_abs_max,
+                    (delta_abs_max / max(weight_abs_max, 1e-12)),
                     float(weight_norm.min().item()),
                     float(weight_norm.max().item()),
                     float(scale32.abs().max().item()),
@@ -1164,6 +1179,10 @@ class DoraPowerLoraLoader:
             # Older ComfyUI builds may not expose safe_load kwarg
             lora_sd = comfy.utils.load_torch_file(lora_path)
         lora_sd = comfy.lora_convert.convert_lora(lora_sd)
+
+        if verbose:
+            n_dora = sum(1 for k in lora_sd.keys() if str(k).endswith(".dora_scale"))
+            _LOG.info("[DoRA Power LoRA Loader] %s: dora_scale keys=%d total_keys=%d", lora_name, n_dora, len(lora_sd))
 
         _log_lora_tensor_health(lora_name, lora_sd, verbose=verbose)
 
