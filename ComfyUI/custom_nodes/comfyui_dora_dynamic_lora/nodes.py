@@ -13,15 +13,46 @@ import torch
 
 _LOG = logging.getLogger(__name__)
 
+# --------------------------------------------------------------------------------------
+# DoRA decompose debug config (set per-node run via kwargs)
+# --------------------------------------------------------------------------------------
+
+_DORA_DECOMP_CFG: Dict[str, Any] = {
+    "dbg": False,
+    "dbg_n": 30,
+    "dbg_stack": 10,
+    "slice_fix": True,
+    "call_i": 0,
+}
+
+
+def _set_dora_decomp_cfg(*, dbg: bool, dbg_n: int, dbg_stack: int, slice_fix: bool) -> None:
+    _DORA_DECOMP_CFG["dbg"] = bool(dbg)
+    try:
+        _DORA_DECOMP_CFG["dbg_n"] = max(0, int(dbg_n))
+    except Exception:
+        _DORA_DECOMP_CFG["dbg_n"] = 30
+    try:
+        _DORA_DECOMP_CFG["dbg_stack"] = max(2, min(64, int(dbg_stack)))
+    except Exception:
+        _DORA_DECOMP_CFG["dbg_stack"] = 10
+    _DORA_DECOMP_CFG["slice_fix"] = bool(slice_fix)
+    # reset counter each time node runs (so logs are deterministic)
+    _DORA_DECOMP_CFG["call_i"] = 0
+
 
 def _patch_comfy_weight_decompose() -> None:
-    """Patch ComfyUI DoRA normalization to use norm(V) where V = W0 + alpha*delta."""
+    """
+    Patch ComfyUI DoRA normalization to:
+      - normalize using norm(V) where V = W0 + alpha*delta (DoRA definition)
+      - slice dora_scale for sliced qkv offsets (common in Flux2) to prevent axis mismatch blow-ups
+      - emit debug logs controlled from node settings (no env vars)
+    """
     try:
         import comfy.weight_adapter.base as wa_base  # lazy import (avoid load-order issues)
     except Exception:
         return
 
-    # already patched?
     if getattr(wa_base, "_dora_weight_decompose_patched_by_dora_loader", False):
         return
 
@@ -29,24 +60,40 @@ def _patch_comfy_weight_decompose() -> None:
     if orig is None:
         return
 
-    # keep original around for debugging / potential rollback
     if not hasattr(wa_base, "_dora_weight_decompose_orig_by_dora_loader"):
         wa_base._dora_weight_decompose_orig_by_dora_loader = orig
 
+    def _find_ctx(max_depth: int):
+        """
+        Try to recover (key, offset) from adapter stack frames without inspect.stack().
+        LoRAAdapter.calculate_weight commonly has locals: key, offset.
+        """
+        key = None
+        offset = None
+        caller = None
+        try:
+            f = sys._getframe(2)
+        except Exception:
+            f = None
+        depth = 0
+        while f is not None and depth < max_depth:
+            loc = getattr(f, "f_locals", {}) or {}
+            if caller is None:
+                caller = f"{getattr(f, 'f_code', None).co_filename if getattr(f, 'f_code', None) else '?'}:{getattr(f, 'f_lineno', -1)}:{getattr(getattr(f, 'f_code', None), 'co_name', '?')}"
+            if key is None and "key" in loc:
+                key = loc.get("key")
+            if offset is None and "offset" in loc:
+                offset = loc.get("offset")
+            if key is not None and offset is not None:
+                break
+            f = getattr(f, "f_back", None)
+            depth += 1
+        return key, offset, caller
+
     def weight_decompose_fixed(*args, **kwargs):
-        # one-shot runtime confirmation that this path is actually being used
         if not getattr(wa_base, "_dora_weight_decompose_first_call_logged", False):
             wa_base._dora_weight_decompose_first_call_logged = True
             _LOG.warning("[DoRA Power LoRA Loader] weight_decompose_fixed invoked (DoRA normalization patch active).")
-
-        # Support:
-        #  - fully positional: (dora_scale, weight, lora_diff, alpha, strength, intermediate_dtype, function)
-        #  - fully keyword
-        #  - mixed: first 4 required positionals, rest via kwargs (common pattern)
-        dora_scale = None
-        weight = None
-        lora_diff = None
-        alpha = None
 
         if len(args) >= 4:
             dora_scale, weight, lora_diff, alpha = args[:4]
@@ -55,25 +102,57 @@ def _patch_comfy_weight_decompose() -> None:
             weight = kwargs.get("weight")
             lora_diff = kwargs.get("lora_diff")
             alpha = kwargs.get("alpha")
-
         if dora_scale is None or weight is None or lora_diff is None or alpha is None:
             raise TypeError("weight_decompose_fixed missing required arguments (dora_scale, weight, lora_diff, alpha)")
 
-        # remaining args (optional) can be positional 4.. or kwargs
         strength = args[4] if len(args) >= 5 else kwargs.get("strength", 1.0)
         intermediate_dtype = args[5] if len(args) >= 6 else kwargs.get("intermediate_dtype", getattr(weight, "dtype", torch.float32))
         function = args[6] if len(args) >= 7 else kwargs.get("function")
         if function is None:
             raise TypeError("weight_decompose_fixed missing required argument 'function'")
 
-        # cast magnitude vector to device/dtype used for intermediate math
+        cfg = _DORA_DECOMP_CFG
+        call_i = int(cfg.get("call_i", 0))
+        cfg["call_i"] = call_i + 1
+        do_dbg = bool(cfg.get("dbg", False)) and call_i < int(cfg.get("dbg_n", 30))
+
         dora_scale_local = comfy.model_management.cast_to_device(dora_scale, weight.device, intermediate_dtype)
 
         lora_diff_scaled = lora_diff * alpha
         weight_calc = weight + function(lora_diff_scaled).type(weight.dtype)
 
-        wd_on_output_axis = dora_scale_local.shape[0] == weight_calc.shape[0]
-        # compute norms in fp32 for stability
+        key_ctx = None
+        off_ctx = None
+        caller_ctx = None
+        if bool(cfg.get("slice_fix", True)):
+            try:
+                if hasattr(dora_scale_local, "ndim") and int(dora_scale_local.ndim) != 1:
+                    need = False
+                else:
+                    ds0 = int(dora_scale_local.shape[0]) if hasattr(dora_scale_local, "shape") else -1
+                    need = (ds0 > 0) and (ds0 not in (int(weight_calc.shape[0]), int(weight_calc.shape[1])))
+            except Exception:
+                need = False
+            if need or do_dbg:
+                key_ctx, off_ctx, caller_ctx = _find_ctx(int(cfg.get("dbg_stack", 10)))
+                if do_dbg and need and (off_ctx is None):
+                    _LOG.warning("[DoRA Power LoRA Loader] DoRA dbg[%d] slice-fix needed but offset not found (key=%r).", call_i, key_ctx)
+                if isinstance(off_ctx, tuple) and len(off_ctx) >= 2 and dora_scale_local is not None and hasattr(dora_scale_local, "shape"):
+                    a, b = off_ctx[0], off_ctx[1]
+                    try:
+                        a = int(a)
+                        b = int(b)
+                        ds_len = int(dora_scale_local.shape[0])
+                        if 0 <= a < b <= ds_len:
+                            if (b - a) == int(weight_calc.shape[0]):
+                                dora_scale_local = dora_scale_local[a:b]
+                            elif (b - a) == int(weight_calc.shape[1]):
+                                dora_scale_local = dora_scale_local[a:b]
+                    except Exception:
+                        pass
+
+        wd_on_output_axis = int(dora_scale_local.shape[0]) == int(weight_calc.shape[0])
+
         wc32 = weight_calc.float()
         if wd_on_output_axis:
             weight_norm = (
@@ -92,15 +171,36 @@ def _patch_comfy_weight_decompose() -> None:
 
         weight_norm = weight_norm + torch.finfo(torch.float32).eps
         scale32 = dora_scale_local.float() / weight_norm
+
+        if do_dbg:
+            try:
+                _LOG.warning(
+                    "[DoRA Power LoRA Loader] DoRA dbg[%d] key=%r off=%r axis=%s w=%s ds=%s alpha=%g strength=%g "
+                    "norm(min/max)=%g/%g scale(max)=%g wc(max)=%g caller=%s",
+                    call_i,
+                    key_ctx,
+                    off_ctx,
+                    ("out" if wd_on_output_axis else "in"),
+                    tuple(weight_calc.shape),
+                    tuple(dora_scale_local.shape),
+                    float(alpha),
+                    float(strength) if not isinstance(strength, torch.Tensor) else float(strength.item()),
+                    float(weight_norm.min().item()),
+                    float(weight_norm.max().item()),
+                    float(scale32.abs().max().item()),
+                    float(wc32.abs().max().item()),
+                    caller_ctx,
+                )
+            except Exception:
+                pass
+
         weight_calc = weight_calc * scale32.type(weight_calc.dtype)
 
-        # ALWAYS write in-place (some call sites ignore return value)
         try:
             s = float(strength)
         except Exception:
             s = 1.0
         if s != 1.0:
-            # lerp: W <- (1-s)*W + s*W_dora
             weight[:] = weight + s * (weight_calc - weight)
         else:
             weight[:] = weight_calc
@@ -108,11 +208,8 @@ def _patch_comfy_weight_decompose() -> None:
 
     wa_base.weight_decompose = weight_decompose_fixed
     wa_base._dora_weight_decompose_patched_by_dora_loader = True
-    _LOG.warning("[DoRA Power LoRA Loader] patched ComfyUI weight_decompose for correct DoRA normalization (norm(V)).")
+    _LOG.warning("[DoRA Power LoRA Loader] patched ComfyUI weight_decompose for correct DoRA normalization (norm(V) + slice fix).")
 
-    # ALSO patch any modules that previously imported the original by value:
-    #   from comfy.weight_adapter.base import weight_decompose
-    # Those references won't see wa_base.weight_decompose changes.
     patched_refs = 0
     for m in list(sys.modules.values()):
         if m is None:
@@ -970,7 +1067,17 @@ class DoraPowerLoraLoader:
                 "clip": ("CLIP",),
             },
             # Dynamic/stack inputs injected by the JS UI (and/or by other frontends).
-            "optional": FlexibleOptionalInputType(any_type),
+            "optional": FlexibleOptionalInputType(
+                any_type,
+                data={
+                    # DoRA decompose debugging (node-adjustable)
+                    "dora_decompose_debug": ("BOOLEAN", {"default": False}),
+                    "dora_decompose_debug_n": ("INT", {"default": 30, "min": 0, "max": 500, "step": 1}),
+                    "dora_decompose_debug_stack_depth": ("INT", {"default": 10, "min": 2, "max": 64, "step": 1}),
+                    # Slice-aware magnitude fix for offset/sliced patches (recommended ON for Flux2)
+                    "dora_slice_fix": ("BOOLEAN", {"default": True}),
+                },
+            ),
             "hidden": {},
         }
 
@@ -1123,6 +1230,19 @@ class DoraPowerLoraLoader:
             broadcast_scale = float(kwargs.get("broadcast_scale", 1.0))
         except Exception:
             broadcast_scale = 1.0
+
+        # DoRA decompose debug controls (node-adjustable)
+        dora_dbg = bool(kwargs.get("dora_decompose_debug", False))
+        try:
+            dora_dbg_n = int(kwargs.get("dora_decompose_debug_n", 30))
+        except Exception:
+            dora_dbg_n = 30
+        try:
+            dora_dbg_stack = int(kwargs.get("dora_decompose_debug_stack_depth", 10))
+        except Exception:
+            dora_dbg_stack = 10
+        dora_slice_fix = bool(kwargs.get("dora_slice_fix", True))
+        _set_dora_decomp_cfg(dbg=dora_dbg, dbg_n=dora_dbg_n, dbg_stack=dora_dbg_stack, slice_fix=dora_slice_fix)
 
         if not stack_enabled:
             return (model, clip)
