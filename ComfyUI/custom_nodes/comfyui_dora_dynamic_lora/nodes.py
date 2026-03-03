@@ -139,6 +139,70 @@ def _src_has_dora_params(lora_sd: Dict[str, Any], base: str) -> bool:
     return False
 
 
+def _keymap_dest_key(v: Any) -> str:
+    """
+    Normalize a key_map value into a comparable "destination" key so we can dedupe alias bases.
+    key_map values can be:
+      - "some.weight"
+      - ("some.weight", slice_tuple)
+      - ("some.weight", None, patch_fn)
+    """
+    try:
+        if v is None:
+            return "__NONE__"
+        if isinstance(v, tuple) and len(v) > 0:
+            # include slice info when present to avoid merging genuinely distinct sliced mappings
+            dest0 = str(v[0])
+            if dest0.endswith(".weight"):
+                dest0 = dest0[:-7]
+            sl = None
+            if len(v) > 1 and isinstance(v[1], tuple):
+                sl = v[1]
+            return f"{dest0}|{sl}" if sl is not None else str(dest0)
+        dest0 = str(v)
+        if dest0.endswith(".weight"):
+            dest0 = dest0[:-7]
+        return dest0
+    except Exception:
+        return repr(v)
+
+
+def _target_preference(base: str) -> int:
+    """
+    Lower is better. Prefer canonical lora_unet_* bases over diffusion_model.* aliases.
+    """
+    if base.startswith("lora_unet_"):
+        return 0
+    if base.startswith("lora_"):
+        return 1
+    if base.startswith("diffusion_model."):
+        return 2
+    return 3
+
+
+def _dedupe_targets_by_dest(key_map: Dict[str, Any], targets: List[str]) -> List[str]:
+    """
+    Dedupe target bases that map to the same destination in key_map (alias bases).
+    Keep the most preferred base among aliases.
+    Preserve original order as much as possible.
+    """
+    best_for_dest: Dict[str, str] = {}
+    for b in targets:
+        dest = _keymap_dest_key(key_map.get(b))
+        cur = best_for_dest.get(dest)
+        if cur is None or _target_preference(b) < _target_preference(cur):
+            best_for_dest[dest] = b
+
+    chosen = set(best_for_dest.values())
+    out: List[str] = []
+    for b in targets:
+        if b in chosen and b not in out:
+            out.append(b)
+    # ensure preference within the preserved order if multiple kept
+    out.sort(key=lambda x: (_target_preference(x), targets.index(x)))
+    return out
+
+
 def _delete_prefix_keys(lora_sd: Dict[str, Any], prefix: str) -> int:
     """
     Deletes all keys that start with prefix.
@@ -183,6 +247,8 @@ def _clone_base_block(
     created = 0
     prefix = from_base + "."
     keys = list(lora_sd.keys())
+    # If alpha exists, scale ONLY alpha (linear). Otherwise scale only "up" side.
+    has_alpha = any(k.startswith(prefix) and k.endswith(".alpha") for k in keys)
     for k in keys:
         if not k.startswith(prefix):
             continue
@@ -201,7 +267,7 @@ def _clone_base_block(
             if scale != 1.0:
                 if k.endswith(".alpha"):
                     vv = v * scale
-                elif k.endswith(_UP_ONLY_SCALE_SUFFIXES):
+                elif (not has_alpha) and k.endswith(_UP_ONLY_SCALE_SUFFIXES):
                     vv = v * scale
             # Always clone broadcasted tensors to avoid any in-place casts/mutations downstream
             lora_sd[nk] = vv.clone()
@@ -430,6 +496,20 @@ def _apply_flux2_onetrainer_dora_compat(
 
     img_targets, txt_targets, single_targets = _pick_flux2_broadcast_targets(key_map)
 
+    # Dedupe alias bases (e.g. diffusion_model.* and lora_unet_* pointing to the same dest weight)
+    img_targets = _dedupe_targets_by_dest(key_map, img_targets)
+    txt_targets = _dedupe_targets_by_dest(key_map, txt_targets)
+    single_targets = _dedupe_targets_by_dest(key_map, single_targets)
+
+    if verbose:
+        def _dump_targets(name: str, tgs: List[str]):
+            for t in tgs:
+                _LOG.info("[DoRA Power LoRA Loader] flux2 compat: %s target %s -> %r", name, t, key_map.get(t))
+
+        _dump_targets("img", img_targets)
+        _dump_targets("txt", txt_targets)
+        _dump_targets("single", single_targets)
+
     # Helpful debug: print actual targets (not only counts).
     if verbose:
         _LOG.info("[DoRA Power LoRA Loader] flux2 compat: img_targets=%s", img_targets)
@@ -442,11 +522,6 @@ def _apply_flux2_onetrainer_dora_compat(
     suf_single = (
         _BROADCAST_DORA_SUFFIXES if _src_has_dora_params(lora_sd, src_single) else _BROADCAST_DELTA_SUFFIXES
     )
-
-    # If the model actually exposes the global modulation modules, do not broadcast/delete them.
-    img_has_global = any(t == src_img for t in img_targets)
-    txt_has_global = any(t == src_txt for t in txt_targets)
-    single_has_global = any(t == src_single for t in single_targets)
 
     def _scale_for(n: int) -> float:
         if n <= 0:
@@ -478,27 +553,55 @@ def _apply_flux2_onetrainer_dora_compat(
         p = prefix_base + "."
         return any(k.startswith(p) for k in lora_sd.keys())
 
-    if have_img and img_targets and (not img_has_global):
-        if not any(_has_any_base(t) for t in img_targets):
+    # For Flux2: these are typically GLOBAL modulation modules, not per-block.
+    # If we have exactly one unique destination, rename into that canonical base instead of cloning/broadcasting.
+    if have_img and img_targets:
+        if any(_has_any_base(t) for t in img_targets):
+            if verbose:
+                _LOG.info("[DoRA Power LoRA Loader] flux2 compat: img modulation targets already present; dropping source %s", src_img)
+            _delete_prefix_keys(lora_sd, src_img + ".")
+        elif len(img_targets) == 1:
+            dst = img_targets[0]
+            n = _rename_prefix_keys(lora_sd, src_img + ".", dst + ".", delete_from=True)
+            if verbose:
+                _LOG.info("[DoRA Power LoRA Loader] flux2 compat: renamed %s keys %s -> %s", n, src_img, dst)
+        else:
             created = 0
             for dst in img_targets:
                 created += _clone_base_block(lora_sd, src_img, dst, scale=scale_img, allow_suffixes=suf_img)
             if verbose:
                 _LOG.info("[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)", src_img, len(img_targets), created)
-        # Always consume source keys in per-block mode (even if targets already exist).
-        _delete_prefix_keys(lora_sd, src_img + ".")
+            _delete_prefix_keys(lora_sd, src_img + ".")
 
-    if have_txt and txt_targets and (not txt_has_global):
-        if not any(_has_any_base(t) for t in txt_targets):
+    if have_txt and txt_targets:
+        if any(_has_any_base(t) for t in txt_targets):
+            if verbose:
+                _LOG.info("[DoRA Power LoRA Loader] flux2 compat: txt modulation targets already present; dropping source %s", src_txt)
+            _delete_prefix_keys(lora_sd, src_txt + ".")
+        elif len(txt_targets) == 1:
+            dst = txt_targets[0]
+            n = _rename_prefix_keys(lora_sd, src_txt + ".", dst + ".", delete_from=True)
+            if verbose:
+                _LOG.info("[DoRA Power LoRA Loader] flux2 compat: renamed %s keys %s -> %s", n, src_txt, dst)
+        else:
             created = 0
             for dst in txt_targets:
                 created += _clone_base_block(lora_sd, src_txt, dst, scale=scale_txt, allow_suffixes=suf_txt)
             if verbose:
                 _LOG.info("[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)", src_txt, len(txt_targets), created)
-        _delete_prefix_keys(lora_sd, src_txt + ".")
+            _delete_prefix_keys(lora_sd, src_txt + ".")
 
-    if have_single and single_targets and (not single_has_global):
-        if not any(_has_any_base(t) for t in single_targets):
+    if have_single and single_targets:
+        if any(_has_any_base(t) for t in single_targets):
+            if verbose:
+                _LOG.info("[DoRA Power LoRA Loader] flux2 compat: single modulation targets already present; dropping source %s", src_single)
+            _delete_prefix_keys(lora_sd, src_single + ".")
+        elif len(single_targets) == 1:
+            dst = single_targets[0]
+            n = _rename_prefix_keys(lora_sd, src_single + ".", dst + ".", delete_from=True)
+            if verbose:
+                _LOG.info("[DoRA Power LoRA Loader] flux2 compat: renamed %s keys %s -> %s", n, src_single, dst)
+        else:
             created = 0
             for dst in single_targets:
                 created += _clone_base_block(lora_sd, src_single, dst, scale=scale_single, allow_suffixes=suf_single)
@@ -509,7 +612,7 @@ def _apply_flux2_onetrainer_dora_compat(
                     len(single_targets),
                     created,
                 )
-        _delete_prefix_keys(lora_sd, src_single + ".")
+            _delete_prefix_keys(lora_sd, src_single + ".")
 
 
 def _extract_lora_bases(keys: Iterable[str]) -> Set[str]:
