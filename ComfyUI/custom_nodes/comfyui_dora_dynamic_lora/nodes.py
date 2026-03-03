@@ -22,11 +22,12 @@ _DORA_DECOMP_CFG: Dict[str, Any] = {
     "dbg_n": 30,
     "dbg_stack": 10,
     "slice_fix": True,
+    "adaln_swap_fix": True,
     "call_i": 0,
 }
 
 
-def _set_dora_decomp_cfg(*, dbg: bool, dbg_n: int, dbg_stack: int, slice_fix: bool) -> None:
+def _set_dora_decomp_cfg(*, dbg: bool, dbg_n: int, dbg_stack: int, slice_fix: bool, adaln_swap_fix: bool) -> None:
     _DORA_DECOMP_CFG["dbg"] = bool(dbg)
     try:
         _DORA_DECOMP_CFG["dbg_n"] = max(0, int(dbg_n))
@@ -37,6 +38,7 @@ def _set_dora_decomp_cfg(*, dbg: bool, dbg_n: int, dbg_stack: int, slice_fix: bo
     except Exception:
         _DORA_DECOMP_CFG["dbg_stack"] = 10
     _DORA_DECOMP_CFG["slice_fix"] = bool(slice_fix)
+    _DORA_DECOMP_CFG["adaln_swap_fix"] = bool(adaln_swap_fix)
     # reset counter each time node runs (so logs are deterministic)
     _DORA_DECOMP_CFG["call_i"] = 0
 
@@ -120,6 +122,40 @@ def _patch_comfy_weight_decompose() -> None:
 
         lora_diff_scaled = lora_diff * alpha
         weight_calc = weight + function(lora_diff_scaled).type(weight.dtype)
+
+        # swap_scale_shift is applied to delta for adaLN_modulation weights.
+        # If dora_scale is in unswapped ordering, apply the same swap so magnitude aligns.
+        if bool(cfg.get("adaln_swap_fix", True)) and dora_scale_local is not None:
+            try:
+                fn_name = getattr(function, "__name__", "") or ""
+                if "swap_scale_shift" in fn_name:
+                    # Apply the exact same transform Comfy uses for this weight.
+                    ds = dora_scale_local
+                    if ds.ndim == 1:
+                        ds2 = ds[:, None]
+                        ds2 = function(ds2)
+                        ds = ds2[:, 0]
+                    else:
+                        ds = function(ds)
+                    dora_scale_local = ds
+                    if do_dbg:
+                        _LOG.warning("[DoRA Power LoRA Loader] DoRA dbg[%d] applied adaLN swap_scale_shift fix (fn=%s).", call_i, fn_name)
+                else:
+                    # Fallback heuristic for builds where function name isn't preserved.
+                    ktmp, _, _ = _find_ctx(6)
+                    key_hint = ktmp if isinstance(ktmp, str) else ""
+                    if ("adaLN_modulation" in key_hint) or ("adaln_modulation" in key_hint.lower()):
+                        n0 = int(dora_scale_local.shape[0])
+                        if n0 == int(weight_calc.shape[0]) and (n0 % 2) == 0:
+                            h = n0 // 2
+                            if dora_scale_local.ndim == 1:
+                                dora_scale_local = torch.cat([dora_scale_local[h:], dora_scale_local[:h]], dim=0)
+                            else:
+                                dora_scale_local = torch.cat([dora_scale_local[h:, ...], dora_scale_local[:h, ...]], dim=0)
+                            if do_dbg:
+                                _LOG.warning("[DoRA Power LoRA Loader] DoRA dbg[%d] applied adaLN half-swap fallback (N=%d).", call_i, n0)
+            except Exception:
+                pass
 
         key_ctx = None
         off_ctx = None
@@ -672,6 +708,8 @@ def _apply_flux2_onetrainer_dora_compat(
     verbose: bool = False,
     broadcast_auto_scale: bool = True,
     broadcast_scale: float = 1.0,
+    broadcast_modulations: bool = True,
+    broadcast_include_dora_scale: bool = False,
 ) -> None:
     """
     Flux2 / OneTrainer DoRA compat:
@@ -699,6 +737,8 @@ def _apply_flux2_onetrainer_dora_compat(
     # 2) Broadcast global modulations if present (OneTrainer exports globals; ComfyUI expects per-block keys).
     # Choose destinations from the *current* model's key_map rather than hardcoding.
     if not key_map:
+        return
+    if not broadcast_modulations:
         return
 
     src_img = "transformer.double_stream_modulation_img.linear"
@@ -736,12 +776,15 @@ def _apply_flux2_onetrainer_dora_compat(
         _LOG.info("[DoRA Power LoRA Loader] flux2 compat: txt_targets=%s", txt_targets)
         _LOG.info("[DoRA Power LoRA Loader] flux2 compat: single_targets=%s", single_targets)
 
-    # Choose suffix set: if the source base has DoRA params, broadcast them too.
-    suf_img = _BROADCAST_DORA_SUFFIXES if _src_has_dora_params(lora_sd, src_img) else _BROADCAST_DELTA_SUFFIXES
-    suf_txt = _BROADCAST_DORA_SUFFIXES if _src_has_dora_params(lora_sd, src_txt) else _BROADCAST_DELTA_SUFFIXES
-    suf_single = (
-        _BROADCAST_DORA_SUFFIXES if _src_has_dora_params(lora_sd, src_single) else _BROADCAST_DELTA_SUFFIXES
-    )
+    # Choose suffix set: include DoRA magnitude params only when explicitly requested.
+    def _pick_suffixes(src_base: str) -> Tuple[str, ...]:
+        if broadcast_include_dora_scale and _src_has_dora_params(lora_sd, src_base):
+            return _BROADCAST_DORA_SUFFIXES
+        return _BROADCAST_DELTA_SUFFIXES
+
+    suf_img = _pick_suffixes(src_img)
+    suf_txt = _pick_suffixes(src_txt)
+    suf_single = _pick_suffixes(src_single)
 
     def _scale_for(n: int) -> float:
         if n <= 0:
@@ -1070,12 +1113,17 @@ class DoraPowerLoraLoader:
             "optional": FlexibleOptionalInputType(
                 any_type,
                 data={
+                    # Flux2 modulation handling
+                    "broadcast_modulations": ("BOOLEAN", {"default": True}),
+                    "broadcast_include_dora_scale": ("BOOLEAN", {"default": False}),
+
                     # DoRA decompose debugging (node-adjustable)
                     "dora_decompose_debug": ("BOOLEAN", {"default": False}),
                     "dora_decompose_debug_n": ("INT", {"default": 30, "min": 0, "max": 500, "step": 1}),
                     "dora_decompose_debug_stack_depth": ("INT", {"default": 10, "min": 2, "max": 64, "step": 1}),
                     # Slice-aware magnitude fix for offset/sliced patches (recommended ON for Flux2)
                     "dora_slice_fix": ("BOOLEAN", {"default": True}),
+                    "dora_adaln_swap_fix": ("BOOLEAN", {"default": True}),
                 },
             ),
             "hidden": {},
@@ -1097,6 +1145,8 @@ class DoraPowerLoraLoader:
         log_unloaded_keys: bool,
         broadcast_auto_scale: bool,
         broadcast_scale: float,
+        broadcast_modulations: bool,
+        broadcast_include_dora_scale: bool,
         model_is_quantized: bool,
         model_sd_keys: Optional[Set[str]],
         model_sd_list: Optional[List[str]],
@@ -1145,6 +1195,8 @@ class DoraPowerLoraLoader:
                 verbose=verbose,
                 broadcast_auto_scale=broadcast_auto_scale,
                 broadcast_scale=broadcast_scale,
+                broadcast_modulations=broadcast_modulations,
+                broadcast_include_dora_scale=broadcast_include_dora_scale,
             )
 
         # Extract base module names from file keys (after compat rewrites/broadcast).
@@ -1226,6 +1278,8 @@ class DoraPowerLoraLoader:
         verbose = bool(kwargs.get("verbose", False))
         log_unloaded_keys = bool(kwargs.get("log_unloaded_keys", False))
         broadcast_auto_scale = bool(kwargs.get("broadcast_auto_scale", True))
+        broadcast_modulations = bool(kwargs.get("broadcast_modulations", True))
+        broadcast_include_dora_scale = bool(kwargs.get("broadcast_include_dora_scale", False))
         try:
             broadcast_scale = float(kwargs.get("broadcast_scale", 1.0))
         except Exception:
@@ -1242,7 +1296,14 @@ class DoraPowerLoraLoader:
         except Exception:
             dora_dbg_stack = 10
         dora_slice_fix = bool(kwargs.get("dora_slice_fix", True))
-        _set_dora_decomp_cfg(dbg=dora_dbg, dbg_n=dora_dbg_n, dbg_stack=dora_dbg_stack, slice_fix=dora_slice_fix)
+        dora_adaln_swap_fix = bool(kwargs.get("dora_adaln_swap_fix", True))
+        _set_dora_decomp_cfg(
+            dbg=dora_dbg,
+            dbg_n=dora_dbg_n,
+            dbg_stack=dora_dbg_stack,
+            slice_fix=dora_slice_fix,
+            adaln_swap_fix=dora_adaln_swap_fix,
+        )
 
         if not stack_enabled:
             return (model, clip)
@@ -1296,6 +1357,8 @@ class DoraPowerLoraLoader:
                 log_unloaded_keys=log_unloaded_keys,
                 broadcast_auto_scale=broadcast_auto_scale,
                 broadcast_scale=broadcast_scale,
+                broadcast_modulations=broadcast_modulations,
+                broadcast_include_dora_scale=broadcast_include_dora_scale,
                 model_is_quantized=model_is_quantized,
                 model_sd_keys=model_sd_keys,
                 model_sd_list=model_sd_list,
