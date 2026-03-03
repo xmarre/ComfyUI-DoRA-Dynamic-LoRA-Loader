@@ -1,15 +1,118 @@
 import logging
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import comfy.lora
 import comfy.lora_convert
+import comfy.model_management
 import comfy.utils
 import folder_paths
 import torch
 
 _LOG = logging.getLogger(__name__)
+
+
+def _patch_comfy_weight_decompose() -> None:
+    """Patch ComfyUI DoRA normalization to use norm(V) where V = W0 + alpha*delta."""
+    try:
+        import comfy.weight_adapter.base as wa_base  # lazy import (avoid load-order issues)
+    except Exception:
+        return
+
+    # already patched?
+    if getattr(wa_base, "_dora_weight_decompose_patched_by_dora_loader", False):
+        return
+
+    orig = getattr(wa_base, "weight_decompose", None)
+    if orig is None:
+        return
+
+    # keep original around for debugging / potential rollback
+    if not hasattr(wa_base, "_dora_weight_decompose_orig_by_dora_loader"):
+        wa_base._dora_weight_decompose_orig_by_dora_loader = orig
+
+    def weight_decompose_fixed(*args, **kwargs):
+        # one-shot runtime confirmation that this path is actually being used
+        if not getattr(wa_base, "_dora_weight_decompose_first_call_logged", False):
+            wa_base._dora_weight_decompose_first_call_logged = True
+            _LOG.warning("[DoRA Power LoRA Loader] weight_decompose_fixed invoked (DoRA normalization patch active).")
+
+        # support both positional and keyword calling styles
+        if args and len(args) >= 7:
+            dora_scale, weight, lora_diff, alpha, strength, intermediate_dtype, function = args[:7]
+        else:
+            dora_scale = kwargs["dora_scale"]
+            weight = kwargs["weight"]
+            lora_diff = kwargs["lora_diff"]
+            alpha = kwargs["alpha"]
+            strength = kwargs.get("strength", 1.0)
+            intermediate_dtype = kwargs.get("intermediate_dtype", weight.dtype)
+            function = kwargs["function"]
+
+        # cast magnitude vector to device/dtype used for intermediate math
+        dora_scale_local = comfy.model_management.cast_to_device(dora_scale, weight.device, intermediate_dtype)
+
+        lora_diff_scaled = lora_diff * alpha
+        weight_calc = weight + function(lora_diff_scaled).type(weight.dtype)
+
+        wd_on_output_axis = dora_scale_local.shape[0] == weight_calc.shape[0]
+        # compute norms in fp32 for stability
+        wc32 = weight_calc.float()
+        if wd_on_output_axis:
+            weight_norm = (
+                wc32.reshape(wc32.shape[0], -1)
+                .norm(dim=1, keepdim=True)
+                .reshape(wc32.shape[0], *[1] * (wc32.dim() - 1))
+            )
+        else:
+            weight_norm = (
+                wc32.transpose(0, 1)
+                .reshape(wc32.shape[1], -1)
+                .norm(dim=1, keepdim=True)
+                .reshape(wc32.shape[1], *[1] * (wc32.dim() - 1))
+                .transpose(0, 1)
+            )
+
+        weight_norm = weight_norm + torch.finfo(torch.float32).eps
+        scale32 = dora_scale_local.float() / weight_norm
+        weight_calc = weight_calc * scale32.type(weight_calc.dtype)
+
+        # ALWAYS write in-place (some call sites ignore return value)
+        try:
+            s = float(strength)
+        except Exception:
+            s = 1.0
+        if s != 1.0:
+            # lerp: W <- (1-s)*W + s*W_dora
+            weight[:] = weight + s * (weight_calc - weight)
+        else:
+            weight[:] = weight_calc
+        return weight
+
+    wa_base.weight_decompose = weight_decompose_fixed
+    wa_base._dora_weight_decompose_patched_by_dora_loader = True
+    _LOG.warning("[DoRA Power LoRA Loader] patched ComfyUI weight_decompose for correct DoRA normalization (norm(V)).")
+
+    # ALSO patch any modules that previously imported the original by value:
+    #   from comfy.weight_adapter.base import weight_decompose
+    # Those references won't see wa_base.weight_decompose changes.
+    patched_refs = 0
+    for m in list(sys.modules.values()):
+        if m is None:
+            continue
+        try:
+            if getattr(m, "weight_decompose", None) is orig:
+                setattr(m, "weight_decompose", weight_decompose_fixed)
+                patched_refs += 1
+        except Exception:
+            pass
+    if patched_refs:
+        _LOG.warning("[DoRA Power LoRA Loader] patched %d cached weight_decompose references across sys.modules.", patched_refs)
+
+
+_patch_comfy_weight_decompose()
 
 # --------------------------------------------------------------------------------------
 # Flexible optional inputs (Power LoRA Loader-style)
@@ -490,6 +593,11 @@ def _apply_flux2_onetrainer_dora_compat(
     src_txt = "transformer.double_stream_modulation_txt.linear"
     src_single = "transformer.single_stream_modulation.linear"
 
+    # If key_map directly supports the source base, keep source keys untouched.
+    src_img_is_mappable = src_img in key_map
+    src_txt_is_mappable = src_txt in key_map
+    src_single_is_mappable = src_single in key_map
+
     have_img = any(k.startswith(src_img + ".") for k in lora_sd.keys())
     have_txt = any(k.startswith(src_txt + ".") for k in lora_sd.keys())
     have_single = any(k.startswith(src_single + ".") for k in lora_sd.keys())
@@ -555,7 +663,7 @@ def _apply_flux2_onetrainer_dora_compat(
 
     # For Flux2: these are typically GLOBAL modulation modules, not per-block.
     # If we have exactly one unique destination, rename into that canonical base instead of cloning/broadcasting.
-    if have_img and img_targets:
+    if have_img and (not src_img_is_mappable) and img_targets:
         if any(_has_any_base(t) for t in img_targets):
             if verbose:
                 _LOG.info("[DoRA Power LoRA Loader] flux2 compat: img modulation targets already present; dropping source %s", src_img)
@@ -573,7 +681,7 @@ def _apply_flux2_onetrainer_dora_compat(
                 _LOG.info("[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)", src_img, len(img_targets), created)
             _delete_prefix_keys(lora_sd, src_img + ".")
 
-    if have_txt and txt_targets:
+    if have_txt and (not src_txt_is_mappable) and txt_targets:
         if any(_has_any_base(t) for t in txt_targets):
             if verbose:
                 _LOG.info("[DoRA Power LoRA Loader] flux2 compat: txt modulation targets already present; dropping source %s", src_txt)
@@ -591,7 +699,7 @@ def _apply_flux2_onetrainer_dora_compat(
                 _LOG.info("[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)", src_txt, len(txt_targets), created)
             _delete_prefix_keys(lora_sd, src_txt + ".")
 
-    if have_single and single_targets:
+    if have_single and (not src_single_is_mappable) and single_targets:
         if any(_has_any_base(t) for t in single_targets):
             if verbose:
                 _LOG.info("[DoRA Power LoRA Loader] flux2 compat: single modulation targets already present; dropping source %s", src_single)
