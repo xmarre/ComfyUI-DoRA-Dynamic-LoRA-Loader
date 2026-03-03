@@ -1,4 +1,5 @@
 import logging
+import inspect
 import re
 import sys
 from collections.abc import Mapping, Sequence
@@ -297,7 +298,81 @@ def _patch_comfy_weight_decompose() -> None:
         _LOG.warning("[DoRA Power LoRA Loader] patched %d cached weight_decompose references across sys.modules.", patched_refs)
 
 
+def _patch_comfy_lora_calculate_weight_fp32() -> None:
+    """
+    Force fp32 intermediate matmul path inside weight_adapter.lora calculate_weight().
+
+    Some mixed-precision/quantized stacks can flush tiny LoRA products to zero while building
+    lora_diff. Force intermediate_dtype=torch.float32 before lora_diff is computed.
+
+    This patch tries to stay robust across Comfy variants:
+      - if signature has intermediate_dtype, set by position OR kwarg (without double-pass)
+      - otherwise replace any positional torch.dtype argument with torch.float32
+      - patch all adapter classes in comfy.weight_adapter.lora that expose calculate_weight
+    """
+    try:
+        import comfy.weight_adapter.lora as wa_lora
+    except Exception:
+        return
+
+    if getattr(wa_lora, "_dora_loader_patched_calc_weight_fp32", False):
+        return
+
+    patched = 0
+
+    def _wrap_calc(orig):
+        try:
+            sig = inspect.signature(orig)
+            param_names = list(sig.parameters.keys())
+            has_intermediate = "intermediate_dtype" in sig.parameters
+            idx_intermediate = param_names.index("intermediate_dtype") if has_intermediate else -1
+        except Exception:
+            sig = None
+            has_intermediate = False
+            idx_intermediate = -1
+
+        def calculate_weight_fixed(self, *args, **kwargs):
+            a = list(args)
+
+            if has_intermediate and idx_intermediate >= 0:
+                if len(a) > idx_intermediate:
+                    a[idx_intermediate] = torch.float32
+                if len(a) <= idx_intermediate:
+                    kwargs["intermediate_dtype"] = torch.float32
+            else:
+                for i, v in enumerate(a):
+                    if isinstance(v, torch.dtype):
+                        a[i] = torch.float32
+                if sig is not None and "intermediate_dtype" in getattr(sig, "parameters", {}):
+                    kwargs["intermediate_dtype"] = torch.float32
+
+            return orig(self, *a, **kwargs)
+
+        return calculate_weight_fixed
+
+    for _, obj in list(wa_lora.__dict__.items()):
+        try:
+            if not isinstance(obj, type):
+                continue
+            orig = getattr(obj, "calculate_weight", None)
+            if orig is None or not callable(orig):
+                continue
+            setattr(obj, "calculate_weight", _wrap_calc(orig))
+            patched += 1
+        except Exception:
+            continue
+
+    if patched:
+        wa_lora._dora_loader_patched_calc_weight_fp32 = True
+        _LOG.warning(
+            "[DoRA Power LoRA Loader] patched %d weight_adapter.lora calculate_weight() methods: forcing fp32 intermediate_dtype "
+            "(fixes lora_diff flush-to-zero on mixed-precision/quantized models).",
+            patched,
+        )
+
+
 _patch_comfy_weight_decompose()
+_patch_comfy_lora_calculate_weight_fp32()
 
 # --------------------------------------------------------------------------------------
 # Flexible optional inputs (Power LoRA Loader-style)
