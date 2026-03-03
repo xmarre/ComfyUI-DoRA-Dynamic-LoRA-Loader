@@ -1,5 +1,6 @@
 import logging
 import re
+from collections.abc import Mapping, Sequence
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import comfy.lora
@@ -70,6 +71,32 @@ _BASE_SUFFIXES = [
 ]
 
 _SCALEABLE_SUFFIXES = (
+    ".alpha",
+    ".diff",
+    ".diff_b",
+    ".set_weight",
+    ".reshape_weight",
+    # mochi-style (no .weight suffix)
+    ".lora_A",
+    ".lora_B",
+)
+
+# When we need to linearly scale a LoRA's *effect* (delta), scaling BOTH matrices is quadratic.
+# For broadcasts we scale only the "up" side (or alpha when present) to keep scaling linear.
+_UP_ONLY_SCALE_SUFFIXES = (
+    ".lora_up.weight",
+    ".lora_A.weight",
+    ".lora_A.default.weight",
+    "_lora.up.weight",
+    ".lora.up.weight",
+    ".lora_linear_layer.up.weight",
+    # mochi-style (no .weight suffix)
+    ".lora_A",
+)
+
+# Only broadcast true LoRA "delta" parameters.
+# IMPORTANT: do NOT broadcast DoRA-only params like dora_scale / w_norm / b_norm by default.
+_BROADCAST_DELTA_SUFFIXES = (
     ".lora_up.weight",
     ".lora_down.weight",
     ".lora_A.weight",
@@ -82,15 +109,16 @@ _SCALEABLE_SUFFIXES = (
     ".lora.down.weight",
     ".lora_linear_layer.up.weight",
     ".lora_linear_layer.down.weight",
+    # mochi style
+    ".lora_A",
+    ".lora_B",
+    # scalar strength
     ".alpha",
-    ".dora_scale",
+    # some exporters use diff-style deltas
     ".diff",
     ".diff_b",
     ".set_weight",
     ".reshape_weight",
-    # mochi-style (no .weight suffix)
-    ".lora_A",
-    ".lora_B",
 )
 
 
@@ -124,7 +152,13 @@ def _rename_prefix_keys(lora_sd: Dict[str, Any], from_prefix: str, to_prefix: st
     return created
 
 
-def _clone_base_block(lora_sd: Dict[str, Any], from_base: str, to_base: str, scale: float = 1.0) -> int:
+def _clone_base_block(
+    lora_sd: Dict[str, Any],
+    from_base: str,
+    to_base: str,
+    scale: float = 1.0,
+    allow_suffixes: Optional[Tuple[str, ...]] = None,
+) -> int:
     """
     Clone all entries under from_base.* to to_base.* (by prefix), preserving suffixes.
     Returns number of keys created.
@@ -135,17 +169,54 @@ def _clone_base_block(lora_sd: Dict[str, Any], from_base: str, to_base: str, sca
     for k in keys:
         if not k.startswith(prefix):
             continue
+        if allow_suffixes is not None and not k.endswith(allow_suffixes):
+            continue
         nk = to_base + k[len(from_base) :]
         if nk in lora_sd:
             continue
         v = lora_sd[k]
-        if scale != 1.0 and isinstance(v, torch.Tensor) and k.endswith(_SCALEABLE_SUFFIXES):
-            # clone() to avoid sharing tensor storage across many broadcasted keys
-            lora_sd[nk] = (v * scale).clone()
+        if isinstance(v, torch.Tensor):
+            # IMPORTANT:
+            # - Do NOT scale DoRA magnitude vectors (dora_scale). Those are not a delta.
+            # - Do NOT scale BOTH LoRA matrices; that changes strength quadratically.
+            # - Prefer scaling alpha, otherwise scale only the "up" side.
+            vv = v
+            if scale != 1.0:
+                if k.endswith(".alpha"):
+                    vv = v * scale
+                elif k.endswith(_UP_ONLY_SCALE_SUFFIXES):
+                    vv = v * scale
+            # Always clone broadcasted tensors to avoid any in-place casts/mutations downstream
+            lora_sd[nk] = vv.clone()
         else:
             lora_sd[nk] = v
         created += 1
     return created
+
+
+def _pick_flux2_broadcast_targets(key_map: Dict[str, str]) -> Tuple[List[str], List[str], List[str]]:
+    """Derive broadcast destinations from the current model's key_map (Flux2 varies across builds)."""
+    bases = list(key_map.keys())
+
+    def _is_modulation_base(b: str) -> bool:
+        bl = b.lower()
+        return "modulation" in bl or "stream_modulation" in bl
+
+    mods = [b for b in bases if _is_modulation_base(b)]
+    if mods:
+        img = [b for b in mods if "img" in b.lower() or "image" in b.lower()]
+        txt = [b for b in mods if "txt" in b.lower() or "text" in b.lower() or "context" in b.lower()]
+        single = [b for b in mods if "single" in b.lower()]
+        return (sorted(img), sorted(txt), sorted(single))
+
+    # Fallback for Flux2 builds where the modulation layers are exposed under norm/adaln modules.
+    re_img = re.compile(r"^transformer\.transformer_blocks\.\d+\.norm1\.linear$")
+    re_txt = re.compile(r"^transformer\.transformer_blocks\.\d+\.norm1_context\.linear$")
+    re_single = re.compile(r"^transformer\.single_transformer_blocks\.\d+\.norm\.linear$")
+    img = [b for b in bases if re_img.match(b)]
+    txt = [b for b in bases if re_txt.match(b)]
+    single = [b for b in bases if re_single.match(b)]
+    return (sorted(img), sorted(txt), sorted(single))
 
 
 def _infer_flux_block_counts(model_sd_keys: Optional[Set[str]]) -> Tuple[int, int]:
@@ -175,6 +246,105 @@ def _infer_flux_block_counts(model_sd_keys: Optional[Set[str]]) -> Tuple[int, in
     return (max_d + 1 if max_d >= 0 else 0, max_s + 1 if max_s >= 0 else 0)
 
 
+def _state_dict_looks_quantized(sd: Dict[str, Any]) -> bool:
+    """Heuristic: any int8/uint8/float8 tensors in state_dict => quantized/mixed precision build."""
+    float8_dtypes = []
+    for name in (
+        "float8_e4m3fn",
+        "float8_e5m2",
+        "float8_e4m3fnuz",
+        "float8_e5m2fnuz",
+    ):
+        dt = getattr(torch, name, None)
+        if dt is not None:
+            float8_dtypes.append(dt)
+
+    for v in sd.values():
+        if not isinstance(v, torch.Tensor):
+            continue
+        if v.dtype in (torch.int8, torch.uint8):
+            return True
+        if float8_dtypes and v.dtype in tuple(float8_dtypes):
+            return True
+    return False
+
+
+def _iter_tensors(obj: Any, path: str = ""):
+    """Yield (path, tensor) pairs from arbitrary nested objects."""
+    if isinstance(obj, torch.Tensor):
+        yield path, obj
+        return
+    if isinstance(obj, Mapping):
+        for k, v in obj.items():
+            p = f"{path}.{k}" if path else str(k)
+            yield from _iter_tensors(v, p)
+        return
+    if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray)):
+        for i, v in enumerate(obj):
+            p = f"{path}[{i}]"
+            yield from _iter_tensors(v, p)
+        return
+
+
+def _tensor_health_report(tensors: List[Tuple[str, torch.Tensor]], topn: int = 20):
+    nan = []
+    inf = []
+    mags = []
+    for k, t in tensors:
+        try:
+            if torch.isnan(t).any():
+                nan.append(k)
+            if torch.isinf(t).any():
+                inf.append(k)
+            mags.append((k, float(t.detach().abs().max().item())))
+        except Exception:
+            continue
+    mags.sort(key=lambda x: x[1], reverse=True)
+    return nan, inf, mags[:topn]
+
+
+def _log_lora_tensor_health(tag: str, lora_sd: Dict[str, Any], verbose: bool):
+    tensors = [(k, v) for k, v in lora_sd.items() if isinstance(v, torch.Tensor)]
+    nan, inf, top = _tensor_health_report(tensors)
+    if nan or inf:
+        _LOG.warning(
+            "[DoRA Power LoRA Loader] %s: LoRA file contains NaN/Inf (nan=%d inf=%d). This will produce pink.",
+            tag,
+            len(nan),
+            len(inf),
+        )
+        if verbose:
+            for k in nan[:50]:
+                _LOG.warning("[DoRA Power LoRA Loader] %s: NaN key: %s", tag, k)
+            for k in inf[:50]:
+                _LOG.warning("[DoRA Power LoRA Loader] %s: Inf key: %s", tag, k)
+    if verbose and top:
+        _LOG.info("[DoRA Power LoRA Loader] %s: top max|x| in lora_sd:", tag)
+        for k, m in top:
+            _LOG.info("  %12.4g  %s", m, k)
+
+
+def _log_loaded_tensor_health(tag: str, loaded: Any, verbose: bool):
+    tensors = list(_iter_tensors(loaded, path="loaded"))
+    nan, inf, top = _tensor_health_report(tensors)
+    if nan or inf:
+        _LOG.warning(
+            "[DoRA Power LoRA Loader] %s: loaded patches contain NaN/Inf (nan=%d inf=%d). Pink is expected.",
+            tag,
+            len(nan),
+            len(inf),
+        )
+        if verbose:
+            for k in nan[:50]:
+                _LOG.warning("[DoRA Power LoRA Loader] %s: NaN patch path: %s", tag, k)
+            for k in inf[:50]:
+                _LOG.warning("[DoRA Power LoRA Loader] %s: Inf patch path: %s", tag, k)
+    if verbose and top:
+        _LOG.info("[DoRA Power LoRA Loader] %s: top max|x| in loaded patches:", tag)
+        for k, m in top:
+            _LOG.info("  %12.4g  %s", m, k)
+
+
 def _get_unet_config_counts(model) -> Tuple[int, int]:
     """
     Best-effort read of Flux unet_config depth from the live model instance.
@@ -200,6 +370,7 @@ def _apply_flux2_onetrainer_dora_compat(
     lora_sd: Dict[str, Any],
     model,
     model_sd_keys: Optional[Set[str]],
+    key_map: Optional[Dict[str, str]] = None,
     verbose: bool = False,
     broadcast_auto_scale: bool = True,
     broadcast_scale: float = 1.0,
@@ -227,75 +398,88 @@ def _apply_flux2_onetrainer_dora_compat(
         if verbose:
             _LOG.info("[DoRA Power LoRA Loader] flux2 compat: renamed %s keys time_guidance_embed -> time_text_embed", n)
 
-    # Determine block counts
-    depth, depth_single = _get_unet_config_counts(model)
-    if depth == 0 and depth_single == 0:
-        depth, depth_single = _infer_flux_block_counts(model_sd_keys)
-    if verbose:
-        _LOG.info("[DoRA Power LoRA Loader] flux2 compat: inferred blocks: double=%s single=%s", depth, depth_single)
+    # 2) Broadcast global modulations if present (OneTrainer exports globals; ComfyUI expects per-block keys).
+    # Choose destinations from the *current* model's key_map rather than hardcoding.
+    if not key_map:
+        return
 
-    # Broadcasting the same LoRA onto many per-block targets can easily blow up (pink output / NaNs).
-    # Auto-scale reduces the per-target delta so total effect is closer to the original "global module" intent.
-    depth_d = max(1, int(depth) or 1)
-    depth_s = max(1, int(depth_single) or 1)
-    scale_d = float(broadcast_scale) / float(depth_d) if broadcast_auto_scale else float(broadcast_scale)
-    scale_s = float(broadcast_scale) / float(depth_s) if broadcast_auto_scale else float(broadcast_scale)
-    if verbose:
-        _LOG.info(
-            "[DoRA Power LoRA Loader] flux2 compat: broadcast scales: double=%s single=%s (auto=%s base=%s)",
-            scale_d,
-            scale_s,
-            broadcast_auto_scale,
-            broadcast_scale,
-        )
-
-    # 2) Broadcast global modulations if present
-    # Source bases from OneTrainer export (the ones you logged as missing).
     src_img = "transformer.double_stream_modulation_img.linear"
     src_txt = "transformer.double_stream_modulation_txt.linear"
     src_single = "transformer.single_stream_modulation.linear"
 
-    # Only broadcast if those bases exist in the LoRA file.
     have_img = any(k.startswith(src_img + ".") for k in lora_sd.keys())
     have_txt = any(k.startswith(src_txt + ".") for k in lora_sd.keys())
     have_single = any(k.startswith(src_single + ".") for k in lora_sd.keys())
 
-    if have_img and depth > 0:
+    img_targets, txt_targets, single_targets = _pick_flux2_broadcast_targets(key_map)
+
+    # If the model actually exposes the global modulation modules, do not broadcast/delete them.
+    img_has_global = any(t == src_img for t in img_targets)
+    txt_has_global = any(t == src_txt for t in txt_targets)
+    single_has_global = any(t == src_single for t in single_targets)
+
+    def _scale_for(n: int) -> float:
+        if n <= 0:
+            return 1.0
+        return (float(broadcast_scale) / float(n)) if broadcast_auto_scale else float(broadcast_scale)
+
+    scale_img = _scale_for(len(img_targets))
+    scale_txt = _scale_for(len(txt_targets))
+    scale_single = _scale_for(len(single_targets))
+
+    if verbose:
+        _LOG.info(
+            "[DoRA Power LoRA Loader] flux2 compat: broadcast targets: img=%s txt=%s single=%s",
+            len(img_targets),
+            len(txt_targets),
+            len(single_targets),
+        )
+        _LOG.info(
+            "[DoRA Power LoRA Loader] flux2 compat: broadcast scales: img=%s txt=%s single=%s (auto=%s base=%s)",
+            scale_img,
+            scale_txt,
+            scale_single,
+            broadcast_auto_scale,
+            broadcast_scale,
+        )
+
+    # Only broadcast into targets that the file doesn't already define.
+    def _has_any_base(prefix_base: str) -> bool:
+        p = prefix_base + "."
+        return any(k.startswith(p) for k in lora_sd.keys())
+
+    if have_img and img_targets and (not img_has_global) and not any(_has_any_base(t) for t in img_targets):
         created = 0
-        for i in range(depth):
-            dst = f"transformer.transformer_blocks.{i}.norm1.linear"
-            created += _clone_base_block(lora_sd, src_img, dst, scale=scale_d)
-        if verbose:
-            _LOG.info(
-                "[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> transformer_blocks.*.norm1.linear (keys=%s)",
-                src_img,
-                created,
+        for dst in img_targets:
+            created += _clone_base_block(
+                lora_sd, src_img, dst, scale=scale_img, allow_suffixes=_BROADCAST_DELTA_SUFFIXES
             )
-        # prevent always-missing spam for the original, unmapped keys
+        if verbose:
+            _LOG.info("[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)", src_img, len(img_targets), created)
+        # Always consume source keys for per-block mode to prevent double-apply via dynamic matching.
         _delete_prefix_keys(lora_sd, src_img + ".")
 
-    if have_txt and depth > 0:
+    if have_txt and txt_targets and (not txt_has_global) and not any(_has_any_base(t) for t in txt_targets):
         created = 0
-        for i in range(depth):
-            dst = f"transformer.transformer_blocks.{i}.norm1_context.linear"
-            created += _clone_base_block(lora_sd, src_txt, dst, scale=scale_d)
-        if verbose:
-            _LOG.info(
-                "[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> transformer_blocks.*.norm1_context.linear (keys=%s)",
-                src_txt,
-                created,
+        for dst in txt_targets:
+            created += _clone_base_block(
+                lora_sd, src_txt, dst, scale=scale_txt, allow_suffixes=_BROADCAST_DELTA_SUFFIXES
             )
+        if verbose:
+            _LOG.info("[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)", src_txt, len(txt_targets), created)
         _delete_prefix_keys(lora_sd, src_txt + ".")
 
-    if have_single and depth_single > 0:
+    if have_single and single_targets and (not single_has_global) and not any(_has_any_base(t) for t in single_targets):
         created = 0
-        for i in range(depth_single):
-            dst = f"transformer.single_transformer_blocks.{i}.norm.linear"
-            created += _clone_base_block(lora_sd, src_single, dst, scale=scale_s)
+        for dst in single_targets:
+            created += _clone_base_block(
+                lora_sd, src_single, dst, scale=scale_single, allow_suffixes=_BROADCAST_DELTA_SUFFIXES
+            )
         if verbose:
             _LOG.info(
-                "[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> single_transformer_blocks.*.norm.linear (keys=%s)",
+                "[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)",
                 src_single,
+                len(single_targets),
                 created,
             )
         _delete_prefix_keys(lora_sd, src_single + ".")
@@ -553,6 +737,7 @@ class DoraPowerLoraLoader:
         log_unloaded_keys: bool,
         broadcast_auto_scale: bool,
         broadcast_scale: float,
+        model_is_quantized: bool,
         model_sd_keys: Optional[Set[str]],
         model_sd_list: Optional[List[str]],
         clip_sd_keys: Optional[Set[str]],
@@ -570,22 +755,17 @@ class DoraPowerLoraLoader:
             lora_sd = comfy.utils.load_torch_file(lora_path)
         lora_sd = comfy.lora_convert.convert_lora(lora_sd)
 
-        # Flux2/OneTrainer DoRA compat: rewrite + broadcast missing modules into keys ComfyUI maps.
-        # This fixes cases where critical dora_scale/lora_up/down tensors never map/load.
-        if model is not None:
-            _apply_flux2_onetrainer_dora_compat(
-                lora_sd=lora_sd,
-                model=model,
-                model_sd_keys=model_sd_keys,
-                verbose=verbose,
-                broadcast_auto_scale=broadcast_auto_scale,
-                broadcast_scale=broadcast_scale,
-            )
+        _log_lora_tensor_health(lora_name, lora_sd, verbose=verbose)
 
-        # Extract base module names from file keys.
-        lora_bases = _extract_lora_bases(lora_sd.keys())
-        if verbose:
-            _LOG.info("[DoRA Power LoRA Loader] %s: bases in file: %s", lora_name, len(lora_bases))
+        # If your Flux2 base is quantized/mixed-precision, DoRA can produce NaNs in some ComfyUI builds
+        # (pink/magenta decode). Key-mapping can be 100% correct and you'll still get pink.
+        # We can't safely dequantize here without depending on ComfyUI internals, so we emit a clear warning.
+        if model_is_quantized and any(str(k).endswith(".dora_scale") for k in lora_sd.keys()):
+            _LOG.warning(
+                "[DoRA Power LoRA Loader] %s: quantized/mixed-precision base model detected; DoRA may produce NaNs (pink). "
+                "If this happens, test with an FP16 base (non-quantized) to confirm.",
+                lora_name,
+            )
 
         # Start with standard ComfyUI key map.
         key_map: Dict[str, str] = {}
@@ -593,6 +773,24 @@ class DoraPowerLoraLoader:
             key_map = comfy.lora.model_lora_keys_unet(model.model, key_map)
         if clip is not None:
             key_map = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, key_map)
+
+        # Flux2/OneTrainer DoRA compat: rewrite + broadcast missing modules into keys ComfyUI maps.
+        # This fixes cases where critical dora_scale/lora_up/down tensors never map/load.
+        if model is not None:
+            _apply_flux2_onetrainer_dora_compat(
+                lora_sd=lora_sd,
+                model=model,
+                model_sd_keys=model_sd_keys,
+                key_map=key_map,
+                verbose=verbose,
+                broadcast_auto_scale=broadcast_auto_scale,
+                broadcast_scale=broadcast_scale,
+            )
+
+        # Extract base module names from file keys (after compat rewrites/broadcast).
+        lora_bases = _extract_lora_bases(lora_sd.keys())
+        if verbose:
+            _LOG.info("[DoRA Power LoRA Loader] %s: bases in file: %s", lora_name, len(lora_bases))
 
         # Extend map with missing bases from the file (includes Flux/Flux2 rewrites in _candidate_base_variants()).
         added, unresolved = _extend_key_map_with_dynamic_matches(
@@ -622,6 +820,8 @@ class DoraPowerLoraLoader:
                 loaded = comfy.lora.load_lora(lora_sd, key_map, log_unloaded_keys)
             except TypeError:
                 loaded = comfy.lora.load_lora(lora_sd, key_map)
+
+        _log_loaded_tensor_health(lora_name, loaded, verbose=verbose)
 
         # Apply patches to provided model/clip (already cloned by caller).
         applied_m = []
@@ -653,6 +853,10 @@ class DoraPowerLoraLoader:
                 strength_model,
                 strength_clip,
             )
+            if isinstance(applied_m, list) and applied_m:
+                _LOG.info("[DoRA Power LoRA Loader] %s: sample applied(model) keys: %s", lora_name, applied_m[:10])
+            if isinstance(applied_c, list) and applied_c:
+                _LOG.info("[DoRA Power LoRA Loader] %s: sample applied(clip) keys: %s", lora_name, applied_c[:10])
 
         return model, clip
 
@@ -681,11 +885,18 @@ class DoraPowerLoraLoader:
         # Prepare state_dict key sets/lists once for dynamic matching.
         model_sd_keys = model_sd_list = None
         clip_sd_keys = clip_sd_list = None
+        model_is_quantized = False
 
         if new_model is not None:
             model_state_dict = new_model.model.state_dict()
             model_sd_list = list(model_state_dict.keys())
             model_sd_keys = set(model_sd_list)
+            model_is_quantized = _state_dict_looks_quantized(model_state_dict)
+            if model_is_quantized:
+                _LOG.warning(
+                    "[DoRA Power LoRA Loader] quantized/mixed-precision Flux/Flux2 detected in UNet state_dict; "
+                    "DoRA LoRAs can still map correctly but may output pink if the DoRA math path is unstable on quantized weights."
+                )
 
         if new_clip is not None:
             clip_state_dict = new_clip.cond_stage_model.state_dict()
@@ -712,6 +923,7 @@ class DoraPowerLoraLoader:
                 log_unloaded_keys=log_unloaded_keys,
                 broadcast_auto_scale=broadcast_auto_scale,
                 broadcast_scale=broadcast_scale,
+                model_is_quantized=model_is_quantized,
                 model_sd_keys=model_sd_keys,
                 model_sd_list=model_sd_list,
                 clip_sd_keys=clip_sd_keys,
