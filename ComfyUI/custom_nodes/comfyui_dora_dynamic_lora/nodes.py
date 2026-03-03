@@ -343,12 +343,16 @@ def _patch_comfy_lora_calculate_weight_fp32() -> None:
             a = list(args)
 
             if has_intermediate and idx_intermediate >= 0:
-                # Always force fp32 intermediate dtype.
-                kwargs["intermediate_dtype"] = torch.float32
-
-                # If intermediate_dtype was provided positionally, overwrite the correct slot.
+                # If intermediate_dtype was provided positionally, overwrite that slot and
+                # DO NOT also pass it as a kwarg (would be "multiple values").
                 if idx_intermediate_call >= 0 and len(a) > idx_intermediate_call:
                     a[idx_intermediate_call] = torch.float32
+                    # If upstream also set it as a kwarg, drop it to avoid duplicates.
+                    if "intermediate_dtype" in kwargs:
+                        kwargs.pop("intermediate_dtype", None)
+                else:
+                    # Otherwise, force via kwarg.
+                    kwargs["intermediate_dtype"] = torch.float32
             else:
                 for i, v in enumerate(a):
                     if isinstance(v, torch.dtype):
