@@ -326,19 +326,29 @@ def _patch_comfy_lora_calculate_weight_fp32() -> None:
             param_names = list(sig.parameters.keys())
             has_intermediate = "intermediate_dtype" in sig.parameters
             idx_intermediate = param_names.index("intermediate_dtype") if has_intermediate else -1
+
+            # calculate_weight is an instance method; callers pass args *without* the leading
+            # `self`. When patching by positional index, compensate for the missing self slot so
+            # we overwrite the actual intermediate_dtype argument instead of original_weight.
+            idx_intermediate_call = idx_intermediate
+            if has_intermediate and param_names and param_names[0] == "self":
+                idx_intermediate_call = idx_intermediate - 1
         except Exception:
             sig = None
             has_intermediate = False
             idx_intermediate = -1
+            idx_intermediate_call = -1
 
         def calculate_weight_fixed(self, *args, **kwargs):
             a = list(args)
 
             if has_intermediate and idx_intermediate >= 0:
-                if len(a) > idx_intermediate:
-                    a[idx_intermediate] = torch.float32
-                if len(a) <= idx_intermediate:
-                    kwargs["intermediate_dtype"] = torch.float32
+                # Always force fp32 intermediate dtype.
+                kwargs["intermediate_dtype"] = torch.float32
+
+                # If intermediate_dtype was provided positionally, overwrite the correct slot.
+                if idx_intermediate_call >= 0 and len(a) > idx_intermediate_call:
+                    a[idx_intermediate_call] = torch.float32
             else:
                 for i, v in enumerate(a):
                     if isinstance(v, torch.dtype):
