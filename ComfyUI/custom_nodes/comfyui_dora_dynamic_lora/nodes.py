@@ -784,6 +784,57 @@ def _log_lora_tensor_health(tag: str, lora_sd: Dict[str, Any], verbose: bool):
             _LOG.info("  %12.4g  %s", m, k)
 
 
+def _log_lora_direction_stats(tag: str, lora_sd: Dict[str, Any], verbose: bool) -> None:
+    """Targeted stats for direction matrices (up/down). Helps distinguish 'missing/ignored' vs 'all zeros'."""
+    if not verbose:
+        return
+    suffix_groups = (
+        (".lora_up.weight", ".lora_down.weight"),
+        (".lora_A.weight", ".lora_B.weight"),
+        (".lora_A.default.weight", ".lora_B.default.weight"),
+        ("_lora.up.weight", "_lora.down.weight"),
+        (".lora.up.weight", ".lora.down.weight"),
+        (".lora_linear_layer.up.weight", ".lora_linear_layer.down.weight"),
+        (".lora_A", ".lora_B"),
+    )
+    for up_s, down_s in suffix_groups:
+        ups = [v for k, v in lora_sd.items() if str(k).endswith(up_s) and isinstance(v, torch.Tensor)]
+        downs = [v for k, v in lora_sd.items() if str(k).endswith(down_s) and isinstance(v, torch.Tensor)]
+        if not ups and not downs:
+            continue
+
+        def _summ(ts):
+            if not ts:
+                return (0, 0, 0.0)
+            zero = 0
+            mx = 0.0
+            for t in ts:
+                try:
+                    m = float(t.detach().abs().max().item())
+                    if m == 0.0:
+                        zero += 1
+                    if m > mx:
+                        mx = m
+                except Exception:
+                    continue
+            return (len(ts), zero, mx)
+
+        nu, zu, mu = _summ(ups)
+        nd, zd, md = _summ(downs)
+        _LOG.info(
+            "[DoRA Power LoRA Loader] %s: dir-mats %s/%s: up n=%d zero=%d max|x|=%g | down n=%d zero=%d max|x|=%g",
+            tag,
+            up_s,
+            down_s,
+            nu,
+            zu,
+            mu,
+            nd,
+            zd,
+            md,
+        )
+
+
 def _log_loaded_tensor_health(tag: str, loaded: Any, verbose: bool):
     tensors = list(_iter_tensors(loaded, path="loaded"))
     nan, inf, top = _tensor_health_report(tensors)
@@ -803,6 +854,138 @@ def _log_loaded_tensor_health(tag: str, loaded: Any, verbose: bool):
         _LOG.info("[DoRA Power LoRA Loader] %s: top max|x| in loaded patches:", tag)
         for k, m in top:
             _LOG.info("  %12.4g  %s", m, k)
+
+
+def _unwrap_key_map_target(v: Any) -> Tuple[Optional[str], Optional[Tuple[int, int, int]]]:
+    """Return (dest_key, slice_tuple) from a key_map value."""
+    try:
+        if v is None:
+            return (None, None)
+        if isinstance(v, str):
+            return (v, None)
+        if isinstance(v, tuple) and len(v) >= 1 and isinstance(v[0], str):
+            # Common Comfy pattern: (dest_key, (dim, start, length))
+            sl = None
+            if len(v) >= 2 and isinstance(v[1], tuple) and len(v[1]) == 3:
+                try:
+                    sl = (int(v[1][0]), int(v[1][1]), int(v[1][2]))
+                except Exception:
+                    sl = None
+            return (v[0], sl)
+    except Exception:
+        return (None, None)
+    return (None, None)
+
+
+def _fix_onetrainer_output_axis_dora_mats(
+    lora_sd: Dict[str, Any],
+    key_map: Dict[str, Any],
+    model_state_dict: Optional[Dict[str, Any]],
+    clip_state_dict: Optional[Dict[str, Any]],
+    verbose: bool,
+) -> None:
+    """
+    OneTrainer 'Apply on output axis (DoRA only)' can store direction mats transposed.
+    If they don't match the destination weight layout, Comfy effectively applies only dora_scale
+    -> lora_diff becomes identically zero (your exact symptom).
+    """
+    sd_model = model_state_dict or {}
+    sd_clip = clip_state_dict or {}
+    pair_suffixes = (
+        (".lora_up.weight", ".lora_down.weight"),
+        (".lora_A.weight", ".lora_B.weight"),
+        (".lora_A.default.weight", ".lora_B.default.weight"),
+        ("_lora.up.weight", "_lora.down.weight"),
+        (".lora.up.weight", ".lora.down.weight"),
+        (".lora_linear_layer.up.weight", ".lora_linear_layer.down.weight"),
+        (".lora_A", ".lora_B"),
+    )
+    fixed = 0
+    checked = 0
+    examples: List[str] = []
+    dora_bases = [k[: -len(".dora_scale")] for k in lora_sd.keys() if str(k).endswith(".dora_scale")]
+    for base in dora_bases:
+        up_key = down_key = None
+        for us, ds in pair_suffixes:
+            uk = base + us
+            dk = base + ds
+            if uk in lora_sd and dk in lora_sd:
+                up_key, down_key = uk, dk
+                break
+        if up_key is None:
+            continue
+
+        up = lora_sd.get(up_key)
+        down = lora_sd.get(down_key)
+        if not isinstance(up, torch.Tensor) or not isinstance(down, torch.Tensor) or up.ndim != 2 or down.ndim != 2:
+            continue
+
+        dest, sl = _unwrap_key_map_target(key_map.get(base))
+        if not dest or not dest.endswith(".weight"):
+            continue
+
+        w = sd_model.get(dest)
+        if w is None:
+            w = sd_clip.get(dest)
+        if not isinstance(w, torch.Tensor) or w.ndim < 2:
+            continue
+
+        out_dim = int(w.shape[0])
+        in_dim = int(w.shape[1])
+        # If mapping is a slice (e.g. qkv), compare against the effective slice shape.
+        if sl is not None:
+            dim, _start, length = sl
+            if dim == 0:
+                out_dim = int(length)
+            elif dim == 1:
+                in_dim = int(length)
+
+        # Robust rank inference: pick the shared "rank-like" dimension.
+        u0, u1 = int(up.shape[0]), int(up.shape[1])
+        d0, d1 = int(down.shape[0]), int(down.shape[1])
+        dims = {u0, u1, d0, d1}
+        cand = [x for x in dims if x not in (out_dim, in_dim)]
+        if cand:
+            r = min(cand)
+        else:
+            r = min(u0, u1, d0, d1)
+
+        checked += 1
+
+        # Standard: up=(out,r), down=(r,in)
+        if u0 == out_dim and u1 == r and d0 == r and d1 == in_dim:
+            continue
+
+        # Swapped: up=(r,in), down=(out,r) -> swap
+        if u0 == r and u1 == in_dim and d0 == out_dim and d1 == r:
+            lora_sd[up_key], lora_sd[down_key] = down, up
+            fixed += 1
+            if len(examples) < 10:
+                examples.append(f"swap  base={base} W=({out_dim},{in_dim}) up={tuple(up.shape)} down={tuple(down.shape)}")
+            continue
+
+        # Transposed: up=(in,r), down=(r,out) -> up=(out,r), down=(r,in)
+        if u0 == in_dim and u1 == r and d0 == r and d1 == out_dim:
+            lora_sd[up_key] = down.transpose(0, 1).contiguous()  # (out,r)
+            lora_sd[down_key] = up.transpose(0, 1).contiguous()  # (r,in)
+            fixed += 1
+            if len(examples) < 10:
+                examples.append(f"xpose base={base} W=({out_dim},{in_dim}) up={tuple(up.shape)} down={tuple(down.shape)}")
+            continue
+
+        # Transposed+swapped: up=(r,out), down=(in,r) -> transpose each
+        if u0 == r and u1 == out_dim and d0 == in_dim and d1 == r:
+            lora_sd[up_key] = up.transpose(0, 1).contiguous()  # (out,r)
+            lora_sd[down_key] = down.transpose(0, 1).contiguous()  # (r,in)
+            fixed += 1
+            if len(examples) < 10:
+                examples.append(f"xpose2 base={base} W=({out_dim},{in_dim}) up={tuple(up.shape)} down={tuple(down.shape)}")
+            continue
+
+    if verbose:
+        _LOG.info("[DoRA Power LoRA Loader] OneTrainer output-axis DoRA mat-fix: checked=%d fixed=%d", checked, fixed)
+        for ex in examples:
+            _LOG.info("[DoRA Power LoRA Loader] OneTrainer mat-fix example: %s", ex)
 
 
 def _get_unet_config_counts(model) -> Tuple[int, int]:
@@ -830,7 +1013,7 @@ def _apply_flux2_onetrainer_dora_compat(
     lora_sd: Dict[str, Any],
     model,
     model_sd_keys: Optional[Set[str]],
-    key_map: Optional[Dict[str, str]] = None,
+    key_map: Optional[Dict[str, Any]] = None,
     verbose: bool = False,
     broadcast_auto_scale: bool = True,
     broadcast_scale: float = 1.0,
@@ -1110,7 +1293,7 @@ def _find_weight_key_for_base(sd_keys: Set[str], sd_key_list: List[str], base: s
 
 
 def _extend_key_map_with_dynamic_matches(
-    key_map: Dict[str, str],
+    key_map: Dict[str, Any],
     lora_bases: Set[str],
     model_sd_keys: Optional[Set[str]],
     model_sd_list: Optional[List[str]],
@@ -1274,8 +1457,10 @@ class DoraPowerLoraLoader:
         broadcast_modulations: bool,
         broadcast_include_dora_scale: bool,
         model_is_quantized: bool,
+        model_state_dict: Optional[Dict[str, Any]],
         model_sd_keys: Optional[Set[str]],
         model_sd_list: Optional[List[str]],
+        clip_state_dict: Optional[Dict[str, Any]],
         clip_sd_keys: Optional[Set[str]],
         clip_sd_list: Optional[List[str]],
     ):
@@ -1296,6 +1481,7 @@ class DoraPowerLoraLoader:
             _LOG.info("[DoRA Power LoRA Loader] %s: dora_scale keys=%d total_keys=%d", lora_name, n_dora, len(lora_sd))
 
         _log_lora_tensor_health(lora_name, lora_sd, verbose=verbose)
+        _log_lora_direction_stats(lora_name, lora_sd, verbose=verbose)
 
         # If your Flux2 base is quantized/mixed-precision, DoRA can produce NaNs in some ComfyUI builds
         # (pink/magenta decode). Key-mapping can be 100% correct and you'll still get pink.
@@ -1308,7 +1494,7 @@ class DoraPowerLoraLoader:
             )
 
         # Start with standard ComfyUI key map.
-        key_map: Dict[str, str] = {}
+        key_map: Dict[str, Any] = {}
         if model is not None:
             key_map = comfy.lora.model_lora_keys_unet(model.model, key_map)
         if clip is not None:
@@ -1352,6 +1538,15 @@ class DoraPowerLoraLoader:
                 added,
                 len(unresolved),
             )
+
+        _fix_onetrainer_output_axis_dora_mats(
+            lora_sd=lora_sd,
+            key_map=key_map,
+            model_state_dict=model_state_dict,
+            clip_state_dict=clip_state_dict,
+            verbose=verbose,
+        )
+        _log_lora_direction_stats(lora_name + " (post-fix)", lora_sd, verbose=verbose)
 
         # Load patches (DoRA handling remains in comfy.lora internals).
         try:
@@ -1450,6 +1645,8 @@ class DoraPowerLoraLoader:
         model_sd_keys = model_sd_list = None
         clip_sd_keys = clip_sd_list = None
         model_is_quantized = False
+        model_state_dict = None
+        clip_state_dict = None
 
         if new_model is not None:
             model_state_dict = new_model.model.state_dict()
@@ -1490,8 +1687,10 @@ class DoraPowerLoraLoader:
                 broadcast_modulations=broadcast_modulations,
                 broadcast_include_dora_scale=broadcast_include_dora_scale,
                 model_is_quantized=model_is_quantized,
+                model_state_dict=model_state_dict,
                 model_sd_keys=model_sd_keys,
                 model_sd_list=model_sd_list,
+                clip_state_dict=clip_state_dict,
                 clip_sd_keys=clip_sd_keys,
                 clip_sd_list=clip_sd_list,
             )
