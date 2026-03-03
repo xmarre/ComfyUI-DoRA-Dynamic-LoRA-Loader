@@ -784,6 +784,33 @@ def _log_lora_tensor_health(tag: str, lora_sd: Dict[str, Any], verbose: bool):
             _LOG.info("  %12.4g  %s", m, k)
 
 
+def _suffix_tensor_stats(sd: Dict[str, Any], suffix: str) -> Tuple[int, int, float, List[str]]:
+    """
+    Returns (count, zero_count, max_abs, dtypes) for tensors whose key endswith(suffix).
+    zero_count counts tensors whose max_abs == 0.
+    """
+    n = 0
+    z = 0
+    mx = 0.0
+    dtypes: Set[str] = set()
+    for k, v in sd.items():
+        if not isinstance(v, torch.Tensor):
+            continue
+        if not str(k).endswith(suffix):
+            continue
+        n += 1
+        dtypes.add(str(v.dtype))
+        try:
+            m = float(v.detach().abs().max().item())
+            if m == 0.0:
+                z += 1
+            if m > mx:
+                mx = m
+        except Exception:
+            continue
+    return (n, z, mx, sorted(dtypes))
+
+
 def _log_lora_direction_stats(tag: str, lora_sd: Dict[str, Any], verbose: bool) -> None:
     """Targeted stats for direction matrices (up/down). Helps distinguish 'missing/ignored' vs 'all zeros'."""
     if not verbose:
@@ -1470,11 +1497,73 @@ class DoraPowerLoraLoader:
 
         # Load and normalize formats.
         try:
-            lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            lora_sd_raw = comfy.utils.load_torch_file(lora_path, safe_load=True)
         except TypeError:
             # Older ComfyUI builds may not expose safe_load kwarg
-            lora_sd = comfy.utils.load_torch_file(lora_path)
-        lora_sd = comfy.lora_convert.convert_lora(lora_sd)
+            lora_sd_raw = comfy.utils.load_torch_file(lora_path)
+
+        # RAW stats (before convert_lora) – tells us if training/export already produced zero lora_up.
+        raw_up_n, raw_up_z, raw_up_mx, raw_up_dt = _suffix_tensor_stats(lora_sd_raw, ".lora_up.weight")
+        raw_dn_n, raw_dn_z, raw_dn_mx, raw_dn_dt = _suffix_tensor_stats(lora_sd_raw, ".lora_down.weight")
+        if verbose and (raw_up_n or raw_dn_n):
+            _LOG.info(
+                "[DoRA Power LoRA Loader] %s (raw): .lora_up n=%d zero=%d max|x|=%g dtypes=%s | "
+                ".lora_down n=%d zero=%d max|x|=%g dtypes=%s",
+                lora_name,
+                raw_up_n,
+                raw_up_z,
+                raw_up_mx,
+                raw_up_dt,
+                raw_dn_n,
+                raw_dn_z,
+                raw_dn_mx,
+                raw_dn_dt,
+            )
+
+        if raw_up_n and raw_up_mx == 0.0:
+            _LOG.warning(
+                "[DoRA Power LoRA Loader] %s (raw): ALL lora_up matrices are zero. "
+                "This LoRA has no direction update, so lora_diff will be 0 and it will barely change the image. "
+                "This is a training/export issue, not a loader issue.",
+                lora_name,
+            )
+
+        # Convert (needed for some formats)
+        lora_sd_conv = comfy.lora_convert.convert_lora(lora_sd_raw)
+
+        # CONVERTED stats – tells us if convert_lora is zeroing lora_up.
+        conv_up_n, conv_up_z, conv_up_mx, conv_up_dt = _suffix_tensor_stats(lora_sd_conv, ".lora_up.weight")
+        conv_dn_n, conv_dn_z, conv_dn_mx, conv_dn_dt = _suffix_tensor_stats(lora_sd_conv, ".lora_down.weight")
+        if verbose and (conv_up_n or conv_dn_n):
+            _LOG.info(
+                "[DoRA Power LoRA Loader] %s (converted): .lora_up n=%d zero=%d max|x|=%g dtypes=%s | "
+                ".lora_down n=%d zero=%d max|x|=%g dtypes=%s",
+                lora_name,
+                conv_up_n,
+                conv_up_z,
+                conv_up_mx,
+                conv_up_dt,
+                conv_dn_n,
+                conv_dn_z,
+                conv_dn_mx,
+                conv_dn_dt,
+            )
+
+        # If conversion killed lora_up, bypass conversion for this file.
+        if raw_up_n and raw_up_mx > 0.0 and conv_up_n == raw_up_n and conv_up_mx == 0.0:
+            _LOG.warning(
+                "[DoRA Power LoRA Loader] %s: convert_lora appears to zero lora_up (raw max|x|=%g -> converted max|x|=0). "
+                "Bypassing convert_lora for this file.",
+                lora_name,
+                raw_up_mx,
+            )
+            # Reload fresh to avoid in-place conversion side effects.
+            try:
+                lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            except TypeError:
+                lora_sd = comfy.utils.load_torch_file(lora_path)
+        else:
+            lora_sd = lora_sd_conv
 
         if verbose:
             n_dora = sum(1 for k in lora_sd.keys() if str(k).endswith(".dora_scale"))
