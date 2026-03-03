@@ -20,5 +20,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "DoRA Power LoRA Loader": "DoRA Power LoRA Loader (DoRA + Flux2/OneTrainer key-fix)",
+    "DoRA Power LoRA Loader": "DoRA Power LoRA Loader",
 }

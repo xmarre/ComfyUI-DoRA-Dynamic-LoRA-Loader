@@ -77,14 +77,14 @@ function makeRowDefaults() {
 // Back-compat for old workflows that saved widgets_values.
 function parseRowsFromWidgetValues(widgetsValues) {
   // legacy serialized layouts:
-  //   per-row: enabled, name, strengthModel, strengthClip  (4)
+  //   compact per-row: enabled, name, strengthModel  (3)
+  //   old per-row: enabled, name, strengthModel, strengthClip  (4)
   //   globals v1: stack_enabled, verbose, log_unloaded_keys   (3)
   //   globals v2: v1 + dora_decompose_debug, dora_decompose_debug_n,
   //               dora_decompose_debug_stack_depth, dora_slice_fix (7)
   const vals = Array.isArray(widgetsValues) ? widgetsValues : [];
-  const PER_ROW = 4;
 
-  const parseWithGlobals = (GLOBALS) => {
+  const parseWithLayout = (PER_ROW, GLOBALS) => {
     if (vals.length < GLOBALS) return null;
     if ((vals.length - GLOBALS) % PER_ROW !== 0) return null;
 
@@ -97,9 +97,13 @@ function parseRowsFromWidgetValues(widgetsValues) {
       const nm = vals[idx++];
       r.name = typeof nm === "string" ? nm : (nm ?? "None");
       const sm = Number(vals[idx++]);
-      const sc = Number(vals[idx++]);
       r.strengthModel = sm;
-      r.strengthClip = sc;
+      if (PER_ROW === 4) {
+        const sc = Number(vals[idx++]);
+        r.strengthClip = Number.isFinite(sc) ? sc : sm;
+      } else {
+        r.strengthClip = sm;
+      }
       outRows.push(r);
     }
 
@@ -131,12 +135,17 @@ function parseRowsFromWidgetValues(widgetsValues) {
     return true;
   };
 
-  // Prefer v1 when ambiguous (e.g. len=7 can be one-row v1 or zero-row v2).
-  const v1 = parseWithGlobals(3);
-  if (looksValid(v1)) return v1;
+  const layouts = [
+    [4, 3],
+    [4, 7],
+    [3, 3],
+    [3, 7],
+  ];
 
-  const v2 = parseWithGlobals(7);
-  if (looksValid(v2)) return v2;
+  for (const [perRow, globals] of layouts) {
+    const parsed = parseWithLayout(perRow, globals);
+    if (looksValid(parsed)) return parsed;
+  }
 
   return { rows: [], globals: { stack_enabled: true, verbose: false, log_unloaded_keys: false } };
 }
@@ -250,12 +259,12 @@ function buildUI(node, state, loraValues) {
       row.enabled = !!v;
       setState(node, { rows: node._doraRows, globals: node._doraGlobals });
     });
-    wEnabled.label = `LoRA ${n} Enabled`;
+    wEnabled.label = `LoRA ${n}`;
 
     const wName = node.addWidget("combo", `lora_${n}_name`, row.name ?? "None", (v) => (row.name = v), {
       values: loras,
     });
-    wName.label = `LoRA ${n}`;
+    wName.label = `Name`;
     // ensure state persists
     const _origNameCb = wName.callback;
     wName.callback = (v) => {
@@ -273,19 +282,7 @@ function buildUI(node, state, loraValues) {
       },
       { min: -10.0, max: 10.0, step: 0.05 }
     );
-    wSm.label = `Strength (Model)`;
-
-    const wSc = node.addWidget(
-      "number",
-      `lora_${n}_strength_clip`,
-      Number.isFinite(row.strengthClip) ? row.strengthClip : (Number.isFinite(row.strengthModel) ? row.strengthModel : 1.0),
-      (v) => {
-        row.strengthClip = Number(v);
-        setState(node, { rows: node._doraRows, globals: node._doraGlobals });
-      },
-      { min: -10.0, max: 10.0, step: 0.05 }
-    );
-    wSc.label = `Strength (Clip)`;
+    wSm.label = `Weight`;
 
     const wRemove = node.addWidget("button", `lora_${n}_remove`, "✖ Remove");
     setButtonCallback(wRemove, () => {
@@ -369,7 +366,7 @@ function buildUI(node, state, loraValues) {
       setState(node, { rows: node._doraRows, globals: node._doraGlobals });
     }
   );
-  wAutoScale.label = "Auto-scale broadcast (fix pink/NaNs)";
+  wAutoScale.label = "Auto-scale broadcast";
 
   const wScale = node.addWidget(
     "number",
