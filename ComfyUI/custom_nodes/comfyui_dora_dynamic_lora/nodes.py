@@ -39,17 +39,32 @@ def _patch_comfy_weight_decompose() -> None:
             wa_base._dora_weight_decompose_first_call_logged = True
             _LOG.warning("[DoRA Power LoRA Loader] weight_decompose_fixed invoked (DoRA normalization patch active).")
 
-        # support both positional and keyword calling styles
-        if args and len(args) >= 7:
-            dora_scale, weight, lora_diff, alpha, strength, intermediate_dtype, function = args[:7]
+        # Support:
+        #  - fully positional: (dora_scale, weight, lora_diff, alpha, strength, intermediate_dtype, function)
+        #  - fully keyword
+        #  - mixed: first 4 required positionals, rest via kwargs (common pattern)
+        dora_scale = None
+        weight = None
+        lora_diff = None
+        alpha = None
+
+        if len(args) >= 4:
+            dora_scale, weight, lora_diff, alpha = args[:4]
         else:
-            dora_scale = kwargs["dora_scale"]
-            weight = kwargs["weight"]
-            lora_diff = kwargs["lora_diff"]
-            alpha = kwargs["alpha"]
-            strength = kwargs.get("strength", 1.0)
-            intermediate_dtype = kwargs.get("intermediate_dtype", weight.dtype)
-            function = kwargs["function"]
+            dora_scale = kwargs.get("dora_scale")
+            weight = kwargs.get("weight")
+            lora_diff = kwargs.get("lora_diff")
+            alpha = kwargs.get("alpha")
+
+        if dora_scale is None or weight is None or lora_diff is None or alpha is None:
+            raise TypeError("weight_decompose_fixed missing required arguments (dora_scale, weight, lora_diff, alpha)")
+
+        # remaining args (optional) can be positional 4.. or kwargs
+        strength = args[4] if len(args) >= 5 else kwargs.get("strength", 1.0)
+        intermediate_dtype = args[5] if len(args) >= 6 else kwargs.get("intermediate_dtype", getattr(weight, "dtype", torch.float32))
+        function = args[6] if len(args) >= 7 else kwargs.get("function")
+        if function is None:
+            raise TypeError("weight_decompose_fixed missing required argument 'function'")
 
         # cast magnitude vector to device/dtype used for intermediate math
         dora_scale_local = comfy.model_management.cast_to_device(dora_scale, weight.device, intermediate_dtype)
