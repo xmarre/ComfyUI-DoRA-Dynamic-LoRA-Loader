@@ -121,6 +121,23 @@ _BROADCAST_DELTA_SUFFIXES = (
     ".reshape_weight",
 )
 
+# For OneTrainer DoRA exports, modulation modules often include DoRA params.
+# If we broadcast only A/B/alpha and then delete the source prefix, we effectively strip DoRA
+# for these modules -> can destabilize / cause pink outputs.
+_BROADCAST_DORA_SUFFIXES = _BROADCAST_DELTA_SUFFIXES + (
+    ".dora_scale",
+    ".w_norm",
+    ".b_norm",
+)
+
+
+def _src_has_dora_params(lora_sd: Dict[str, Any], base: str) -> bool:
+    p = base + "."
+    for k in lora_sd.keys():
+        if k.startswith(p) and (k.endswith(".dora_scale") or k.endswith(".w_norm") or k.endswith(".b_norm")):
+            return True
+    return False
+
 
 def _delete_prefix_keys(lora_sd: Dict[str, Any], prefix: str) -> int:
     """
@@ -413,6 +430,19 @@ def _apply_flux2_onetrainer_dora_compat(
 
     img_targets, txt_targets, single_targets = _pick_flux2_broadcast_targets(key_map)
 
+    # Helpful debug: print actual targets (not only counts).
+    if verbose:
+        _LOG.info("[DoRA Power LoRA Loader] flux2 compat: img_targets=%s", img_targets)
+        _LOG.info("[DoRA Power LoRA Loader] flux2 compat: txt_targets=%s", txt_targets)
+        _LOG.info("[DoRA Power LoRA Loader] flux2 compat: single_targets=%s", single_targets)
+
+    # Choose suffix set: if the source base has DoRA params, broadcast them too.
+    suf_img = _BROADCAST_DORA_SUFFIXES if _src_has_dora_params(lora_sd, src_img) else _BROADCAST_DELTA_SUFFIXES
+    suf_txt = _BROADCAST_DORA_SUFFIXES if _src_has_dora_params(lora_sd, src_txt) else _BROADCAST_DELTA_SUFFIXES
+    suf_single = (
+        _BROADCAST_DORA_SUFFIXES if _src_has_dora_params(lora_sd, src_single) else _BROADCAST_DELTA_SUFFIXES
+    )
+
     # If the model actually exposes the global modulation modules, do not broadcast/delete them.
     img_has_global = any(t == src_img for t in img_targets)
     txt_has_global = any(t == src_txt for t in txt_targets)
@@ -448,40 +478,37 @@ def _apply_flux2_onetrainer_dora_compat(
         p = prefix_base + "."
         return any(k.startswith(p) for k in lora_sd.keys())
 
-    if have_img and img_targets and (not img_has_global) and not any(_has_any_base(t) for t in img_targets):
-        created = 0
-        for dst in img_targets:
-            created += _clone_base_block(
-                lora_sd, src_img, dst, scale=scale_img, allow_suffixes=_BROADCAST_DELTA_SUFFIXES
-            )
-        if verbose:
-            _LOG.info("[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)", src_img, len(img_targets), created)
-        # Always consume source keys for per-block mode to prevent double-apply via dynamic matching.
+    if have_img and img_targets and (not img_has_global):
+        if not any(_has_any_base(t) for t in img_targets):
+            created = 0
+            for dst in img_targets:
+                created += _clone_base_block(lora_sd, src_img, dst, scale=scale_img, allow_suffixes=suf_img)
+            if verbose:
+                _LOG.info("[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)", src_img, len(img_targets), created)
+        # Always consume source keys in per-block mode (even if targets already exist).
         _delete_prefix_keys(lora_sd, src_img + ".")
 
-    if have_txt and txt_targets and (not txt_has_global) and not any(_has_any_base(t) for t in txt_targets):
-        created = 0
-        for dst in txt_targets:
-            created += _clone_base_block(
-                lora_sd, src_txt, dst, scale=scale_txt, allow_suffixes=_BROADCAST_DELTA_SUFFIXES
-            )
-        if verbose:
-            _LOG.info("[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)", src_txt, len(txt_targets), created)
+    if have_txt and txt_targets and (not txt_has_global):
+        if not any(_has_any_base(t) for t in txt_targets):
+            created = 0
+            for dst in txt_targets:
+                created += _clone_base_block(lora_sd, src_txt, dst, scale=scale_txt, allow_suffixes=suf_txt)
+            if verbose:
+                _LOG.info("[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)", src_txt, len(txt_targets), created)
         _delete_prefix_keys(lora_sd, src_txt + ".")
 
-    if have_single and single_targets and (not single_has_global) and not any(_has_any_base(t) for t in single_targets):
-        created = 0
-        for dst in single_targets:
-            created += _clone_base_block(
-                lora_sd, src_single, dst, scale=scale_single, allow_suffixes=_BROADCAST_DELTA_SUFFIXES
-            )
-        if verbose:
-            _LOG.info(
-                "[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)",
-                src_single,
-                len(single_targets),
-                created,
-            )
+    if have_single and single_targets and (not single_has_global):
+        if not any(_has_any_base(t) for t in single_targets):
+            created = 0
+            for dst in single_targets:
+                created += _clone_base_block(lora_sd, src_single, dst, scale=scale_single, allow_suffixes=suf_single)
+            if verbose:
+                _LOG.info(
+                    "[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)",
+                    src_single,
+                    len(single_targets),
+                    created,
+                )
         _delete_prefix_keys(lora_sd, src_single + ".")
 
 
