@@ -76,15 +76,25 @@ function makeRowDefaults() {
 
 // Back-compat for old workflows that saved widgets_values.
 function parseRowsFromWidgetValues(widgetsValues) {
-  // old serialized layout:
+  // legacy serialized layouts:
   //   per-row: enabled, name, strengthModel, strengthClip  (4)
-  //   globals: stack_enabled, verbose, log_unloaded_keys   (3)
+  //   globals v1: stack_enabled, verbose, log_unloaded_keys   (3)
+  //   globals v2: v1 + dora_decompose_debug, dora_decompose_debug_n,
+  //               dora_decompose_debug_stack_depth, dora_slice_fix (7)
   const vals = Array.isArray(widgetsValues) ? widgetsValues : [];
-  const GLOBALS = 3;
   const PER_ROW = 4;
   const rows = [];
 
-  if (vals.length < GLOBALS) {
+  const pickGlobalCount = (arrLen) => {
+    // Prefer richer layout when divisible; otherwise fall back to original 3-globals layout.
+    if (arrLen >= 7 && (arrLen - 7) % PER_ROW === 0) return 7;
+    if (arrLen >= 3 && (arrLen - 3) % PER_ROW === 0) return 3;
+    // Last-resort back-compat for malformed saves.
+    return arrLen >= 3 ? 3 : 0;
+  };
+
+  const GLOBALS = pickGlobalCount(vals.length);
+  if (GLOBALS === 0) {
     return { rows: [], globals: { stack_enabled: true, verbose: false, log_unloaded_keys: false } };
   }
 
@@ -99,11 +109,20 @@ function parseRowsFromWidgetValues(widgetsValues) {
     r.strengthClip = Number(vals[idx++]);
     rows.push(r);
   }
+
   const globals = {
     stack_enabled: Boolean(vals[idx++]),
     verbose: Boolean(vals[idx++]),
     log_unloaded_keys: Boolean(vals[idx++]),
   };
+
+  if (GLOBALS >= 7) {
+    globals.dora_decompose_debug = Boolean(vals[idx++]);
+    globals.dora_decompose_debug_n = Number(vals[idx++]);
+    globals.dora_decompose_debug_stack_depth = Number(vals[idx++]);
+    globals.dora_slice_fix = Boolean(vals[idx++]);
+  }
+
   return { rows, globals };
 }
 
@@ -114,8 +133,14 @@ function defaultState() {
       stack_enabled: true,
       verbose: false,
       log_unloaded_keys: false,
+      broadcast_modulations: true,
       broadcast_auto_scale: true,
       broadcast_scale: 1.0,
+      broadcast_include_dora_scale: false,
+      dora_decompose_debug: false,
+      dora_decompose_debug_n: 30,
+      dora_decompose_debug_stack_depth: 10,
+      dora_slice_fix: true,
     },
   };
 }
@@ -138,8 +163,16 @@ function sanitizeState(st) {
     stack_enabled: globalsIn.stack_enabled !== undefined ? !!globalsIn.stack_enabled : true,
     verbose: globalsIn.verbose !== undefined ? !!globalsIn.verbose : false,
     log_unloaded_keys: globalsIn.log_unloaded_keys !== undefined ? !!globalsIn.log_unloaded_keys : false,
+    broadcast_modulations: globalsIn.broadcast_modulations !== undefined ? !!globalsIn.broadcast_modulations : true,
     broadcast_auto_scale: globalsIn.broadcast_auto_scale !== undefined ? !!globalsIn.broadcast_auto_scale : true,
     broadcast_scale: Number.isFinite(+globalsIn.broadcast_scale) ? +globalsIn.broadcast_scale : 1.0,
+    broadcast_include_dora_scale: globalsIn.broadcast_include_dora_scale !== undefined ? !!globalsIn.broadcast_include_dora_scale : false,
+    dora_decompose_debug: globalsIn.dora_decompose_debug !== undefined ? !!globalsIn.dora_decompose_debug : false,
+    dora_decompose_debug_n: Number.isFinite(+globalsIn.dora_decompose_debug_n) ? Math.max(0, Math.floor(+globalsIn.dora_decompose_debug_n)) : 30,
+    dora_decompose_debug_stack_depth: Number.isFinite(+globalsIn.dora_decompose_debug_stack_depth)
+      ? Math.max(2, Math.min(64, Math.floor(+globalsIn.dora_decompose_debug_stack_depth)))
+      : 10,
+    dora_slice_fix: globalsIn.dora_slice_fix !== undefined ? !!globalsIn.dora_slice_fix : true,
   };
 
   return { rows, globals };
@@ -288,6 +321,28 @@ function buildUI(node, state, loraValues) {
   );
   wLogMissing.label = "Log Unloaded Keys";
 
+  const wBroadcastMods = node.addWidget(
+    "toggle",
+    "broadcast_modulations",
+    !!node._doraGlobals.broadcast_modulations,
+    (v) => {
+      node._doraGlobals.broadcast_modulations = !!v;
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+    }
+  );
+  wBroadcastMods.label = "Broadcast OneTrainer modulation LoRAs";
+
+  const wIncludeDoraScale = node.addWidget(
+    "toggle",
+    "broadcast_include_dora_scale",
+    !!node._doraGlobals.broadcast_include_dora_scale,
+    (v) => {
+      node._doraGlobals.broadcast_include_dora_scale = !!v;
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+    }
+  );
+  wIncludeDoraScale.label = "Include DoRA dora_scale in broadcast";
+
   const wAutoScale = node.addWidget(
     "toggle",
     "broadcast_auto_scale",
@@ -310,6 +365,53 @@ function buildUI(node, state, loraValues) {
     { min: 0.0, max: 64.0, step: 0.05 }
   );
   wScale.label = "Broadcast scale";
+
+  // ---------------- DoRA decompose debug controls (node-adjustable) ----------------
+  const wDoraSliceFix = node.addWidget(
+    "toggle",
+    "dora_slice_fix",
+    !!node._doraGlobals.dora_slice_fix,
+    (v) => {
+      node._doraGlobals.dora_slice_fix = !!v;
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+    }
+  );
+  wDoraSliceFix.label = "DoRA slice-fix for offset patches (Flux2)";
+
+  const wDoraDbg = node.addWidget(
+    "toggle",
+    "dora_decompose_debug",
+    !!node._doraGlobals.dora_decompose_debug,
+    (v) => {
+      node._doraGlobals.dora_decompose_debug = !!v;
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+    }
+  );
+  wDoraDbg.label = "DoRA decompose debug logs";
+
+  const wDoraDbgN = node.addWidget(
+    "number",
+    "dora_decompose_debug_n",
+    Number.isFinite(+node._doraGlobals.dora_decompose_debug_n) ? +node._doraGlobals.dora_decompose_debug_n : 30,
+    (v) => {
+      node._doraGlobals.dora_decompose_debug_n = Math.max(0, Math.floor(+v || 0));
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+    },
+    { min: 0, max: 500, step: 1 }
+  );
+  wDoraDbgN.label = "DoRA debug lines";
+
+  const wDoraDbgStack = node.addWidget(
+    "number",
+    "dora_decompose_debug_stack_depth",
+    Number.isFinite(+node._doraGlobals.dora_decompose_debug_stack_depth) ? +node._doraGlobals.dora_decompose_debug_stack_depth : 10,
+    (v) => {
+      node._doraGlobals.dora_decompose_debug_stack_depth = Math.max(2, Math.min(64, Math.floor(+v || 10)));
+      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+    },
+    { min: 2, max: 64, step: 1 }
+  );
+  wDoraDbgStack.label = "DoRA debug stack depth";
 
   // Ensure node is tall enough
   const size = node.computeSize();
@@ -348,8 +450,14 @@ app.registerExtension({
               globals: {
                 ...parsed.globals,
                 // new fields default
+                broadcast_modulations: true,
                 broadcast_auto_scale: true,
                 broadcast_scale: 1.0,
+                broadcast_include_dora_scale: false,
+                dora_decompose_debug: false,
+                dora_decompose_debug_n: 30,
+                dora_decompose_debug_stack_depth: 10,
+                dora_slice_fix: true,
               },
             });
           } else {
