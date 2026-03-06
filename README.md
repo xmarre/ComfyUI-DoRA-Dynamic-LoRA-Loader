@@ -105,9 +105,9 @@ The loader emits warnings when:
 
 ## Install
 
-Copy the folder into:
+Copy this repository folder into:
 
-`ComfyUI/custom_nodes/comfyui_dora_dynamic_lora/`
+`ComfyUI/custom_nodes/ComfyUI-DoRA-Dynamic-LoRA-Loader/`
 
 Restart ComfyUI.
 

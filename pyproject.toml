@@ -1,0 +1,16 @@
+[project]
+name = "dora-dynamic-lora-loader"
+description = "A ComfyUI custom node that loads and stacks regular LoRAs and DoRA LoRAs with Flux/Flux2 and OneTrainer compatibility fixes."
+version = "1.0.0"
+license = { file = "LICENSE" }
+
+[project.urls]
+Repository = "https://github.com/xmarre/ComfyUI-DoRA-Dynamic-LoRA-Loader"
+Documentation = "https://github.com/xmarre/ComfyUI-DoRA-Dynamic-LoRA-Loader#readme"
+"Bug Tracker" = "https://github.com/xmarre/ComfyUI-DoRA-Dynamic-LoRA-Loader/issues"
+
+[tool.comfy]
+PublisherId = "xmarre"
+DisplayName = "ComfyUI-DoRA-Dynamic-LoRA-Loader"
+Icon = ""
+includes = ["__init__.py", "nodes.py", "web"]
