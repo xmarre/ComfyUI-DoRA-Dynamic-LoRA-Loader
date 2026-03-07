@@ -3,6 +3,9 @@ import { app } from "../../scripts/app.js";
 const NODE_CLASS = "DoRA Power LoRA Loader";
 const EXT_NAME = "comfyui_dora_dynamic_lora.power_lora_loader";
 const LORA_API = "/dora_dynamic_lora/loras";
+const ROW_HEIGHT = 24;
+const HORIZ_MARGIN = 15;
+const WEIGHT_STEP = 0.05;
 
 let _cachedLoras = null;
 let _cachedLorasPromise = null;
@@ -20,7 +23,6 @@ async function fetchLoras() {
     try {
       let loras = null;
 
-      // 1) Preferred: our custom backend endpoint (stable across ComfyUI versions).
       try {
         const r = await fetch(LORA_API, { cache: "no-store" });
         if (r.ok) {
@@ -29,7 +31,6 @@ async function fetchLoras() {
         }
       } catch (_) {}
 
-      // 2) Fallback: some builds expose /object_info (all nodes) but not /object_info/<NodeName>
       if (!Array.isArray(loras)) {
         try {
           const r = await fetch("/object_info", { cache: "no-store" });
@@ -43,14 +44,12 @@ async function fetchLoras() {
         } catch (_) {}
       }
 
-      // Normalize
       const list = Array.isArray(loras) ? loras : [];
       const out = ["None", ...list.filter((x) => x && x !== "None" && x !== "NONE")];
       _cachedLoras = out;
       return out;
     } catch (e) {
       console.warn(`[${EXT_NAME}] Failed to fetch LoRAs`, e);
-      // Don't permanently cache failure; allow refresh/retry.
       return ["None"];
     } finally {
       _cachedLorasPromise = null;
@@ -58,6 +57,32 @@ async function fetchLoras() {
   })();
 
   return _cachedLorasPromise;
+}
+
+function getThemeColors() {
+  const lg = globalThis.LiteGraph || {};
+  return {
+    bg: lg.WIDGET_BGCOLOR || "#222",
+    text: lg.WIDGET_TEXT_COLOR || "#DDD",
+    secondary: lg.WIDGET_SECONDARY_TEXT_COLOR || "#999",
+    outline: lg.WIDGET_OUTLINE_COLOR || "#666",
+  };
+}
+
+function drawRoundedRect(ctx, x, y, w, h, r) {
+  if (typeof ctx.roundRect === "function") {
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, [r]);
+    return;
+  }
+  const rr = Math.max(0, Math.min(r, Math.min(w, h) / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
 }
 
 function removeAllWidgets(node) {
@@ -74,23 +99,16 @@ function makeRowDefaults() {
   };
 }
 
-// Back-compat for old workflows that saved widgets_values.
 function parseRowsFromWidgetValues(widgetsValues) {
-  // legacy serialized layouts:
-  //   compact per-row: enabled, name, strengthModel  (3)
-  //   old per-row: enabled, name, strengthModel, strengthClip  (4)
-  //   globals v1: stack_enabled, verbose, log_unloaded_keys   (3)
-  //   globals v2: v1 + dora_decompose_debug, dora_decompose_debug_n,
-  //               dora_decompose_debug_stack_depth, dora_slice_fix (7)
   const vals = Array.isArray(widgetsValues) ? widgetsValues : [];
 
-  const parseWithLayout = (PER_ROW, GLOBALS) => {
-    if (vals.length < GLOBALS) return null;
-    if ((vals.length - GLOBALS) % PER_ROW !== 0) return null;
+  const parseWithLayout = (perRow, globalsCount) => {
+    if (vals.length < globalsCount) return null;
+    if ((vals.length - globalsCount) % perRow !== 0) return null;
 
     const outRows = [];
     let idx = 0;
-    const rowsCount = Math.max(0, Math.floor((vals.length - GLOBALS) / PER_ROW));
+    const rowsCount = Math.max(0, Math.floor((vals.length - globalsCount) / perRow));
     for (let i = 0; i < rowsCount; i++) {
       const r = makeRowDefaults();
       r.enabled = Boolean(vals[idx++]);
@@ -98,7 +116,7 @@ function parseRowsFromWidgetValues(widgetsValues) {
       r.name = typeof nm === "string" ? nm : (nm ?? "None");
       const sm = Number(vals[idx++]);
       r.strengthModel = sm;
-      if (PER_ROW === 4) {
+      if (perRow === 4) {
         const sc = Number(vals[idx++]);
         r.strengthClip = Number.isFinite(sc) ? sc : sm;
       } else {
@@ -113,12 +131,12 @@ function parseRowsFromWidgetValues(widgetsValues) {
       log_unloaded_keys: Boolean(vals[idx++]),
     };
 
-    if (GLOBALS >= 7) {
+    if (globalsCount >= 7) {
       globals.dora_decompose_debug = Boolean(vals[idx++]);
       globals.dora_decompose_debug_n = Number(vals[idx++]);
       globals.dora_decompose_debug_stack_depth = Number(vals[idx++]);
       globals.dora_slice_fix = Boolean(vals[idx++]);
-      globals.dora_adaln_swap_fix = true; // legacy widgets_values never had this; default to on
+      globals.dora_adaln_swap_fix = true;
     }
 
     return { rows: outRows, globals };
@@ -142,8 +160,8 @@ function parseRowsFromWidgetValues(widgetsValues) {
     [3, 7],
   ];
 
-  for (const [perRow, globals] of layouts) {
-    const parsed = parseWithLayout(perRow, globals);
+  for (const [perRow, globalsCount] of layouts) {
+    const parsed = parseWithLayout(perRow, globalsCount);
     if (looksValid(parsed)) return parsed;
   }
 
@@ -180,7 +198,9 @@ function sanitizeState(st) {
         enabled: !!r.enabled,
         name: typeof r.name === "string" ? r.name : "None",
         strengthModel: Number.isFinite(+r.strengthModel) ? +r.strengthModel : 1.0,
-        strengthClip: Number.isFinite(+r.strengthClip) ? +r.strengthClip : (Number.isFinite(+r.strengthModel) ? +r.strengthModel : 1.0),
+        strengthClip: Number.isFinite(+r.strengthClip)
+          ? +r.strengthClip
+          : (Number.isFinite(+r.strengthModel) ? +r.strengthModel : 1.0),
       }))
     : [makeRowDefaults()];
 
@@ -191,9 +211,12 @@ function sanitizeState(st) {
     broadcast_modulations: globalsIn.broadcast_modulations !== undefined ? !!globalsIn.broadcast_modulations : true,
     broadcast_auto_scale: globalsIn.broadcast_auto_scale !== undefined ? !!globalsIn.broadcast_auto_scale : true,
     broadcast_scale: Number.isFinite(+globalsIn.broadcast_scale) ? +globalsIn.broadcast_scale : 1.0,
-    broadcast_include_dora_scale: globalsIn.broadcast_include_dora_scale !== undefined ? !!globalsIn.broadcast_include_dora_scale : false,
+    broadcast_include_dora_scale:
+      globalsIn.broadcast_include_dora_scale !== undefined ? !!globalsIn.broadcast_include_dora_scale : false,
     dora_decompose_debug: globalsIn.dora_decompose_debug !== undefined ? !!globalsIn.dora_decompose_debug : false,
-    dora_decompose_debug_n: Number.isFinite(+globalsIn.dora_decompose_debug_n) ? Math.max(0, Math.floor(+globalsIn.dora_decompose_debug_n)) : 30,
+    dora_decompose_debug_n: Number.isFinite(+globalsIn.dora_decompose_debug_n)
+      ? Math.max(0, Math.floor(+globalsIn.dora_decompose_debug_n))
+      : 30,
     dora_decompose_debug_stack_depth: Number.isFinite(+globalsIn.dora_decompose_debug_stack_depth)
       ? Math.max(2, Math.min(64, Math.floor(+globalsIn.dora_decompose_debug_stack_depth)))
       : 10,
@@ -215,8 +238,11 @@ function setState(node, st) {
   node.properties.dora_power_lora = sanitizeState(st);
 }
 
+function persistNodeState(node) {
+  setState(node, { rows: node._doraRows || [], globals: node._doraGlobals || {} });
+}
+
 function setButtonCallback(widget, cb) {
-  // ComfyUI/LiteGraph variants differ; force callback into the widget object.
   if (!widget) return;
   widget.callback = cb;
   widget.options = widget.options || {};
@@ -233,94 +259,281 @@ function rebuild(node) {
   });
 }
 
+class DoraLoraRowWidget {
+  constructor(name, parentNode, row) {
+    this.name = name;
+    this.type = "custom";
+    this.parentNode = parentNode;
+    this.row = row;
+    this.last_y = 0;
+    this.hitAreas = {
+      toggle: [0, 0],
+      name: [0, 0],
+      weightDec: [0, 0],
+      weightInc: [0, 0],
+      weightVal: [0, 0],
+    };
+  }
+
+  computeSize(width) {
+    return [width, ROW_HEIGHT];
+  }
+
+  serializeValue() {
+    return {
+      on: !!this.row.enabled,
+      lora: this.row.name ?? "None",
+      strength: Number.isFinite(+this.row.strengthModel) ? +this.row.strengthModel : 1.0,
+      strengthTwo: Number.isFinite(+this.row.strengthClip)
+        ? +this.row.strengthClip
+        : (Number.isFinite(+this.row.strengthModel) ? +this.row.strengthModel : 1.0),
+    };
+  }
+
+  draw(ctx, node, width, posY, height) {
+    const colors = getThemeColors();
+    const x = HORIZ_MARGIN;
+    const widgetWidth = width - HORIZ_MARGIN * 2;
+    const midY = posY + height / 2;
+    this.last_y = posY;
+
+    const globalOn = node.widgets.find((w) => w.name === "stack_enabled")?.value !== false;
+    const effectiveOn = !!this.row.enabled && globalOn;
+
+    ctx.save();
+
+    ctx.fillStyle = colors.bg;
+    ctx.strokeStyle = colors.outline;
+    drawRoundedRect(ctx, x, posY + 2, widgetWidth, height - 4, 4);
+    ctx.fill();
+    ctx.stroke();
+
+    const toggleWidth = 20;
+    const toggleHeight = 12;
+    const toggleX = x + 8;
+    const toggleY = midY - toggleHeight / 2;
+
+    ctx.fillStyle = colors.outline;
+    drawRoundedRect(ctx, toggleX, toggleY, toggleWidth, toggleHeight, toggleHeight / 2);
+    ctx.fill();
+
+    ctx.fillStyle = globalOn ? colors.text : colors.secondary;
+    const knobX = this.row.enabled ? toggleX + toggleWidth - 6 : toggleX + 6;
+    ctx.beginPath();
+    ctx.arc(knobX, midY, 4, 0, Math.PI * 2);
+    ctx.fill();
+    this.hitAreas.toggle = [toggleX, toggleX + toggleWidth];
+
+    const weightAreaWidth = 74;
+    const nameX = toggleX + toggleWidth + 10;
+    const nameWidth = widgetWidth - (nameX - x) - weightAreaWidth - 4;
+
+    ctx.fillStyle = effectiveOn ? colors.text : colors.secondary;
+    ctx.font = "12px Arial";
+    ctx.textAlign = "left";
+
+    let displayLabel = this.row.name || "None";
+    const metrics = ctx.measureText(displayLabel);
+    if (metrics.width > nameWidth) {
+      const avgCharWidth = 7;
+      const maxChars = Math.max(4, Math.floor(nameWidth / avgCharWidth));
+      if (displayLabel.length > maxChars) {
+        displayLabel = `${displayLabel.substring(0, maxChars - 3)}...`;
+      }
+    }
+
+    ctx.fillText(displayLabel, nameX, midY + 4);
+    this.hitAreas.name = [nameX, nameX + nameWidth];
+
+    const rightX = x + widgetWidth - 5;
+    const valueCenter = rightX - 35;
+    const arrowGap = 22;
+    const weightValue = Number.isFinite(+this.row.strengthModel) ? +this.row.strengthModel : 1.0;
+
+    ctx.textAlign = "center";
+    ctx.fillText(">", valueCenter + arrowGap, midY + 4);
+    this.hitAreas.weightInc = [valueCenter + arrowGap - 10, valueCenter + arrowGap + 10];
+
+    ctx.fillStyle = effectiveOn ? colors.text : colors.secondary;
+    ctx.fillText(weightValue.toFixed(2), valueCenter, midY + 4);
+    this.hitAreas.weightVal = [valueCenter - 18, valueCenter + 18];
+
+    ctx.fillText("<", valueCenter - arrowGap, midY + 4);
+    this.hitAreas.weightDec = [valueCenter - arrowGap - 10, valueCenter - arrowGap + 10];
+
+    ctx.restore();
+  }
+
+  async chooseLora(event) {
+    const loras = await fetchLoras();
+    const ContextMenu = globalThis.LiteGraph?.ContextMenu;
+    if (!ContextMenu) return;
+    new ContextMenu(loras, {
+      event,
+      callback: (value) => {
+        this.row.name = value || "None";
+        persistNodeState(this.parentNode);
+        this.parentNode.setDirtyCanvas(true, true);
+      },
+    });
+  }
+
+  updateWeight(next) {
+    const value = Number.isFinite(+next) ? +next : 1.0;
+    this.row.strengthModel = value;
+    this.row.strengthClip = value;
+    persistNodeState(this.parentNode);
+  }
+
+  openRowMenu(event, node) {
+    const ContextMenu = globalThis.LiteGraph?.ContextMenu;
+    if (!ContextMenu) return false;
+
+    const rows = node._doraRows || [];
+    const rowIndex = rows.indexOf(this.row);
+    if (rowIndex < 0) return false;
+
+    const items = [
+      {
+        content: this.row.enabled ? "Toggle Off" : "Toggle On",
+        callback: () => {
+          this.row.enabled = !this.row.enabled;
+          persistNodeState(this.parentNode);
+          this.parentNode.setDirtyCanvas(true, true);
+        },
+      },
+      rowIndex > 0
+        ? {
+            content: "Move Up",
+            callback: () => {
+              [rows[rowIndex - 1], rows[rowIndex]] = [rows[rowIndex], rows[rowIndex - 1]];
+              persistNodeState(this.parentNode);
+              buildUI(this.parentNode, getState(this.parentNode), _cachedLoras || ["None"]);
+              this.parentNode.setDirtyCanvas(true, true);
+            },
+          }
+        : null,
+      rowIndex < rows.length - 1
+        ? {
+            content: "Move Down",
+            callback: () => {
+              [rows[rowIndex], rows[rowIndex + 1]] = [rows[rowIndex + 1], rows[rowIndex]];
+              persistNodeState(this.parentNode);
+              buildUI(this.parentNode, getState(this.parentNode), _cachedLoras || ["None"]);
+              this.parentNode.setDirtyCanvas(true, true);
+            },
+          }
+        : null,
+      {
+        content: "Remove",
+        callback: () => {
+          rows.splice(rowIndex, 1);
+          if (!rows.length) rows.push(makeRowDefaults());
+          persistNodeState(this.parentNode);
+          buildUI(this.parentNode, getState(this.parentNode), _cachedLoras || ["None"]);
+          this.parentNode.setDirtyCanvas(true, true);
+        },
+      },
+    ].filter(Boolean);
+
+    new ContextMenu(items, { event });
+    return true;
+  }
+
+  mouse(event, pos, node) {
+    if (event.type !== "pointerdown") return false;
+
+    if (event.button === 2) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      return this.openRowMenu(event, node);
+    }
+
+    const globalOn = node.widgets.find((w) => w.name === "stack_enabled")?.value !== false;
+    if (!globalOn) return false;
+
+    const widgetX = pos[0];
+
+    if (widgetX >= this.hitAreas.toggle[0] && widgetX <= this.hitAreas.toggle[1]) {
+      this.row.enabled = !this.row.enabled;
+      persistNodeState(this.parentNode);
+    } else if (widgetX >= this.hitAreas.name[0] && widgetX <= this.hitAreas.name[1]) {
+      this.chooseLora(event);
+    } else if (widgetX >= this.hitAreas.weightDec[0] && widgetX <= this.hitAreas.weightDec[1]) {
+      this.updateWeight(Math.round(((+this.row.strengthModel || 1.0) - WEIGHT_STEP) * 100) / 100);
+    } else if (widgetX >= this.hitAreas.weightInc[0] && widgetX <= this.hitAreas.weightInc[1]) {
+      this.updateWeight(Math.round(((+this.row.strengthModel || 1.0) + WEIGHT_STEP) * 100) / 100);
+    } else if (widgetX >= this.hitAreas.weightVal[0] && widgetX <= this.hitAreas.weightVal[1]) {
+      app.canvas.prompt(
+        "LoRA Weight",
+        Number.isFinite(+this.row.strengthModel) ? +this.row.strengthModel : 1.0,
+        (v) => {
+          const parsed = parseFloat(v);
+          if (!Number.isNaN(parsed)) {
+            this.updateWeight(parsed);
+            node.setDirtyCanvas(true, true);
+          }
+        },
+        event
+      );
+    } else {
+      return false;
+    }
+
+    this.parentNode.setDirtyCanvas(true, true);
+    return true;
+  }
+}
+
 function buildUI(node, state, loraValues) {
   const st = sanitizeState(state);
   setState(node, st);
   removeAllWidgets(node);
-
   node._doraRows = st.rows;
   node._doraGlobals = st.globals;
 
   const loras = Array.isArray(loraValues) ? loraValues : ["None"];
 
-  // Refresh button (helps if new LoRAs are added without restarting)
-  const wRefresh = node.addWidget("button", "refresh_loras", "↻ Refresh LoRAs");
+  const wRefresh = node.addWidget("button", "refresh_loras", "Refresh LoRAs");
   setButtonCallback(wRefresh, () => {
     invalidateLorasCache();
     rebuild(node);
   });
   wRefresh.serialize = false;
 
-  // Rows
   node._doraRows.forEach((row, i) => {
-    const n = i + 1;
-
-    const wEnabled = node.addWidget("toggle", `lora_${n}_enabled`, !!row.enabled, (v) => {
-      row.enabled = !!v;
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
-    });
-    wEnabled.label = `LoRA ${n}`;
-
-    const wName = node.addWidget("combo", `lora_${n}_name`, row.name ?? "None", (v) => (row.name = v), {
-      values: loras,
-    });
-    wName.label = `Name`;
-    // ensure state persists
-    const _origNameCb = wName.callback;
-    wName.callback = (v) => {
-      if (_origNameCb) _origNameCb(v);
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
-    };
-
-    const wSm = node.addWidget(
-      "number",
-      `lora_${n}_strength_model`,
-      Number.isFinite(row.strengthModel) ? row.strengthModel : 1.0,
-      (v) => {
-        row.strengthModel = Number(v);
-        setState(node, { rows: node._doraRows, globals: node._doraGlobals });
-      },
-      { min: -10.0, max: 10.0, step: 0.05 }
-    );
-    wSm.label = `Weight`;
-
-    const wRemove = node.addWidget("button", `lora_${n}_remove`, "✖ Remove");
-    setButtonCallback(wRemove, () => {
-      node._doraRows.splice(i, 1);
-      if (!node._doraRows.length) node._doraRows.push(makeRowDefaults());
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
-      // Rebuild with current cached loras (or "None")
-      buildUI(node, getState(node), _cachedLoras || ["None"]);
-      node.setDirtyCanvas(true, true);
-    });
-    wRemove.serialize = false;
+    const widget = new DoraLoraRowWidget(`LORA_${i + 1}`, node, row);
+    if (typeof node.addCustomWidget === "function") {
+      node.addCustomWidget(widget);
+    } else {
+      node.widgets.push(widget);
+    }
   });
 
-  // Add row button
-  const wAdd = node.addWidget("button", "add_lora", "➕ Add LoRA");
+  const wAdd = node.addWidget("button", "add_lora", "Add LoRA");
   setButtonCallback(wAdd, () => {
     node._doraRows.push(makeRowDefaults());
-    setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+    persistNodeState(node);
     buildUI(node, getState(node), _cachedLoras || ["None"]);
     node.setDirtyCanvas(true, true);
   });
   wAdd.serialize = false;
 
-  // Globals (serialized)
   const wStackEnabled = node.addWidget(
     "toggle",
     "stack_enabled",
     !!node._doraGlobals.stack_enabled,
     (v) => {
       node._doraGlobals.stack_enabled = !!v;
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+      persistNodeState(node);
+      node.setDirtyCanvas(true, true);
     }
   );
   wStackEnabled.label = "Stack Enabled";
 
   const wVerbose = node.addWidget("toggle", "verbose", !!node._doraGlobals.verbose, (v) => {
     node._doraGlobals.verbose = !!v;
-    setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+    persistNodeState(node);
   });
   wVerbose.label = "Verbose";
 
@@ -330,7 +543,7 @@ function buildUI(node, state, loraValues) {
     !!node._doraGlobals.log_unloaded_keys,
     (v) => {
       node._doraGlobals.log_unloaded_keys = !!v;
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+      persistNodeState(node);
     }
   );
   wLogMissing.label = "Log Unloaded Keys";
@@ -341,7 +554,7 @@ function buildUI(node, state, loraValues) {
     !!node._doraGlobals.broadcast_modulations,
     (v) => {
       node._doraGlobals.broadcast_modulations = !!v;
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+      persistNodeState(node);
     }
   );
   wBroadcastMods.label = "Broadcast OneTrainer modulation LoRAs";
@@ -352,7 +565,7 @@ function buildUI(node, state, loraValues) {
     !!node._doraGlobals.broadcast_include_dora_scale,
     (v) => {
       node._doraGlobals.broadcast_include_dora_scale = !!v;
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+      persistNodeState(node);
     }
   );
   wIncludeDoraScale.label = "Include DoRA dora_scale in broadcast";
@@ -363,7 +576,7 @@ function buildUI(node, state, loraValues) {
     !!node._doraGlobals.broadcast_auto_scale,
     (v) => {
       node._doraGlobals.broadcast_auto_scale = !!v;
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+      persistNodeState(node);
     }
   );
   wAutoScale.label = "Auto-scale broadcast";
@@ -374,20 +587,19 @@ function buildUI(node, state, loraValues) {
     Number.isFinite(node._doraGlobals.broadcast_scale) ? node._doraGlobals.broadcast_scale : 1.0,
     (v) => {
       node._doraGlobals.broadcast_scale = Number(v);
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+      persistNodeState(node);
     },
     { min: 0.0, max: 64.0, step: 0.05 }
   );
   wScale.label = "Broadcast scale";
 
-  // ---------------- DoRA decompose debug controls (node-adjustable) ----------------
   const wDoraSliceFix = node.addWidget(
     "toggle",
     "dora_slice_fix",
     !!node._doraGlobals.dora_slice_fix,
     (v) => {
       node._doraGlobals.dora_slice_fix = !!v;
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+      persistNodeState(node);
     }
   );
   wDoraSliceFix.label = "DoRA slice-fix for offset patches (Flux2)";
@@ -398,7 +610,7 @@ function buildUI(node, state, loraValues) {
     !!node._doraGlobals.dora_adaln_swap_fix,
     (v) => {
       node._doraGlobals.dora_adaln_swap_fix = !!v;
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+      persistNodeState(node);
     }
   );
   wDoraAdaLNSwap.label = "DoRA adaLN swap_scale_shift fix";
@@ -409,7 +621,7 @@ function buildUI(node, state, loraValues) {
     !!node._doraGlobals.dora_decompose_debug,
     (v) => {
       node._doraGlobals.dora_decompose_debug = !!v;
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+      persistNodeState(node);
     }
   );
   wDoraDbg.label = "DoRA decompose debug logs";
@@ -420,7 +632,7 @@ function buildUI(node, state, loraValues) {
     Number.isFinite(+node._doraGlobals.dora_decompose_debug_n) ? +node._doraGlobals.dora_decompose_debug_n : 30,
     (v) => {
       node._doraGlobals.dora_decompose_debug_n = Math.max(0, Math.floor(+v || 0));
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+      persistNodeState(node);
     },
     { min: 0, max: 500, step: 1 }
   );
@@ -432,13 +644,12 @@ function buildUI(node, state, loraValues) {
     Number.isFinite(+node._doraGlobals.dora_decompose_debug_stack_depth) ? +node._doraGlobals.dora_decompose_debug_stack_depth : 10,
     (v) => {
       node._doraGlobals.dora_decompose_debug_stack_depth = Math.max(2, Math.min(64, Math.floor(+v || 10)));
-      setState(node, { rows: node._doraRows, globals: node._doraGlobals });
+      persistNodeState(node);
     },
     { min: 2, max: 64, step: 1 }
   );
   wDoraDbgStack.label = "DoRA debug stack depth";
 
-  // Ensure node is tall enough
   const size = node.computeSize();
   node.size[0] = Math.max(node.size[0], size[0]);
   node.size[1] = Math.max(node.size[1], size[1]);
@@ -456,42 +667,35 @@ app.registerExtension({
       return r;
     };
 
-    // Make workflow loading safe:
-    // - NEVER let base configure apply widgets_values to our dynamic widget list.
-    // - Persist state in node.properties.dora_power_lora.
+
     const origConfigure = nodeType.prototype.configure;
     nodeType.prototype.configure = function (info) {
       try {
-        // 1) Use new persisted state if present
         let st = null;
         if (info?.properties?.dora_power_lora) {
           st = sanitizeState(info.properties.dora_power_lora);
+        } else if (Array.isArray(info?.widgets_values) && info.widgets_values.length) {
+          const parsed = parseRowsFromWidgetValues(info.widgets_values);
+          st = sanitizeState({
+            rows: parsed.rows,
+            globals: {
+              ...parsed.globals,
+              broadcast_modulations: true,
+              broadcast_auto_scale: true,
+              broadcast_scale: 1.0,
+              broadcast_include_dora_scale: false,
+              dora_decompose_debug: false,
+              dora_decompose_debug_n: 30,
+              dora_decompose_debug_stack_depth: 10,
+              dora_slice_fix: true,
+              dora_adaln_swap_fix: true,
+            },
+          });
         } else {
-          // Back-compat: migrate old widgets_values into properties once.
-          if (Array.isArray(info?.widgets_values) && info.widgets_values.length) {
-            const parsed = parseRowsFromWidgetValues(info.widgets_values);
-            st = sanitizeState({
-              rows: parsed.rows,
-              globals: {
-                ...parsed.globals,
-                // new fields default
-                broadcast_modulations: true,
-                broadcast_auto_scale: true,
-                broadcast_scale: 1.0,
-                broadcast_include_dora_scale: false,
-                dora_decompose_debug: false,
-                dora_decompose_debug_n: 30,
-                dora_decompose_debug_stack_depth: 10,
-                dora_slice_fix: true,
-              },
-            });
-          } else {
-            st = defaultState();
-          }
+          st = defaultState();
         }
         setState(this, st);
 
-        // 2) Call base configure with widgets_values removed so it cannot abort workflow loading.
         if (origConfigure) {
           const safeInfo = info ? { ...info } : info;
           if (safeInfo) delete safeInfo.widgets_values;
@@ -514,7 +718,6 @@ app.registerExtension({
       return this;
     };
 
-    // Ensure saves never include widgets_values (avoids "Widget not found" on future loads).
     const origOnSerialize = nodeType.prototype.onSerialize;
     nodeType.prototype.onSerialize = function (o) {
       try {
