@@ -486,6 +486,10 @@ class DoraLoraRowWidget {
 }
 
 function buildUI(node, state, loraValues) {
+  console.log(`[${EXT_NAME}] buildUI`, {
+    widgetsBefore: node.widgets?.map((w) => w.name),
+    rows: state?.rows,
+  });
   const st = sanitizeState(state);
   setState(node, st);
   removeAllWidgets(node);
@@ -658,19 +662,37 @@ function buildUI(node, state, loraValues) {
 app.registerExtension({
   name: EXT_NAME,
   async beforeRegisterNodeDef(nodeType, nodeData) {
-    if (nodeData?.name !== NODE_CLASS) return;
+    const nodeName = nodeData?.name ?? "";
+    const displayName = nodeData?.display_name ?? "";
+    const comfyClass = nodeType?.comfyClass ?? "";
+    const pythonClass = nodeData?.python_module ?? "";
+
+    const isTarget =
+      nodeName === NODE_CLASS ||
+      displayName === NODE_CLASS ||
+      comfyClass === NODE_CLASS;
+
+    if (!isTarget) return;
+
+    console.log(`[${EXT_NAME}] attaching frontend override`, {
+      nodeName,
+      displayName,
+      comfyClass,
+      pythonClass,
+    });
 
     const origOnNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const r = origOnNodeCreated?.apply(this, arguments);
+      console.log(`[${EXT_NAME}] onNodeCreated`, this);
       rebuild(this);
       return r;
     };
 
-
     const origConfigure = nodeType.prototype.configure;
     nodeType.prototype.configure = function (info) {
       try {
+        console.log(`[${EXT_NAME}] configure`, info);
         let st = null;
         if (info?.properties?.dora_power_lora) {
           st = sanitizeState(info.properties.dora_power_lora);
