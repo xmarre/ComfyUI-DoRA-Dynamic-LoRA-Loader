@@ -469,7 +469,7 @@ class DoraLoraRowWidget {
           activeIndex = index;
           render();
         };
-        item.onclick = (e) => {
+        item.onpointerdown = (e) => {
           e.preventDefault();
           e.stopPropagation();
           selectValue(name);
@@ -559,6 +559,7 @@ class DoraLoraRowWidget {
       startClientX: Number.isFinite(event?.clientX) ? event.clientX : 0,
       startValue: Number.isFinite(+this.row.strengthModel) ? +this.row.strengthModel : 1.0,
       moved: false,
+      lastSteps: 0,
       onPointerMove,
       onPointerUp,
     };
@@ -575,7 +576,8 @@ class DoraLoraRowWidget {
     const steps = Math.trunc(dx / WEIGHT_DRAG_PIXELS_PER_STEP);
     const next = this._drag.startValue + steps * WEIGHT_STEP;
     if (Math.abs(dx) >= 2) this._drag.moved = true;
-    if (steps !== 0) {
+    if (steps !== this._drag.lastSteps) {
+      this._drag.lastSteps = steps;
       this.updateWeight(next);
       this.parentNode.setDirtyCanvas(true, true);
     }
