@@ -6,6 +6,18 @@ const LORA_API = "/dora_dynamic_lora/loras";
 const ROW_HEIGHT = 24;
 const HORIZ_MARGIN = 15;
 const WEIGHT_STEP = 0.05;
+const WEIGHT_DRAG_PIXELS_PER_STEP = 12;
+
+function roundToStep(v, step = WEIGHT_STEP) {
+  const n = Number.isFinite(+v) ? +v : 0;
+  return Number((Math.round(n / step) * step).toFixed(10));
+}
+
+function closeActiveLoraPicker() {
+  const picker = globalThis.__doraActiveLoraPicker;
+  if (picker && typeof picker.close === "function") picker.close();
+  globalThis.__doraActiveLoraPicker = null;
+}
 
 let _cachedLoras = null;
 let _cachedLorasPromise = null;
@@ -266,6 +278,7 @@ class DoraLoraRowWidget {
     this.parentNode = parentNode;
     this.row = row;
     this.last_y = 0;
+    this._drag = null;
     this.hitAreas = {
       toggle: [0, 0],
       name: [0, 0],
@@ -364,25 +377,213 @@ class DoraLoraRowWidget {
     ctx.restore();
   }
 
-  async chooseLora(event) {
+  async openLoraPicker(event) {
     const loras = await fetchLoras();
-    const ContextMenu = globalThis.LiteGraph?.ContextMenu;
-    if (!ContextMenu) return;
-    new ContextMenu(loras, {
-      event,
-      callback: (value) => {
-        this.row.name = value || "None";
-        persistNodeState(this.parentNode);
-        this.parentNode.setDirtyCanvas(true, true);
-      },
+    closeActiveLoraPicker();
+
+    const picker = document.createElement("div");
+    picker.style.position = "fixed";
+    picker.style.left = `${Math.max(8, Math.floor(event.clientX || 0) - 12)}px`;
+    picker.style.top = `${Math.max(8, Math.floor(event.clientY || 0) - 12)}px`;
+    picker.style.width = "420px";
+    picker.style.maxWidth = "min(420px, calc(100vw - 16px))";
+    picker.style.maxHeight = "min(70vh, 560px)";
+    picker.style.background = "#18181b";
+    picker.style.border = "1px solid #3f3f46";
+    picker.style.borderRadius = "10px";
+    picker.style.boxShadow = "0 12px 30px rgba(0,0,0,0.45)";
+    picker.style.padding = "10px";
+    picker.style.zIndex = "100000";
+    picker.style.display = "flex";
+    picker.style.flexDirection = "column";
+    picker.style.gap = "8px";
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "Filter list";
+    input.value = "";
+    input.style.width = "100%";
+    input.style.boxSizing = "border-box";
+    input.style.background = "#09090b";
+    input.style.color = "#e4e4e7";
+    input.style.border = "1px solid #52525b";
+    input.style.borderRadius = "8px";
+    input.style.padding = "8px 10px";
+    input.style.outline = "none";
+
+    const list = document.createElement("div");
+    list.style.overflowY = "auto";
+    list.style.maxHeight = "min(52vh, 420px)";
+    list.style.display = "flex";
+    list.style.flexDirection = "column";
+    list.style.gap = "4px";
+
+    picker.append(input, list);
+    document.body.appendChild(picker);
+
+    let filtered = [];
+    let activeIndex = Math.max(0, loras.indexOf(this.row.name ?? "None"));
+
+    const selectValue = (value) => {
+      this.row.name = value || "None";
+      persistNodeState(this.parentNode);
+      this.parentNode.setDirtyCanvas(true, true);
+      close();
+    };
+
+    const render = () => {
+      const q = input.value.trim().toLowerCase();
+      filtered = loras.filter((name) => !q || String(name).toLowerCase().includes(q));
+      if (!filtered.length) {
+        activeIndex = 0;
+        list.innerHTML = `<div style="padding:8px 10px;color:#a1a1aa;">No matches</div>`;
+        return;
+      }
+      activeIndex = Math.max(0, Math.min(activeIndex, filtered.length - 1));
+      list.innerHTML = "";
+      filtered.forEach((name, index) => {
+        const item = document.createElement("button");
+        item.type = "button";
+        item.textContent = name;
+        item.style.textAlign = "left";
+        item.style.background = index === activeIndex ? "#27272a" : "transparent";
+        item.style.color = "#e4e4e7";
+        item.style.border = "1px solid #3f3f46";
+        item.style.borderRadius = "8px";
+        item.style.padding = "7px 10px";
+        item.style.cursor = "pointer";
+        item.style.whiteSpace = "nowrap";
+        item.style.overflow = "hidden";
+        item.style.textOverflow = "ellipsis";
+        item.onmouseenter = () => {
+          activeIndex = index;
+          render();
+        };
+        item.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          selectValue(name);
+        };
+        list.appendChild(item);
+      });
+    };
+
+    const onPointerDownOutside = (e) => {
+      if (!picker.contains(e.target)) close();
+    };
+
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        close();
+      } else if (e.key === "ArrowDown") {
+        if (!filtered.length) return;
+        e.preventDefault();
+        activeIndex = Math.min(filtered.length - 1, activeIndex + 1);
+        render();
+      } else if (e.key === "ArrowUp") {
+        if (!filtered.length) return;
+        e.preventDefault();
+        activeIndex = Math.max(0, activeIndex - 1);
+        render();
+      } else if (e.key === "Enter") {
+        if (!filtered.length) return;
+        e.preventDefault();
+        selectValue(filtered[activeIndex]);
+      }
+    };
+
+    const close = () => {
+      document.removeEventListener("pointerdown", onPointerDownOutside, true);
+      input.removeEventListener("keydown", onKeyDown);
+      picker.remove();
+      if (globalThis.__doraActiveLoraPicker?.close === close) {
+        globalThis.__doraActiveLoraPicker = null;
+      }
+    };
+
+    globalThis.__doraActiveLoraPicker = { close };
+    document.addEventListener("pointerdown", onPointerDownOutside, true);
+    input.addEventListener("keydown", onKeyDown);
+    input.addEventListener("input", () => {
+      activeIndex = 0;
+      render();
+    });
+
+    render();
+    queueMicrotask(() => {
+      input.focus();
+      input.select();
     });
   }
 
+  openNumericWeightPrompt(event) {
+    app.canvas.prompt(
+      "LoRA Weight",
+      Number.isFinite(+this.row.strengthModel) ? +this.row.strengthModel : 1.0,
+      (v) => {
+        const parsed = parseFloat(v);
+        if (!Number.isNaN(parsed)) {
+          this.updateWeight(parsed);
+          this.parentNode.setDirtyCanvas(true, true);
+        }
+      },
+      event
+    );
+  }
+
   updateWeight(next) {
-    const value = Number.isFinite(+next) ? +next : 1.0;
+    const value = roundToStep(Number.isFinite(+next) ? +next : 1.0);
     this.row.strengthModel = value;
     this.row.strengthClip = value;
     persistNodeState(this.parentNode);
+  }
+
+  startWeightDrag(event) {
+    if (this._drag) this.finishWeightDrag(event);
+
+    const onPointerMove = (moveEvent) => this.handleWeightDrag(moveEvent);
+    const onPointerUp = (upEvent) => this.finishWeightDrag(upEvent);
+
+    this._drag = {
+      startClientX: Number.isFinite(event?.clientX) ? event.clientX : 0,
+      startValue: Number.isFinite(+this.row.strengthModel) ? +this.row.strengthModel : 1.0,
+      moved: false,
+      onPointerMove,
+      onPointerUp,
+    };
+
+    window.addEventListener("pointermove", onPointerMove, true);
+    window.addEventListener("pointerup", onPointerUp, true);
+    window.addEventListener("pointercancel", onPointerUp, true);
+  }
+
+  handleWeightDrag(event) {
+    if (!this._drag) return false;
+    const clientX = Number.isFinite(event?.clientX) ? event.clientX : this._drag.startClientX;
+    const dx = clientX - this._drag.startClientX;
+    const steps = Math.trunc(dx / WEIGHT_DRAG_PIXELS_PER_STEP);
+    const next = this._drag.startValue + steps * WEIGHT_STEP;
+    if (Math.abs(dx) >= 2) this._drag.moved = true;
+    if (steps !== 0) {
+      this.updateWeight(next);
+      this.parentNode.setDirtyCanvas(true, true);
+    }
+    event.preventDefault?.();
+    return true;
+  }
+
+  finishWeightDrag(event) {
+    if (!this._drag) return false;
+    const drag = this._drag;
+    this._drag = null;
+    window.removeEventListener("pointermove", drag.onPointerMove, true);
+    window.removeEventListener("pointerup", drag.onPointerUp, true);
+    window.removeEventListener("pointercancel", drag.onPointerUp, true);
+    if (!drag.moved) this.openNumericWeightPrompt(event);
+    this.parentNode.setDirtyCanvas(true, true);
+    event.preventDefault?.();
+    return true;
   }
 
   openRowMenu(event, node) {
@@ -441,6 +642,10 @@ class DoraLoraRowWidget {
   }
 
   mouse(event, pos, node) {
+    if (event.type === "pointermove") return this.handleWeightDrag(event);
+    if (event.type === "pointerup" || event.type === "pointercancel" || event.type === "mouseup") {
+      return this.finishWeightDrag(event);
+    }
     if (event.type !== "pointerdown") return false;
 
     if (event.button === 2) {
@@ -458,24 +663,15 @@ class DoraLoraRowWidget {
       this.row.enabled = !this.row.enabled;
       persistNodeState(this.parentNode);
     } else if (widgetX >= this.hitAreas.name[0] && widgetX <= this.hitAreas.name[1]) {
-      this.chooseLora(event);
+      this.openLoraPicker(event);
     } else if (widgetX >= this.hitAreas.weightDec[0] && widgetX <= this.hitAreas.weightDec[1]) {
-      this.updateWeight(Math.round(((+this.row.strengthModel || 1.0) - WEIGHT_STEP) * 100) / 100);
+      this.updateWeight((+this.row.strengthModel || 1.0) - WEIGHT_STEP);
     } else if (widgetX >= this.hitAreas.weightInc[0] && widgetX <= this.hitAreas.weightInc[1]) {
-      this.updateWeight(Math.round(((+this.row.strengthModel || 1.0) + WEIGHT_STEP) * 100) / 100);
+      this.updateWeight((+this.row.strengthModel || 1.0) + WEIGHT_STEP);
     } else if (widgetX >= this.hitAreas.weightVal[0] && widgetX <= this.hitAreas.weightVal[1]) {
-      app.canvas.prompt(
-        "LoRA Weight",
-        Number.isFinite(+this.row.strengthModel) ? +this.row.strengthModel : 1.0,
-        (v) => {
-          const parsed = parseFloat(v);
-          if (!Number.isNaN(parsed)) {
-            this.updateWeight(parsed);
-            node.setDirtyCanvas(true, true);
-          }
-        },
-        event
-      );
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      this.startWeightDrag(event);
     } else {
       return false;
     }
@@ -486,10 +682,6 @@ class DoraLoraRowWidget {
 }
 
 function buildUI(node, state, loraValues) {
-  console.log(`[${EXT_NAME}] buildUI`, {
-    widgetsBefore: node.widgets?.map((w) => w.name),
-    rows: state?.rows,
-  });
   const st = sanitizeState(state);
   setState(node, st);
   removeAllWidgets(node);
@@ -674,17 +866,9 @@ app.registerExtension({
 
     if (!isTarget) return;
 
-    console.log(`[${EXT_NAME}] attaching frontend override`, {
-      nodeName,
-      displayName,
-      comfyClass,
-      pythonClass,
-    });
-
     const origOnNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const r = origOnNodeCreated?.apply(this, arguments);
-      console.log(`[${EXT_NAME}] onNodeCreated`, this);
       rebuild(this);
       return r;
     };
@@ -692,7 +876,6 @@ app.registerExtension({
     const origConfigure = nodeType.prototype.configure;
     nodeType.prototype.configure = function (info) {
       try {
-        console.log(`[${EXT_NAME}] configure`, info);
         let st = null;
         if (info?.properties?.dora_power_lora) {
           st = sanitizeState(info.properties.dora_power_lora);
