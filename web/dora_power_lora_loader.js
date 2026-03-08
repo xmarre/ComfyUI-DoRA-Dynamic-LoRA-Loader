@@ -6,7 +6,7 @@ const LORA_API = "/dora_dynamic_lora/loras";
 const ROW_HEIGHT = 24;
 const HORIZ_MARGIN = 15;
 const WEIGHT_STEP = 0.05;
-const WEIGHT_DRAG_PIXELS_PER_STEP = 12;
+const WEIGHT_DRAG_PIXELS_PER_STEP = 6;
 
 function roundToStep(v, step = WEIGHT_STEP) {
   const n = Number.isFinite(+v) ? +v : 0;
@@ -385,8 +385,8 @@ class DoraLoraRowWidget {
     picker.style.position = "fixed";
     picker.style.left = `${Math.max(8, Math.floor(event.clientX || 0) - 12)}px`;
     picker.style.top = `${Math.max(8, Math.floor(event.clientY || 0) - 12)}px`;
-    picker.style.width = "420px";
-    picker.style.maxWidth = "min(420px, calc(100vw - 16px))";
+    picker.style.width = "520px";
+    picker.style.maxWidth = "min(520px, calc(100vw - 16px))";
     picker.style.maxHeight = "min(70vh, 560px)";
     picker.style.background = "#18181b";
     picker.style.border = "1px solid #3f3f46";
@@ -417,6 +417,8 @@ class DoraLoraRowWidget {
     list.style.display = "flex";
     list.style.flexDirection = "column";
     list.style.gap = "4px";
+    list.style.paddingRight = "2px";
+    list.style.boxSizing = "border-box";
 
     picker.append(input, list);
     document.body.appendChild(picker);
@@ -442,19 +444,27 @@ class DoraLoraRowWidget {
       activeIndex = Math.max(0, Math.min(activeIndex, filtered.length - 1));
       list.innerHTML = "";
       filtered.forEach((name, index) => {
-        const item = document.createElement("button");
-        item.type = "button";
+        const item = document.createElement("div");
         item.textContent = name;
-        item.style.textAlign = "left";
-        item.style.background = index === activeIndex ? "#27272a" : "transparent";
+        item.style.display = "flex";
+        item.style.alignItems = "center";
+        item.style.width = "100%";
+        item.style.boxSizing = "border-box";
+        item.style.minHeight = "32px";
+        item.style.height = "32px";
+        item.style.padding = "0 10px";
+        item.style.background = index === activeIndex ? "#27272a" : "#111215";
         item.style.color = "#e4e4e7";
         item.style.border = "1px solid #3f3f46";
         item.style.borderRadius = "8px";
-        item.style.padding = "7px 10px";
+        item.style.fontSize = "13px";
+        item.style.lineHeight = "1.2";
+        item.style.fontFamily = "Arial, sans-serif";
         item.style.cursor = "pointer";
         item.style.whiteSpace = "nowrap";
         item.style.overflow = "hidden";
         item.style.textOverflow = "ellipsis";
+        item.style.userSelect = "none";
         item.onmouseenter = () => {
           activeIndex = index;
           render();
