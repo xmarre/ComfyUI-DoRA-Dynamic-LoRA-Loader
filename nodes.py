@@ -1289,29 +1289,6 @@ def _infer_flux_block_counts(model_sd_keys: Optional[Set[str]]) -> Tuple[int, in
     return (max_d + 1 if max_d >= 0 else 0, max_s + 1 if max_s >= 0 else 0)
 
 
-def _state_dict_looks_quantized(sd: Dict[str, Any]) -> bool:
-    """Heuristic: any int8/uint8/float8 tensors in state_dict => quantized/mixed precision build."""
-    float8_dtypes = []
-    for name in (
-        "float8_e4m3fn",
-        "float8_e5m2",
-        "float8_e4m3fnuz",
-        "float8_e5m2fnuz",
-    ):
-        dt = getattr(torch, name, None)
-        if dt is not None:
-            float8_dtypes.append(dt)
-
-    for v in sd.values():
-        if not isinstance(v, torch.Tensor):
-            continue
-        if v.dtype in (torch.int8, torch.uint8):
-            return True
-        if float8_dtypes and v.dtype in tuple(float8_dtypes):
-            return True
-    return False
-
-
 def _iter_tensors(obj: Any, path: str = ""):
     """Yield (path, tensor) pairs from arbitrary nested objects."""
     if isinstance(obj, torch.Tensor):
@@ -2083,7 +2060,6 @@ class DoraPowerLoraLoader:
         broadcast_scale: float,
         broadcast_modulations: bool,
         broadcast_include_dora_scale: bool,
-        model_is_quantized: bool,
         model_state_dict: Optional[Dict[str, Any]],
         model_sd_keys: Optional[Set[str]],
         model_sd_list: Optional[List[str]],
@@ -2172,16 +2148,6 @@ class DoraPowerLoraLoader:
 
         _log_lora_tensor_health(lora_name, lora_sd, verbose=verbose)
         _log_lora_direction_stats(lora_name, lora_sd, verbose=verbose)
-
-        # If your Flux2 base is quantized/mixed-precision, DoRA can produce NaNs in some ComfyUI builds
-        # (pink/magenta decode). Key-mapping can be 100% correct and you'll still get pink.
-        # We can't safely dequantize here without depending on ComfyUI internals, so we emit a clear warning.
-        if model_is_quantized and any(str(k).endswith(".dora_scale") for k in lora_sd.keys()):
-            _LOG.warning(
-                "[DoRA Power LoRA Loader] %s: quantized/mixed-precision base model detected; DoRA may produce NaNs (pink). "
-                "If this happens, test with an FP16 base (non-quantized) to confirm.",
-                lora_name,
-            )
 
         # Start with standard ComfyUI key map.
         key_map: Dict[str, Any] = {}
@@ -2344,7 +2310,6 @@ class DoraPowerLoraLoader:
         # Prepare state_dict key sets/lists once for dynamic matching.
         model_sd_keys = model_sd_list = None
         clip_sd_keys = clip_sd_list = None
-        model_is_quantized = False
         model_state_dict = None
         clip_state_dict = None
 
@@ -2352,12 +2317,6 @@ class DoraPowerLoraLoader:
             model_state_dict = new_model.model.state_dict()
             model_sd_list = list(model_state_dict.keys())
             model_sd_keys = set(model_sd_list)
-            model_is_quantized = _state_dict_looks_quantized(model_state_dict)
-            if model_is_quantized:
-                _LOG.warning(
-                    "[DoRA Power LoRA Loader] quantized/mixed-precision Flux/Flux2 detected in UNet state_dict; "
-                    "DoRA LoRAs can still map correctly but may output pink if the DoRA math path is unstable on quantized weights."
-                )
 
         if new_clip is not None:
             clip_state_dict = new_clip.cond_stage_model.state_dict()
@@ -2386,7 +2345,6 @@ class DoraPowerLoraLoader:
                 broadcast_scale=broadcast_scale,
                 broadcast_modulations=broadcast_modulations,
                 broadcast_include_dora_scale=broadcast_include_dora_scale,
-                model_is_quantized=model_is_quantized,
                 model_state_dict=model_state_dict,
                 model_sd_keys=model_sd_keys,
                 model_sd_list=model_sd_list,
