@@ -196,6 +196,7 @@ function defaultState() {
       dora_decompose_debug_stack_depth: 10,
       dora_slice_fix: true,
       dora_adaln_swap_fix: true,
+      zimage_lumina2_compat: true,
     },
   };
 }
@@ -234,6 +235,7 @@ function sanitizeState(st) {
       : 10,
     dora_slice_fix: globalsIn.dora_slice_fix !== undefined ? !!globalsIn.dora_slice_fix : true,
     dora_adaln_swap_fix: globalsIn.dora_adaln_swap_fix !== undefined ? !!globalsIn.dora_adaln_swap_fix : true,
+    zimage_lumina2_compat: globalsIn.zimage_lumina2_compat !== undefined ? !!globalsIn.zimage_lumina2_compat : true,
   };
 
   return { rows, globals };
@@ -823,6 +825,17 @@ function buildUI(node, state, loraValues) {
   );
   wDoraAdaLNSwap.label = "DoRA adaLN swap_scale_shift fix";
 
+  const wZImageCompat = node.addWidget(
+    "toggle",
+    "zimage_lumina2_compat",
+    !!node._doraGlobals.zimage_lumina2_compat,
+    (v) => {
+      node._doraGlobals.zimage_lumina2_compat = !!v;
+      persistNodeState(node);
+    }
+  );
+  wZImageCompat.label = "ZiT/Lumina2 auto-fix (QKV fuse + out remap)";
+
   const wDoraDbg = node.addWidget(
     "toggle",
     "dora_decompose_debug",
@@ -906,6 +919,7 @@ app.registerExtension({
               dora_decompose_debug_stack_depth: 10,
               dora_slice_fix: true,
               dora_adaln_swap_fix: true,
+              zimage_lumina2_compat: true,
             },
           });
         } else {

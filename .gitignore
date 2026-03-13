@@ -2,3 +2,5 @@
 *.suo
 *.VC.db
 *.VC.opendb
+__pycache__/
+*.pyc

@@ -654,6 +654,589 @@ def _clone_base_block(
     return created
 
 
+# --------------------------------------------------------------------------------------
+# Z-Image Turbo / Lumina2 compatibility
+# --------------------------------------------------------------------------------------
+
+_ZIMAGE_QKV_COMPONENTS = ("to_q", "to_k", "to_v")
+
+_ZIMAGE_QKV_MATRIX_FAMILIES = (
+    {
+        "name": "diffusers2",
+        "up_suffix": ".lora_B.weight",
+        "down_suffix": ".lora_A.weight",
+    },
+    {
+        "name": "diffusers2_default",
+        "up_suffix": ".lora_B.default.weight",
+        "down_suffix": ".lora_A.default.weight",
+    },
+    {
+        "name": "regular",
+        "up_suffix": ".lora_up.weight",
+        "down_suffix": ".lora_down.weight",
+    },
+    {
+        "name": "diffusers1",
+        "up_suffix": "_lora.up.weight",
+        "down_suffix": "_lora.down.weight",
+    },
+    {
+        "name": "diffusers3",
+        "up_suffix": ".lora.up.weight",
+        "down_suffix": ".lora.down.weight",
+    },
+    {
+        "name": "transformers",
+        "up_suffix": ".lora_linear_layer.up.weight",
+        "down_suffix": ".lora_linear_layer.down.weight",
+    },
+)
+
+_ZIMAGE_QKV_CAT_SUFFIXES = (
+    ".dora_scale",
+    ".w_norm",
+    ".b_norm",
+    ".diff",
+    ".diff_b",
+    ".set_weight",
+    ".reshape_weight",
+)
+
+_ZIMAGE_ATTN_ALIAS_REWRITES = (
+    (".attention.to.q.", ".attention.to_q."),
+    (".attention.to.k.", ".attention.to_k."),
+    (".attention.to.v.", ".attention.to_v."),
+    (".attention.to.out.0.", ".attention.to_out.0."),
+    (".attention.to.out.", ".attention.to_out."),
+)
+
+_ZIMAGE_UNDERSCORE_PREFIX_REWRITES = (
+    ("lora_unet_", ""),
+    ("lycoris_", ""),
+    ("diffusion_model_", "diffusion_model."),
+    ("base_model_model_", "base_model.model."),
+    ("base_model_", "base_model."),
+    ("transformer_", "transformer."),
+    ("model_", "model."),
+    ("unet_", "unet."),
+)
+
+_ZIMAGE_UNDERSCORE_ATTN_REWRITES = (
+    (".attention_to_q", ".attention.to_q"),
+    ("_attention_to_q", ".attention.to_q"),
+    (".attention_to_k", ".attention.to_k"),
+    ("_attention_to_k", ".attention.to_k"),
+    (".attention_to_v", ".attention.to_v"),
+    ("_attention_to_v", ".attention.to_v"),
+    (".attention_to_out_0", ".attention.to_out.0"),
+    ("_attention_to_out_0", ".attention.to_out.0"),
+    (".attention_out", ".attention.out"),
+    ("_attention_out", ".attention.out"),
+)
+
+
+def _looks_like_zimage_lumina2_model(model, model_sd_keys: Optional[Set[str]] = None) -> bool:
+    """
+    Best-effort detection for Z-Image Turbo / Lumina2 architectures.
+    Avoid relying on a specific ComfyUI class existing across builds.
+    """
+    try:
+        model_core = getattr(model, "model", model)
+        cls_name = type(model_core).__name__.lower()
+        if ("lumina2" in cls_name) or ("zimage" in cls_name) or ("z_image" in cls_name):
+            return True
+    except Exception:
+        pass
+
+    keys = model_sd_keys
+    if keys is None:
+        try:
+            sd = getattr(getattr(model, "model", model), "state_dict", None)
+            if callable(sd):
+                keys = set(sd().keys())
+        except Exception:
+            keys = None
+
+    if not keys:
+        return False
+
+    has_qkv = any(k.startswith("diffusion_model.layers.") and ".attention.qkv.weight" in k for k in keys)
+    has_out = any(k.startswith("diffusion_model.layers.") and ".attention.out.weight" in k for k in keys)
+    has_ff = any(k.startswith("diffusion_model.layers.") and ".feed_forward.w1.weight" in k for k in keys)
+    has_adaln = any(k.startswith("diffusion_model.layers.") and ".adaLN_modulation." in k for k in keys)
+    return has_qkv and has_out and (has_ff or has_adaln)
+
+
+def _looks_like_zimage_attention_lora(lora_sd: Dict[str, Any]) -> bool:
+    for k in lora_sd.keys():
+        ks = _normalize_zimage_attention_key_string(str(k))
+        has_layers = ks.startswith("layers.") or ".layers." in ks
+        if not has_layers or ".attention." not in ks:
+            continue
+        if (
+            ".attention.qkv." in ks
+            or ".attention.out." in ks
+            or ".attention.to_q." in ks
+            or ".attention.to_k." in ks
+            or ".attention.to_v." in ks
+            or ".attention.to.q." in ks
+            or ".attention.to.k." in ks
+            or ".attention.to.v." in ks
+            or ".attention.to_out.0." in ks
+            or ".attention.to.out.0." in ks
+        ):
+            return True
+    return False
+
+
+def _normalize_zimage_attention_key_string(key: str) -> str:
+    nk = key
+    for old, new in _ZIMAGE_ATTN_ALIAS_REWRITES:
+        if old in nk:
+            nk = nk.replace(old, new)
+
+    while True:
+        changed = False
+        for old, new in _ZIMAGE_UNDERSCORE_PREFIX_REWRITES:
+            if nk.startswith(old):
+                nk = new + nk[len(old) :]
+                changed = True
+                break
+        if not changed:
+            break
+
+    nk = re.sub(r"(^|[._])layers_(\d+)_", lambda m: f"{m.group(1)}layers.{m.group(2)}.", nk)
+
+    for old, new in _ZIMAGE_UNDERSCORE_ATTN_REWRITES:
+        if old in nk:
+            nk = nk.replace(old, new)
+
+    return nk
+
+
+def _zimage_add_key_aliases(key_map: Dict[str, Any], base: str, target: Any) -> int:
+    aliases: List[str] = []
+
+    def _add_alias(alias: Optional[str]) -> None:
+        if alias and alias not in aliases:
+            aliases.append(alias)
+
+    _add_alias(base)
+    if base.endswith(".weight"):
+        _add_alias(base[: -len(".weight")])
+
+    base_no_weight = base[: -len(".weight")] if base.endswith(".weight") else base
+    if base_no_weight.startswith("diffusion_model."):
+        stem = base_no_weight[len("diffusion_model.") :]
+        stem_u = stem.replace(".", "_")
+        for alias in (
+            stem,
+            f"diffusion_model.{stem}",
+            f"transformer.{stem}",
+            f"base_model.model.{stem}",
+            f"model.{stem}",
+            f"unet.{stem}",
+            f"lora_unet_{stem_u}",
+            f"lycoris_{stem_u}",
+        ):
+            _add_alias(alias)
+
+    created = 0
+    for alias in aliases:
+        if alias not in key_map:
+            key_map[alias] = target
+            created += 1
+    return created
+
+
+def _augment_key_map_with_zimage_lumina2_aliases(
+    key_map: Dict[str, Any],
+    model,
+    model_sd_keys: Optional[Set[str]],
+    verbose: bool = False,
+) -> int:
+    """
+    Add exact ZiT/Lumina2 aliases into key_map.
+
+    This complements ComfyUI's generic map with aliases commonly found in trainer exports:
+      - transformer.*
+      - base_model.model.*
+      - bare bases
+      - lora_unet_* / lycoris_*
+    """
+    added = 0
+
+    # First try ComfyUI's dedicated mapper if present in this build.
+    z_to_diffusers = getattr(comfy.utils, "z_image_to_diffusers", None)
+    if callable(z_to_diffusers):
+        try:
+            model_core = getattr(model, "model", model)
+            model_cfg = getattr(model_core, "model_config", None)
+            unet_cfg = getattr(model_cfg, "unet_config", None)
+            if unet_cfg is not None:
+                diffusers_keys = z_to_diffusers(unet_cfg, output_prefix="diffusion_model.")
+                for diff_key, target in diffusers_keys.items():
+                    if not str(diff_key).endswith(".weight"):
+                        continue
+                    added += _zimage_add_key_aliases(key_map, str(diff_key), target)
+                if verbose and diffusers_keys:
+                    _LOG.info(
+                        "[DoRA Power LoRA Loader] ZiT/Lumina2 compat: added %s key aliases via z_image_to_diffusers().",
+                        added,
+                    )
+        except Exception as e:
+            if verbose:
+                _LOG.warning(
+                    "[DoRA Power LoRA Loader] ZiT/Lumina2 compat: z_image_to_diffusers() failed (%r); using state_dict fallback.",
+                    e,
+                )
+
+    # Fallback / supplement from the actual live state_dict keys.
+    if model_sd_keys:
+        for k in model_sd_keys:
+            ks = str(k)
+            if not ks.startswith("diffusion_model.layers.") or not ks.endswith(".weight"):
+                continue
+            added += _zimage_add_key_aliases(key_map, ks, ks)
+
+    if verbose and added:
+        _LOG.info("[DoRA Power LoRA Loader] ZiT/Lumina2 compat: total key aliases added=%s", added)
+
+    return added
+
+
+def _make_scalar_tensor_like(value: float, ref: Optional[torch.Tensor]) -> torch.Tensor:
+    if isinstance(ref, torch.Tensor):
+        return torch.tensor(float(value), dtype=ref.dtype, device=ref.device)
+    return torch.tensor(float(value), dtype=torch.float32)
+
+
+def _tensor_scalar_to_float(v: Any, default: float = 1.0) -> float:
+    try:
+        if isinstance(v, torch.Tensor):
+            return float(v.item())
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _normalize_zimage_attention_component_aliases(lora_sd: Dict[str, Any], verbose: bool = False) -> int:
+    created = 0
+    keys = list(lora_sd.keys())
+    for k in keys:
+        ks = str(k)
+        nk = _normalize_zimage_attention_key_string(ks)
+        if nk != ks and nk not in lora_sd:
+            v = lora_sd[k]
+            lora_sd[nk] = v.clone() if isinstance(v, torch.Tensor) else v
+            created += 1
+    if verbose and created:
+        _LOG.info("[DoRA Power LoRA Loader] ZiT/Lumina2 compat: normalized %s attention-key aliases.", created)
+    return created
+
+
+def _cat_dim0_if_compatible(tensors: Sequence[torch.Tensor]) -> Optional[torch.Tensor]:
+    if not tensors:
+        return None
+    first = tensors[0]
+    if not isinstance(first, torch.Tensor):
+        return None
+
+    prepared: List[torch.Tensor] = []
+    tail = tuple(first.shape[1:])
+    for t in tensors:
+        if not isinstance(t, torch.Tensor):
+            return None
+        if t.ndim != first.ndim:
+            return None
+        if tuple(t.shape[1:]) != tail:
+            return None
+        if t.device != first.device or t.dtype != first.dtype:
+            t = t.to(device=first.device, dtype=first.dtype)
+        prepared.append(t)
+
+    try:
+        return torch.cat(prepared, dim=0)
+    except Exception:
+        return None
+
+
+def _collect_zimage_attention_bases(lora_sd: Dict[str, Any]) -> Set[str]:
+    bases: Set[str] = set()
+    pat = re.compile(r"^(?P<base>.+\.attention)\.(?:to_q|to_k|to_v|qkv|to_out(?:\.0)?|out)\.")
+    for k in lora_sd.keys():
+        m = pat.match(str(k))
+        if m:
+            bases.add(m.group("base"))
+    return bases
+
+
+def _fuse_zimage_attention_qkv_for_family(
+    lora_sd: Dict[str, Any],
+    attention_base: str,
+    up_suffix: str,
+    down_suffix: str,
+    family_name: str,
+    verbose: bool = False,
+) -> Tuple[int, int]:
+    """
+    Represent split Q/K/V LoRAs against a fused QKV weight as a single larger-rank LoRA.
+
+    For each component i ∈ {Q,K,V} with delta_i = alpha_i * up_i @ down_i,
+    the fused target is represented exactly as:
+
+        fused_up   = block_diag(alpha_q*up_q, alpha_k*up_k, alpha_v*up_v)
+        fused_down = cat([down_q, down_k, down_v], dim=0)
+
+    yielding:
+        fused_up @ fused_down = cat([delta_q, delta_k, delta_v], dim=0)
+
+    This preserves each component independently and avoids the incorrect “just concatenate both
+    matrices” shortcut, which is not mathematically equivalent for standard LoRA factorization.
+    """
+    fused_base = f"{attention_base}.qkv"
+    fused_up_key = fused_base + up_suffix
+    fused_down_key = fused_base + down_suffix
+
+    if fused_up_key in lora_sd and fused_down_key in lora_sd:
+        return (0, 0)
+
+    comp_rows = []
+    any_present = False
+    processed: List[str] = []
+
+    for comp in _ZIMAGE_QKV_COMPONENTS:
+        comp_base = f"{attention_base}.{comp}"
+        up_key = comp_base + up_suffix
+        down_key = comp_base + down_suffix
+        if up_key in lora_sd or down_key in lora_sd:
+            any_present = True
+        if up_key not in lora_sd or down_key not in lora_sd:
+            if any_present and verbose:
+                _LOG.warning(
+                    "[DoRA Power LoRA Loader] ZiT/Lumina2 compat: incomplete QKV family %s under %s (missing %s or %s); leaving split keys untouched.",
+                    family_name,
+                    attention_base,
+                    up_key,
+                    down_key,
+                )
+            return (0, 0)
+
+        up = lora_sd[up_key]
+        down = lora_sd[down_key]
+        if not isinstance(up, torch.Tensor) or not isinstance(down, torch.Tensor) or up.ndim != 2 or down.ndim != 2:
+            if verbose:
+                _LOG.warning(
+                    "[DoRA Power LoRA Loader] ZiT/Lumina2 compat: cannot fuse %s %s because tensors are not 2D LoRA matrices.",
+                    attention_base,
+                    family_name,
+                )
+            return (0, 0)
+
+        if int(up.shape[1]) != int(down.shape[0]):
+            if verbose:
+                _LOG.warning(
+                    "[DoRA Power LoRA Loader] ZiT/Lumina2 compat: rank mismatch for %s %s (%s vs %s); leaving split keys untouched.",
+                    attention_base,
+                    family_name,
+                    tuple(up.shape),
+                    tuple(down.shape),
+                )
+            return (0, 0)
+
+        alpha_key = comp_base + ".alpha"
+        alpha = _tensor_scalar_to_float(lora_sd.get(alpha_key, 1.0), default=1.0)
+
+        up_scaled = up if alpha == 1.0 else (up * alpha)
+        comp_rows.append((comp, up_scaled, down, alpha_key))
+        processed.extend([up_key, down_key])
+        if alpha_key in lora_sd:
+            processed.append(alpha_key)
+
+    if not any_present:
+        return (0, 0)
+
+    in_dim = int(comp_rows[0][2].shape[1])
+    up_ref = comp_rows[0][1]
+    down_ref = comp_rows[0][2]
+    prepared_ups: List[torch.Tensor] = []
+    prepared_downs: List[torch.Tensor] = []
+    for _, up, down, _ in comp_rows:
+        if int(down.shape[1]) != in_dim:
+            if verbose:
+                _LOG.warning(
+                    "[DoRA Power LoRA Loader] ZiT/Lumina2 compat: input-dim mismatch while fusing %s %s; leaving split keys untouched.",
+                    attention_base,
+                    family_name,
+                )
+            return (0, 0)
+        if up.device != up_ref.device or up.dtype != up_ref.dtype:
+            up = up.to(device=up_ref.device, dtype=up_ref.dtype)
+        if down.device != down_ref.device or down.dtype != down_ref.dtype:
+            down = down.to(device=down_ref.device, dtype=down_ref.dtype)
+        prepared_ups.append(up)
+        prepared_downs.append(down)
+
+    try:
+        fused_up = torch.block_diag(*prepared_ups)
+        fused_down = torch.cat(prepared_downs, dim=0)
+    except Exception as e:
+        if verbose:
+            _LOG.warning(
+                "[DoRA Power LoRA Loader] ZiT/Lumina2 compat: block-diag fusion failed for %s %s (%r); leaving split keys untouched.",
+                attention_base,
+                family_name,
+                e,
+            )
+        return (0, 0)
+
+    lora_sd[fused_up_key] = fused_up
+    lora_sd[fused_down_key] = fused_down
+    lora_sd[fused_base + ".alpha"] = _make_scalar_tensor_like(1.0, fused_down)
+
+    created = 3
+
+    # Fuse any per-output first-dimension-attached auxiliary tensors when present.
+    for suffix in _ZIMAGE_QKV_CAT_SUFFIXES:
+        fused_aux_key = fused_base + suffix
+        if fused_aux_key in lora_sd:
+            continue
+
+        comp_keys = [f"{attention_base}.{comp}{suffix}" for comp in _ZIMAGE_QKV_COMPONENTS]
+        present = [k for k in comp_keys if k in lora_sd]
+        if not present:
+            continue
+        if len(present) != 3:
+            if verbose:
+                _LOG.warning(
+                    "[DoRA Power LoRA Loader] ZiT/Lumina2 compat: partial auxiliary QKV tensors for %s%s; leaving originals untouched.",
+                    attention_base,
+                    suffix,
+                )
+            continue
+
+        fused_aux = _cat_dim0_if_compatible([lora_sd[k] for k in comp_keys])
+        if fused_aux is None:
+            if verbose:
+                _LOG.warning(
+                    "[DoRA Power LoRA Loader] ZiT/Lumina2 compat: incompatible auxiliary tensor shapes while fusing %s%s; leaving originals untouched.",
+                    attention_base,
+                    suffix,
+                )
+            continue
+
+        lora_sd[fused_aux_key] = fused_aux
+        processed.extend(comp_keys)
+        created += 1
+
+    for k in processed:
+        lora_sd.pop(k, None)
+
+    if verbose:
+        total_rank = int(fused_down.shape[0])
+        _LOG.info(
+            "[DoRA Power LoRA Loader] ZiT/Lumina2 compat: fused %s split Q/K/V -> %s (family=%s, rank=%s, created=%s).",
+            attention_base,
+            fused_base,
+            family_name,
+            total_rank,
+            created,
+        )
+
+    return (1, created)
+
+
+def _remap_zimage_attention_out_prefixes(lora_sd: Dict[str, Any], verbose: bool = False) -> Tuple[int, int]:
+    remapped_groups = 0
+    created = 0
+    keys = list(lora_sd.keys())
+    pat = re.compile(r"^(?P<base>.+\.attention)\.to_out\.0\.")
+    done: Set[str] = set()
+
+    for k in keys:
+        m = pat.match(str(k))
+        if not m:
+            continue
+        src_base = m.group("base") + ".to_out.0"
+        if src_base in done:
+            continue
+        done.add(src_base)
+
+        dst_base = m.group("base") + ".out"
+        src_prefix = src_base + "."
+        dst_prefix = dst_base + "."
+
+        if any(str(x).startswith(dst_prefix) for x in lora_sd.keys()):
+            continue
+
+        n = _rename_prefix_keys(lora_sd, src_prefix, dst_prefix, delete_from=True)
+        if n:
+            remapped_groups += 1
+            created += n
+            if verbose:
+                _LOG.info("[DoRA Power LoRA Loader] ZiT/Lumina2 compat: remapped %s -> %s (%s keys).", src_base, dst_base, n)
+
+    return (remapped_groups, created)
+
+
+def _apply_zimage_lumina2_compat(
+    lora_sd: Dict[str, Any],
+    model,
+    model_sd_keys: Optional[Set[str]],
+    key_map: Optional[Dict[str, Any]],
+    verbose: bool = False,
+) -> None:
+    """
+    Normalize ZiT/Lumina2 LoRA exports into the native fused-attention form expected by the model.
+
+    This is intentionally conservative: it only activates when the live model strongly looks like
+    Lumina2/Z-Image Turbo, or when both the model and the LoRA show strong ZiT-style attention cues.
+    """
+    model_is_zimage = _looks_like_zimage_lumina2_model(model, model_sd_keys)
+    lora_is_zimage = _looks_like_zimage_attention_lora(lora_sd)
+
+    if not model_is_zimage:
+        return
+    if not lora_is_zimage:
+        # Still add aliases for native ZiT keys if this is a Lumina2 model; it is cheap and safe.
+        if key_map is not None:
+            _augment_key_map_with_zimage_lumina2_aliases(key_map, model, model_sd_keys, verbose=verbose)
+        return
+
+    if key_map is not None:
+        _augment_key_map_with_zimage_lumina2_aliases(key_map, model, model_sd_keys, verbose=verbose)
+
+    alias_created = _normalize_zimage_attention_component_aliases(lora_sd, verbose=verbose)
+
+    fused_groups = 0
+    fused_keys = 0
+    for attention_base in sorted(_collect_zimage_attention_bases(lora_sd)):
+        for family in _ZIMAGE_QKV_MATRIX_FAMILIES:
+            g, n = _fuse_zimage_attention_qkv_for_family(
+                lora_sd,
+                attention_base,
+                up_suffix=family["up_suffix"],
+                down_suffix=family["down_suffix"],
+                family_name=family["name"],
+                verbose=verbose,
+            )
+            fused_groups += g
+            fused_keys += n
+
+    out_groups, out_keys = _remap_zimage_attention_out_prefixes(lora_sd, verbose=verbose)
+
+    if verbose and (alias_created or fused_groups or out_groups):
+        _LOG.info(
+            "[DoRA Power LoRA Loader] ZiT/Lumina2 compat summary: alias_keys=%s fused_qkv_groups=%s fused_keys=%s remapped_out_groups=%s remapped_out_keys=%s.",
+            alias_created,
+            fused_groups,
+            fused_keys,
+            out_groups,
+            out_keys,
+        )
+
+
 def _pick_flux2_broadcast_targets(key_map: Dict[str, str]) -> Tuple[List[str], List[str], List[str]]:
     """Derive broadcast destinations from the current model's key_map (Flux2 varies across builds)."""
     bases = list(key_map.keys())
@@ -1234,6 +1817,8 @@ def _candidate_base_variants(base: str) -> List[str]:
     drop_prefixes = (
         "diffusion_model.",
         "model.",
+        "base_model.model.",
+        "base_model.",
         "unet.",
         "transformer.",
         "text_encoder.",
@@ -1259,6 +1844,17 @@ def _candidate_base_variants(base: str) -> List[str]:
             rewrite_variants.append(v[: -len(".linear")] + ".lin")
         if ".linear." in v:
             rewrite_variants.append(v.replace(".linear.", ".lin."))
+        # ZiT/Lumina2 export variants.
+        if ".attention.to.q" in v:
+            rewrite_variants.append(v.replace(".attention.to.q", ".attention.to_q"))
+        if ".attention.to.k" in v:
+            rewrite_variants.append(v.replace(".attention.to.k", ".attention.to_k"))
+        if ".attention.to.v" in v:
+            rewrite_variants.append(v.replace(".attention.to.v", ".attention.to_v"))
+        if v.endswith(".to_out.0"):
+            rewrite_variants.append(v[: -len(".to_out.0")] + ".out")
+        if ".to_out.0." in v:
+            rewrite_variants.append(v.replace(".to_out.0.", ".out."))
 
     variants.extend(rewrite_variants)
 
@@ -1300,6 +1896,8 @@ def _find_weight_key_for_base(sd_keys: Set[str], sd_key_list: List[str], base: s
                 f"diffusion_model.{variant}.weight",
                 f"diffusion_model.transformer.{variant}.weight",
                 f"transformer.{variant}.weight",
+                f"base_model.model.{variant}.weight",
+                f"base_model.{variant}.weight",
                 f"model.{variant}.weight",
             ]
         )
@@ -1460,6 +2058,8 @@ class DoraPowerLoraLoader:
                     # Slice-aware magnitude fix for offset/sliced patches (recommended ON for Flux2)
                     "dora_slice_fix": ("BOOLEAN", {"default": True}),
                     "dora_adaln_swap_fix": ("BOOLEAN", {"default": True}),
+                    # Z-Image Turbo / Lumina2 architecture-aware normalization
+                    "zimage_lumina2_compat": ("BOOLEAN", {"default": True}),
                 },
             ),
             "hidden": {},
@@ -1490,6 +2090,7 @@ class DoraPowerLoraLoader:
         clip_state_dict: Optional[Dict[str, Any]],
         clip_sd_keys: Optional[Set[str]],
         clip_sd_list: Optional[List[str]],
+        zimage_lumina2_compat: bool,
     ):
         lora_path = folder_paths.get_full_path("loras", lora_name)
         if not lora_path:
@@ -1588,6 +2189,15 @@ class DoraPowerLoraLoader:
             key_map = comfy.lora.model_lora_keys_unet(model.model, key_map)
         if clip is not None:
             key_map = comfy.lora.model_lora_keys_clip(clip.cond_stage_model, key_map)
+
+        if zimage_lumina2_compat and model is not None:
+            _apply_zimage_lumina2_compat(
+                lora_sd=lora_sd,
+                model=model,
+                model_sd_keys=model_sd_keys,
+                key_map=key_map,
+                verbose=verbose,
+            )
 
         # Flux2/OneTrainer DoRA compat: rewrite + broadcast missing modules into keys ComfyUI maps.
         # This fixes cases where critical dora_scale/lora_up/down tensors never map/load.
@@ -1711,6 +2321,7 @@ class DoraPowerLoraLoader:
             dora_dbg_stack = 10
         dora_slice_fix = bool(kwargs.get("dora_slice_fix", True))
         dora_adaln_swap_fix = bool(kwargs.get("dora_adaln_swap_fix", True))
+        zimage_lumina2_compat = bool(kwargs.get("zimage_lumina2_compat", True))
         _set_dora_decomp_cfg(
             dbg=dora_dbg,
             dbg_n=dora_dbg_n,
@@ -1782,6 +2393,7 @@ class DoraPowerLoraLoader:
                 clip_state_dict=clip_state_dict,
                 clip_sd_keys=clip_sd_keys,
                 clip_sd_list=clip_sd_list,
+                zimage_lumina2_compat=zimage_lumina2_compat,
             )
 
         return (new_model, new_clip)

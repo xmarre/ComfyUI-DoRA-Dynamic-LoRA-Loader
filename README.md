@@ -1,7 +1,7 @@
 # comfyui_dora_dynamic_lora
 
 Custom ComfyUI node that loads and stacks **regular LoRAs and DoRA LoRAs**, with additional Flux/Flux2 + OneTrainer
-compatibility and DoRA stability fixes.
+compatibility, **Z-Image Turbo / Lumina2 attention-format compatibility**, and DoRA stability fixes.
 
 This repo contains two distinct parts:
 
@@ -88,13 +88,44 @@ After building ComfyUI’s standard key map via:
 
 If multiple candidates match, it picks the shortest match and prefers candidates containing `diffusion_model.`.
 
-### 7) `convert_lora` bypass when it zeroes direction matrices
+### 7) Z-Image Turbo / Lumina2 architecture-aware attention compatibility
+
+Before mapping/loading, the loader can normalize ZiT/Lumina2 LoRAs into the model’s native fused-attention form.
+
+What it does:
+
+- Detects Lumina2/Z-Image-style models by class name and/or live `state_dict()` structure.
+- Adds exact ZiT/Lumina2 key-map aliases (including `transformer.*`, `base_model.model.*`, bare bases,
+  `lora_unet_*`, and `lycoris_*`).
+- Normalizes common export spelling variants:
+  - `attention.to.q` → `attention.to_q`
+  - `attention.to.k` → `attention.to_k`
+  - `attention.to.v` → `attention.to_v`
+  - `attention.to.out.0` → `attention.to_out.0`
+- Fuses split attention Q/K/V LoRAs:
+  - `attention.to_q.*`
+  - `attention.to_k.*`
+  - `attention.to_v.*`
+  into native `attention.qkv.*`
+- Remaps `attention.to_out.0.*` → `attention.out.*`
+
+Important implementation detail:
+
+- The Q/K/V fusion is done as an **exact larger-rank LoRA**, not by naïvely concatenating both matrices.
+- Per-component `alpha` values are absorbed into the fused “up” matrix before building the block-diagonal fused
+  adapter, then the fused adapter is emitted with `alpha = 1`.
+- Compatible per-output auxiliary tensors (such as `dora_scale`, `diff`, `w_norm`, etc.) are concatenated along the
+  output dimension when all three components are present and shape-compatible.
+
+Node toggle: **“ZiT/Lumina2 auto-fix (QKV fuse + out remap)”** (`zimage_lumina2_compat`, default **ON**).
+
+### 8) `convert_lora` bypass when it zeroes direction matrices
 
 The loader normally runs `comfy.lora_convert.convert_lora(...)`. It also computes stats on direction matrices before
 and after conversion. If conversion turns a non-zero set of `.lora_up.weight` tensors into all zeros, it reloads the
 file and bypasses conversion for that LoRA.
 
-### 8) Diagnostics: NaN/Inf checks + quantization warnings
+### 9) Diagnostics: NaN/Inf checks + quantization warnings
 
 The loader emits warnings when:
 
@@ -135,6 +166,7 @@ Each row has:
 - Broadcast scale
 - DoRA slice-fix for offset patches (Flux2)
 - DoRA adaLN swap_scale_shift fix
+- ZiT/Lumina2 auto-fix (QKV fuse + out remap)
 - DoRA decompose debug logs
 - DoRA debug lines
 - DoRA debug stack depth
@@ -145,10 +177,12 @@ For each enabled row:
 
 1) Load the LoRA file (safe_load when supported).
 2) Optionally bypass `convert_lora` if it zeroes direction matrices.
-3) Apply Flux2/OneTrainer compatibility transforms (rename + optional broadcast).
-4) Build ComfyUI key map for UNet and CLIP, then extend it with dynamic suffix matches.
-5) Apply OneTrainer output-axis direction-matrix fix (when applicable).
-6) Call `comfy.lora.load_lora(...)` and apply patches via `model.add_patches(...)` / `clip.add_patches(...)`.
+3) Build ComfyUI key map for UNet and CLIP.
+4) Optionally apply ZiT/Lumina2 attention normalization (QKV fuse + `to_out.0` remap + exact key aliases).
+5) Apply Flux2/OneTrainer compatibility transforms (rename + optional broadcast).
+6) Extend the key map with dynamic suffix matches.
+7) Apply OneTrainer output-axis direction-matrix fix (when applicable).
+8) Call `comfy.lora.load_lora(...)` and apply patches via `model.add_patches(...)` / `clip.add_patches(...)`.
 
 ## Important implementation detail
 
