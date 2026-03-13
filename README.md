@@ -9,7 +9,7 @@ This repo contains two distinct parts:
 2) **Targeted ComfyUI patches and transforms** needed for Flux/Flux2 DoRA LoRAs to apply correctly and avoid known
    failure modes.
 
-## Confirmed adaLN swap-scale alignment fix (Flux2 DoRA)
+## AdaLN swap-scale alignment fix (Flux2 DoRA)
 
 A known Flux2 DoRA failure mode is fixed by aligning DoRA’s magnitude vector (`dora_scale`) with the same permutation
 ComfyUI applies to the LoRA delta for **adaLN_modulation** weights.
