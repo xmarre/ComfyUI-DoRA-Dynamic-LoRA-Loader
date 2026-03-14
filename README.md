@@ -35,10 +35,11 @@ When ComfyUI applies a `swap_scale_shift` transform to the LoRA delta for adaLN-
 
 This repo patches `comfy.weight_adapter.base.weight_decompose` to:
 
-- perform DoRA math in **fp32**
-- normalize using the norm of the **updated weight** `V = W + Δ`  
-  where `Δ` is the LoRA delta after applying alpha / strength
-- avoid normalizing against the untouched base weight
+- Perform DoRA math in **fp32**.
+- Normalize using the norm of the **updated weight** `V = W + delta` (where `delta` is the LoRA delta after applying
+  `alpha`), rather than normalizing against the base weight.
+- Reshape `dora_scale` onto the active normalization axis before division so non-square targets do not broadcast
+  incorrectly.
 
 This is both more stable and more faithful to DoRA’s intended magnitude handling.
 

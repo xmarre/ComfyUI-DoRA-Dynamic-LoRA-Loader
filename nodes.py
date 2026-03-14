@@ -48,6 +48,8 @@ def _patch_comfy_weight_decompose() -> None:
     """
     Patch ComfyUI DoRA normalization to:
       - normalize using norm(V) where V = W0 + alpha*delta (DoRA definition)
+      - reshape dora_scale onto the active norm axis before division so non-square
+        targets do not broadcast into an unintended outer product
       - slice dora_scale for sliced qkv offsets (common in Flux2) to prevent axis mismatch blow-ups
       - emit debug logs controlled from node settings (no env vars)
     """
@@ -229,6 +231,10 @@ def _patch_comfy_weight_decompose() -> None:
             )
 
         weight_norm = weight_norm + torch.finfo(torch.float32).eps
+        if wd_on_output_axis:
+            dora_scale_local = dora_scale_local.reshape(wc32.shape[0], *[1] * (wc32.dim() - 1))
+        else:
+            dora_scale_local = dora_scale_local.reshape(1, wc32.shape[1], *[1] * (wc32.dim() - 2))
         scale32 = dora_scale_local / weight_norm
 
         weight_dora32 = weight_calc32 * scale32
@@ -282,7 +288,7 @@ def _patch_comfy_weight_decompose() -> None:
 
     wa_base.weight_decompose = weight_decompose_fixed
     wa_base._dora_weight_decompose_patched_by_dora_loader = True
-    _LOG.warning("[DoRA Power LoRA Loader] patched ComfyUI weight_decompose for correct DoRA normalization (norm(V) + slice fix).")
+    _LOG.warning("[DoRA Power LoRA Loader] patched ComfyUI weight_decompose for correct DoRA normalization (norm(V) + broadcast-shape + slice fix).")
 
     patched_refs = 0
     for m in list(sys.modules.values()):
