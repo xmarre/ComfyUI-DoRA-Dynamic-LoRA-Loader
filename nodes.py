@@ -421,6 +421,60 @@ class FlexibleOptionalInputType(dict):
         return self._fallback_type
 
 
+_LORA_MAGNITUDE_VECTOR_RE = re.compile(
+    r"^(?P<base>.+?)\.lora_magnitude_vector(?:\.(?P<adapter>[A-Za-z0-9_-]+))?(?:\.weight)?$"
+)
+
+
+def _normalize_diffusers_dora_magnitude_keys(lora_sd: Dict[str, Any], verbose: bool = False) -> int:
+    """
+    Normalize PEFT/Diffusers DoRA magnitude keys into ComfyUI-style `.dora_scale` keys.
+
+    Examples that get rewritten:
+      - `... .lora_magnitude_vector`
+      - `... .lora_magnitude_vector.weight`
+      - `... .lora_magnitude_vector.default`
+      - `... .lora_magnitude_vector.default.weight`
+      - `... .lora_magnitude_vector.default_0`
+      - `... .lora_magnitude_vector.default_0.weight`
+
+    Diffusers/PEFT commonly stores DoRA magnitude tensors under `lora_magnitude_vector`, while
+    ComfyUI's LoRA loader expects `dora_scale`. If these keys are not normalized, the direction
+    matrices may load but the DoRA magnitude vectors are left behind as "unloaded keys".
+    """
+    renamed = 0
+    collisions = 0
+    examples: List[str] = []
+    for key in list(lora_sd.keys()):
+        m = _LORA_MAGNITUDE_VECTOR_RE.match(str(key))
+        if not m:
+            continue
+        new_key = m.group("base") + ".dora_scale"
+        value = lora_sd[key]
+        if new_key in lora_sd:
+            if new_key != key:
+                collisions += 1
+                if len(examples) < 10:
+                    examples.append(f"collision {key} -> {new_key}")
+            lora_sd.pop(key, None)
+            continue
+        lora_sd[new_key] = value
+        if new_key != key:
+            lora_sd.pop(key, None)
+            renamed += 1
+            if len(examples) < 10:
+                examples.append(f"{key} -> {new_key}")
+    if verbose and (renamed or collisions):
+        _LOG.info(
+            "[DoRA Power LoRA Loader] normalized diffusers/PEFT DoRA magnitude keys: renamed=%d collisions=%d",
+            renamed,
+            collisions,
+        )
+        for ex in examples:
+            _LOG.info("[DoRA Power LoRA Loader] magnitude-key normalize example: %s", ex)
+    return renamed
+
+
 # Key suffixes we treat as "belongs to base module X"
 _BASE_SUFFIXES = [
     ".lora_up.weight",
@@ -2141,6 +2195,8 @@ class DoraPowerLoraLoader:
                 lora_sd = comfy.utils.load_torch_file(lora_path)
         else:
             lora_sd = lora_sd_conv
+
+        _normalize_diffusers_dora_magnitude_keys(lora_sd, verbose=verbose)
 
         if verbose:
             n_dora = sum(1 for k in lora_sd.keys() if str(k).endswith(".dora_scale"))
