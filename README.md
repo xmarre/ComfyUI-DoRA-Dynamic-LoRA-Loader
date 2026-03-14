@@ -1,138 +1,212 @@
-# comfyui_dora_dynamic_lora
+# ComfyUI-DoRA-Dynamic-LoRA-Loader
 
-Custom ComfyUI node that loads and stacks **regular LoRAs and DoRA LoRAs**, with additional Flux/Flux2 + OneTrainer
-compatibility, **Z-Image Turbo / Lumina2 attention-format compatibility**, and DoRA stability fixes.
+Custom ComfyUI node that loads and stacks **regular LoRAs and DoRA LoRAs**, with additional **Flux / Flux2 + OneTrainer compatibility**, **Z-Image Turbo / Lumina2 attention-format compatibility**, and multiple **DoRA correctness / stability fixes**.
 
 This repo contains two distinct parts:
 
-1) **A Power LoRA Loader-style node** (multiple LoRAs in one node, per-LoRA strengths).
-2) **Targeted ComfyUI patches and transforms** needed for Flux/Flux2 DoRA LoRAs to apply correctly and avoid known
-   failure modes.
+1. **A Power LoRA Loader-style node**
+   - multiple LoRAs in one node
+   - per-LoRA strengths
+   - stacked application in one place
+
+2. **Targeted ComfyUI patches and transforms**
+   - fixes and compatibility layers needed for Flux / Flux2 DoRA LoRAs to load and apply correctly
+   - protection against several known failure modes
+
+---
 
 ## AdaLN swap-scale alignment fix (Flux2 DoRA)
 
-A known Flux2 DoRA failure mode is fixed by aligning DoRA’s magnitude vector (`dora_scale`) with the same permutation
-ComfyUI applies to the LoRA delta for **adaLN_modulation** weights.
+A known Flux2 DoRA failure mode is fixed by aligning DoRA’s magnitude vector (`dora_scale`) with the same permutation ComfyUI applies to the LoRA delta for **adaLN_modulation** weights.
 
-Implementation:
+### Implementation
 
-- This repo patches `comfy.weight_adapter.base.weight_decompose`.
-- When ComfyUI applies a `swap_scale_shift` function to the delta (used for adaLN_modulation weights), the patch
-  applies that *same* transform to `dora_scale` before computing the DoRA scaling.
-- Node toggle: **“DoRA adaLN swap_scale_shift fix”** (`dora_adaln_swap_fix`, default **ON**).
+This repo patches `comfy.weight_adapter.base.weight_decompose`.
+
+When ComfyUI applies a `swap_scale_shift` transform to the LoRA delta for adaLN-related weights, this patch applies that **same transform** to `dora_scale` before computing the DoRA scaling term.
+
+**Node toggle:** `DoRA adaLN swap_scale_shift fix` (`dora_adaln_swap_fix`, default **ON**)
+
+---
 
 ## Other fixes and compatibility layers
 
-### 1) Correct DoRA normalization (norm(V) in fp32)
+### 1) Correct DoRA normalization (`norm(V)` in fp32)
 
 This repo patches `comfy.weight_adapter.base.weight_decompose` to:
 
-- Perform DoRA math in **fp32**.
-- Normalize using the norm of the **updated weight** `V = W + Δ` (where `Δ` is the LoRA delta after applying
-  `alpha`), rather than normalizing against the base weight.
+- perform DoRA math in **fp32**
+- normalize using the norm of the **updated weight** `V = W + Δ`  
+  where `Δ` is the LoRA delta after applying alpha / strength
+- avoid normalizing against the untouched base weight
 
-### 2) Slice-aware `dora_scale` for sliced/offset patches (Flux2 qkv)
+This is both more stable and more faithful to DoRA’s intended magnitude handling.
 
-Flux/Flux2 key maps can include **sliced targets** (e.g. qkv packed weights). In those cases, ComfyUI applies LoRA to
-only a slice of a weight tensor. This repo’s `weight_decompose` patch includes an optional **slice fix** that slices
-`dora_scale` to the matching offset/length when possible.
+---
 
-Node toggle: **“DoRA slice-fix for offset patches (Flux2)”** (`dora_slice_fix`, default **ON**).
+### 2) Slice-aware `dora_scale` for sliced / offset patches (Flux2 qkv)
+
+Flux / Flux2 key maps can include **sliced targets** such as packed qkv weights. In those cases, ComfyUI applies the LoRA patch to only a slice of a larger tensor.
+
+This repo’s `weight_decompose` patch includes an optional **slice fix** that slices `dora_scale` to the matching offset / length when possible, so the DoRA magnitude vector stays aligned with the actual patched slice.
+
+**Node toggle:** `DoRA slice-fix for offset patches (Flux2)` (`dora_slice_fix`, default **ON**)
+
+---
 
 ### 3) Force fp32 intermediates when building `lora_diff`
 
-This repo patches `comfy.weight_adapter.lora.*.calculate_weight()` to force `intermediate_dtype=torch.float32`.
-This is specifically to avoid mixed-precision paths flushing very small intermediate products to zero while building
-`lora_diff`.
+This repo patches `comfy.weight_adapter.lora.*.calculate_weight()` to force:
+
+- `intermediate_dtype=torch.float32`
+
+This is specifically to avoid mixed-precision paths flushing very small intermediate products to zero while building `lora_diff`.
+
+---
 
 ### 4) OneTrainer “Apply on output axis (DoRA only)” direction-matrix fix
 
-Some OneTrainer exports store the direction matrices (`lora_up`/`lora_down`, or `lora_A`/`lora_B`) in a layout that
-does not match the destination weight (swapped and/or transposed). This repo compares the shapes against the mapped
-destination weight and applies one of the following fixes when it matches a known pattern:
+Some OneTrainer exports store the direction matrices (`lora_up` / `lora_down`, or `lora_A` / `lora_B`) in a layout that does not match the destination weight. Depending on the export, they may be swapped and/or transposed relative to what ComfyUI expects.
+
+This repo compares those matrix shapes against the mapped destination weight and applies one of the following fixes when a known pattern is detected:
 
 - swap `up` and `down`
-- transpose one or both matrices
+- transpose one matrix
+- transpose both matrices
 
-This fix runs automatically when a base has `*.dora_scale` and corresponding direction matrices.
+This fix runs automatically when a base has `*.dora_scale` and matching direction matrices.
 
-### 5) Flux2 / OneTrainer key compatibility transforms
+---
 
-Before mapping/loading, the loader may transform the LoRA state dict:
+### 5) Diffusers / PEFT DoRA magnitude-vector compatibility (`lora_magnitude_vector` → `dora_scale`)
 
-- Rename `transformer.time_guidance_embed.*` → `transformer.time_text_embed.*` (only if the target prefix is not
-  already present).
-- Broadcast OneTrainer’s **global modulation** LoRAs onto the **per-block** keys ComfyUI maps, using the current
-  model’s `key_map` to discover the actual targets.
+Some Diffusers / PEFT DoRA exports store the DoRA magnitude tensor under:
 
-Broadcast controls:
+- `*.lora_magnitude_vector`
+- `*.lora_magnitude_vector.weight`
+- `*.lora_magnitude_vector.default`
+- `*.lora_magnitude_vector.default.weight`
+- `*.lora_magnitude_vector.default_0`
+- `*.lora_magnitude_vector.default_0.weight`
 
-- **Broadcast OneTrainer modulation LoRAs** (`broadcast_modulations`, default **ON**)
-- **Include DoRA dora_scale in broadcast** (`broadcast_include_dora_scale`, default **OFF**)
-- **Auto-scale broadcast** (`broadcast_auto_scale`, default **ON**) — divides `broadcast_scale` by the number of
-  broadcast targets.
-- **Broadcast scale** (`broadcast_scale`, default `1.0`)
+ComfyUI-style loading expects the equivalent tensor under:
 
-### 6) Dynamic key mapping (suffix matching + `.linear → .lin`)
+- `*.dora_scale`
+
+Before mapping / loading, this repo normalizes those Diffusers / PEFT-style DoRA magnitude keys into Comfy-style `dora_scale` keys.
+
+Without this step, the LoRA direction matrices may load while the DoRA magnitude vectors remain behind as unloaded keys, which means the file is **not** being applied as full DoRA.
+
+This directly fixes the common log pattern:
+
+- `lora key not loaded: ...lora_magnitude_vector`
+
+---
+
+### 6) Flux2 / OneTrainer key compatibility transforms
+
+Before mapping / loading, the loader may transform the LoRA state dict:
+
+- rename `transformer.time_guidance_embed.*` → `transformer.time_text_embed.*`  
+  only if the target prefix is not already present
+- broadcast OneTrainer’s **global modulation** LoRAs onto the **per-block** keys ComfyUI actually maps, using the live model’s `key_map` to discover real targets
+
+#### Broadcast controls
+
+- `Broadcast OneTrainer modulation LoRAs` (`broadcast_modulations`, default **ON**)
+- `Include DoRA dora_scale in broadcast` (`broadcast_include_dora_scale`, default **OFF**)
+- `Auto-scale broadcast` (`broadcast_auto_scale`, default **ON**)  
+  divides `broadcast_scale` by the number of broadcast targets
+- `Broadcast scale` (`broadcast_scale`, default `1.0`)
+
+---
+
+### 7) Dynamic key mapping (suffix matching + `.linear` ↔ `.lin`)
 
 After building ComfyUI’s standard key map via:
 
 - `comfy.lora.model_lora_keys_unet(...)`
 - `comfy.lora.model_lora_keys_clip(...)`
 
-…this node extends it for any base modules present in the LoRA file but missing from the map. It matches bases to
-`model.state_dict()` / `clip.state_dict()` keys by suffix, including these built-in variants:
+…the node extends that map for base modules present in the LoRA file but missing from the standard map.
 
-- stripping common prefixes (`diffusion_model.`, `model.`, `transformer.`, etc.)
-- rewriting Flux naming differences: `.linear` ↔ `.lin`
+It matches bases against `model.state_dict()` / `clip.state_dict()` keys by suffix, including these built-in variants:
+
+- stripping common prefixes such as:
+  - `diffusion_model.`
+  - `model.`
+  - `transformer.`
+- rewriting Flux naming differences:
+  - `.linear` ↔ `.lin`
 
 If multiple candidates match, it picks the shortest match and prefers candidates containing `diffusion_model.`.
 
-### 7) Z-Image Turbo / Lumina2 architecture-aware attention compatibility
+---
 
-Before mapping/loading, the loader can normalize ZiT/Lumina2 LoRAs into the model’s native fused-attention form.
+### 8) Z-Image Turbo / Lumina2 architecture-aware attention compatibility
 
-What it does:
+Before mapping / loading, the loader can normalize ZiT / Lumina2 LoRAs into the model’s native fused-attention form.
 
-- Detects Lumina2/Z-Image-style models by class name and/or live `state_dict()` structure.
-- Adds exact ZiT/Lumina2 key-map aliases (including `transformer.*`, `base_model.model.*`, bare bases,
-  `lora_unet_*`, and `lycoris_*`).
-- Normalizes common export spelling variants:
+#### What it does
+
+- detects Lumina2 / Z-Image-style models by class name and/or live `state_dict()` structure
+- adds exact ZiT / Lumina2 key-map aliases, including:
+  - `transformer.*`
+  - `base_model.model.*`
+  - bare bases
+  - `lora_unet_*`
+  - `lycoris_*`
+- normalizes common export spelling variants:
   - `attention.to.q` → `attention.to_q`
   - `attention.to.k` → `attention.to_k`
   - `attention.to.v` → `attention.to_v`
   - `attention.to.out.0` → `attention.to_out.0`
-- Fuses split attention Q/K/V LoRAs:
+- fuses split attention Q / K / V LoRAs:
   - `attention.to_q.*`
   - `attention.to_k.*`
   - `attention.to_v.*`
   into native `attention.qkv.*`
-- Remaps `attention.to_out.0.*` → `attention.out.*`
+- remaps `attention.to_out.0.*` → `attention.out.*`
 
-Important implementation detail:
+#### Important implementation detail
 
-- The Q/K/V fusion is done as an **exact larger-rank LoRA**, not by naïvely concatenating both matrices.
-- Per-component `alpha` values are absorbed into the fused “up” matrix before building the block-diagonal fused
-  adapter, then the fused adapter is emitted with `alpha = 1`.
-- Compatible per-output auxiliary tensors (such as `dora_scale`, `diff`, `w_norm`, etc.) are concatenated along the
-  output dimension when all three components are present and shape-compatible.
+The Q / K / V fusion is done as an **exact larger-rank LoRA**, not by naïvely concatenating both matrices.
 
-Node toggle: **“ZiT/Lumina2 auto-fix (QKV fuse + out remap)”** (`zimage_lumina2_compat`, default **ON**).
+Per-component `alpha` values are absorbed into the fused `up` matrix before building the block-diagonal fused adapter, and the fused adapter is then emitted with `alpha = 1`.
 
-### 8) `convert_lora` bypass when it zeroes direction matrices
+Compatible per-output auxiliary tensors such as:
 
-The loader normally runs `comfy.lora_convert.convert_lora(...)`. It also computes stats on direction matrices before
-and after conversion. If conversion turns a non-zero set of `.lora_up.weight` tensors into all zeros, it reloads the
-file and bypasses conversion for that LoRA.
+- `dora_scale`
+- `diff`
+- `w_norm`
 
-### 9) Diagnostics: NaN/Inf checks + quantization warnings
+are concatenated along the output dimension when all three components are present and shape-compatible.
+
+**Node toggle:** `ZiT/Lumina2 auto-fix (QKV fuse + out remap)` (`zimage_lumina2_compat`, default **ON**)
+
+---
+
+### 9) `convert_lora` bypass when it zeroes direction matrices
+
+The loader normally runs:
+
+- `comfy.lora_convert.convert_lora(...)`
+
+It also computes stats on direction matrices before and after conversion. If conversion turns a non-zero set of `.lora_up.weight` tensors into all zeros, the loader reloads the file and bypasses conversion for that LoRA.
+
+This is meant to protect against destructive conversion paths on certain exports.
+
+---
+
+### 10) Diagnostics: NaN / Inf checks + quantization warnings
 
 The loader emits warnings when:
 
-- The LoRA file contains NaN/Inf tensors.
-- The loaded patches contain NaN/Inf tensors.
-- A quantized/mixed-precision base model is detected in the UNet `state_dict()` and the LoRA contains DoRA tensors
-  (`*.dora_scale`).
+- the LoRA file contains NaN / Inf tensors
+- the loaded patches contain NaN / Inf tensors
+- a quantized or mixed-precision base model is detected in the UNet `state_dict()` and the LoRA contains DoRA tensors (`*.dora_scale`)
+
+---
 
 ## Install
 
@@ -140,7 +214,9 @@ Copy this repository folder into:
 
 `ComfyUI/custom_nodes/ComfyUI-DoRA-Dynamic-LoRA-Loader/`
 
-Restart ComfyUI.
+Then restart ComfyUI.
+
+---
 
 ## Node
 
@@ -151,9 +227,11 @@ Category: `loaders`
 
 Each row has:
 
-- Enabled toggle
-- LoRA name (dropdown; loaded from `/dora_dynamic_lora/loras`)
-- Weight (applies to Model/CLIP)
+- enabled toggle
+- LoRA name dropdown  
+  loaded from `/dora_dynamic_lora/loras`
+- weight  
+  applied to both Model and CLIP
 
 ### Global options
 
@@ -171,37 +249,77 @@ Each row has:
 - DoRA debug lines
 - DoRA debug stack depth
 
-## How it applies LoRAs (high level)
+---
+
+## How it applies LoRAs
 
 For each enabled row:
 
-1) Load the LoRA file (safe_load when supported).
-2) Optionally bypass `convert_lora` if it zeroes direction matrices.
-3) Build ComfyUI key map for UNet and CLIP.
-4) Optionally apply ZiT/Lumina2 attention normalization (QKV fuse + `to_out.0` remap + exact key aliases).
-5) Apply Flux2/OneTrainer compatibility transforms (rename + optional broadcast).
-6) Extend the key map with dynamic suffix matches.
-7) Apply OneTrainer output-axis direction-matrix fix (when applicable).
-8) Call `comfy.lora.load_lora(...)` and apply patches via `model.add_patches(...)` / `clip.add_patches(...)`.
+1. load the LoRA file (`safe_load` when supported)
+2. optionally bypass `convert_lora` if it zeroes direction matrices
+3. build ComfyUI key maps for UNet and CLIP
+4. optionally apply ZiT / Lumina2 attention normalization  
+   QKV fuse + `to_out.0` remap + exact key aliases
+5. apply Flux2 / OneTrainer compatibility transforms  
+   rename + optional broadcast
+6. normalize Diffusers / PEFT DoRA magnitude keys  
+   `lora_magnitude_vector` → `dora_scale`
+7. extend the key map with dynamic suffix matches
+8. apply the OneTrainer output-axis direction-matrix fix when applicable
+9. call `comfy.lora.load_lora(...)`
+10. apply patches via `model.add_patches(...)` / `clip.add_patches(...)`
+
+---
 
 ## Important implementation detail
 
 This custom node **monkey-patches** ComfyUI internals at import time:
 
 - `comfy.weight_adapter.base.weight_decompose`
-- `comfy.weight_adapter.lora.*.calculate_weight` (classes that expose it)
+- `comfy.weight_adapter.lora.*.calculate_weight`  
+  for classes that expose it
 
-These patches affect DoRA/LoRA application in the running ComfyUI process, not only this node.
+These patches affect DoRA / LoRA application in the running ComfyUI process, not only this node.
+
+---
 
 ## Troubleshooting
 
-- Flux2 DoRA instability:
-  - ensure **DoRA adaLN swap_scale_shift fix** is enabled (`dora_adaln_swap_fix`)
-  - check logs for NaN/Inf warnings (LoRA tensors or loaded patches)
-- LoRA loads but has almost no effect:
-  - in verbose mode, the loader warns if **all** `.lora_up` direction matrices are zero in the file (training/export
-    issue, not loader)
-- Suspected mapping problems:
-  - enable **Verbose** and **Log Unloaded Keys** and inspect:
-    - `map: <base> -> <weight>` lines
-    - `unresolved LoRA base:` lines
+### Flux2 DoRA instability
+
+- ensure `DoRA adaLN swap_scale_shift fix` (`dora_adaln_swap_fix`) is enabled
+- check logs for NaN / Inf warnings in:
+  - LoRA tensors
+  - loaded patches
+
+### LoRA loads but has almost no effect
+
+- in verbose mode, the loader warns if **all** `.lora_up` direction matrices are zero in the file
+- that usually points to a training / export issue rather than a loader issue
+
+### `lora_magnitude_vector` keys show as unloaded
+
+- this indicates a Diffusers / PEFT DoRA export format
+- current versions of this repo normalize those keys into `dora_scale` before loading
+- if you still see them after updating, enable:
+  - `Verbose`
+  - `Log Unloaded Keys`
+
+### Suspected mapping problems
+
+Enable **Verbose** and **Log Unloaded Keys** and inspect:
+
+- `map: <base> -> <weight>`
+- `unresolved LoRA base:`
+- unloaded key logs
+
+---
+
+## Notes
+
+This repo is meant for cases where plain ComfyUI LoRA loading is not enough, especially for:
+
+- Flux / Flux2 DoRA LoRAs
+- OneTrainer DoRA exports
+- Diffusers / PEFT DoRA exports
+- Z-Image Turbo / Lumina2 attention-format LoRAs
