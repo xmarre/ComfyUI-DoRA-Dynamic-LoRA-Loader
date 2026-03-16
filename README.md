@@ -1,6 +1,4 @@
-Replace the repo body with this:
 
-```md
 # ComfyUI-DoRA-Dynamic-LoRA-Loader
 
 Custom ComfyUI node that loads and stacks **regular LoRAs and DoRA LoRAs**, with additional **Flux / Flux2 + Diffusers/PEFT + OneTrainer compatibility**, **Z-Image Turbo / Lumina2 attention-format compatibility**, and multiple **DoRA correctness / stability fixes**.
@@ -377,4 +375,3 @@ This repo is meant for cases where plain ComfyUI LoRA loading is not enough, esp
 - OneTrainer DoRA exports
 - Diffusers / PEFT DoRA exports
 - Z-Image Turbo / Lumina2 attention-format LoRAs
-```
