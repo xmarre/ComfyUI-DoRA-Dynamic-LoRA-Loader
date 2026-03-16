@@ -1437,12 +1437,12 @@ def _log_lora_direction_stats(tag: str, lora_sd: Dict[str, Any], verbose: bool) 
         return
     suffix_groups = (
         (".lora_up.weight", ".lora_down.weight"),
-        (".lora_A.weight", ".lora_B.weight"),
-        (".lora_A.default.weight", ".lora_B.default.weight"),
+        (".lora_B.weight", ".lora_A.weight"),
+        (".lora_B.default.weight", ".lora_A.default.weight"),
         ("_lora.up.weight", "_lora.down.weight"),
         (".lora.up.weight", ".lora.down.weight"),
         (".lora_linear_layer.up.weight", ".lora_linear_layer.down.weight"),
-        (".lora_A", ".lora_B"),
+        (".lora_B", ".lora_A"),
     )
     for up_s, down_s in suffix_groups:
         ups = [v for k, v in lora_sd.items() if str(k).endswith(up_s) and isinstance(v, torch.Tensor)]
@@ -1540,12 +1540,12 @@ def _fix_onetrainer_output_axis_dora_mats(
     sd_clip = clip_state_dict or {}
     pair_suffixes = (
         (".lora_up.weight", ".lora_down.weight"),
-        (".lora_A.weight", ".lora_B.weight"),
-        (".lora_A.default.weight", ".lora_B.default.weight"),
+        (".lora_B.weight", ".lora_A.weight"),
+        (".lora_B.default.weight", ".lora_A.default.weight"),
         ("_lora.up.weight", "_lora.down.weight"),
         (".lora.up.weight", ".lora.down.weight"),
         (".lora_linear_layer.up.weight", ".lora_linear_layer.down.weight"),
-        (".lora_A", ".lora_B"),
+        (".lora_B", ".lora_A"),
     )
     fixed = 0
     checked = 0
