@@ -234,11 +234,21 @@ The loader emits warnings when:
 
 ## Install
 
+### Option 1: Manual install
+
 Copy this repository folder into:
 
 `ComfyUI/custom_nodes/ComfyUI-DoRA-Dynamic-LoRA-Loader/`
 
 Then restart ComfyUI.
+
+### Option 2: ComfyUI Manager
+
+Install it through **ComfyUI Manager** by searching for:
+
+`ComfyUI-DoRA-Dynamic-LoRA-Loader`
+
+Then restart ComfyUI after installation or update.
 
 ---
 
