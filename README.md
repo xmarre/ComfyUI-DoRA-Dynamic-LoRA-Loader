@@ -1,6 +1,9 @@
+Replace the repo body with this:
+
+```md
 # ComfyUI-DoRA-Dynamic-LoRA-Loader
 
-Custom ComfyUI node that loads and stacks **regular LoRAs and DoRA LoRAs**, with additional **Flux / Flux2 + OneTrainer compatibility**, **Z-Image Turbo / Lumina2 attention-format compatibility**, and multiple **DoRA correctness / stability fixes**.
+Custom ComfyUI node that loads and stacks **regular LoRAs and DoRA LoRAs**, with additional **Flux / Flux2 + Diffusers/PEFT + OneTrainer compatibility**, **Z-Image Turbo / Lumina2 attention-format compatibility**, and multiple **DoRA correctness / stability fixes**.
 
 This repo contains two distinct parts:
 
@@ -35,11 +38,9 @@ When ComfyUI applies a `swap_scale_shift` transform to the LoRA delta for adaLN-
 
 This repo patches `comfy.weight_adapter.base.weight_decompose` to:
 
-- Perform DoRA math in **fp32**.
-- Normalize using the norm of the **updated weight** `V = W + delta` (where `delta` is the LoRA delta after applying
-  `alpha`), rather than normalizing against the base weight.
-- Reshape `dora_scale` onto the active normalization axis before division so non-square targets do not broadcast
-  incorrectly.
+- perform DoRA math in **fp32**
+- normalize using the norm of the **updated weight** `V = W + delta` (where `delta` is the LoRA delta after applying `alpha`), rather than normalizing against the base weight
+- reshape `dora_scale` onto the active normalization axis before division so non-square targets do not broadcast incorrectly
 
 This is both more stable and more faithful to DoRA’s intended magnitude handling.
 
@@ -65,9 +66,31 @@ This is specifically to avoid mixed-precision paths flushing very small intermed
 
 ---
 
-### 4) OneTrainer “Apply on output axis (DoRA only)” direction-matrix fix
+### 4) Direction-matrix orientation fix for Diffusers / PEFT FLUX2 DoRA and compatible exports
 
-Some OneTrainer exports store the direction matrices (`lora_up` / `lora_down`, or `lora_A` / `lora_B`) in a layout that does not match the destination weight. Depending on the export, they may be swapped and/or transposed relative to what ComfyUI expects.
+Some Flux / Flux2 DoRA exports use Diffusers / PEFT-style direction matrices where:
+
+- `.lora_B.*` is the **up** matrix
+- `.lora_A.*` is the **down** matrix
+
+If those are interpreted with the wrong orientation in later compatibility paths, the loader can end up swapping already-correct matrices into the wrong layout, which then produces shape errors on mapped Flux2 targets such as:
+
+- `single_blocks.*.linear1.weight`
+- `single_blocks.*.linear2.weight`
+- fused qkv / proj targets
+
+This repo centralizes the directional suffix-pair semantics and uses the corrected orientation consistently in the relevant compatibility paths, so Diffusers / PEFT FLUX2 DoRA exports are not “fixed” into an invalid matrix layout.
+
+This directly addresses failure patterns such as:
+
+- `mat1 and mat2 shapes cannot be multiplied`
+- `shape '[6144, 6144]' is invalid for input of size 1024`
+
+---
+
+### 5) Output-axis direction-matrix fix for known DoRA export layouts
+
+Some DoRA exports store the direction matrices (`lora_up` / `lora_down`, or `lora_A` / `lora_B`) in a layout that does not match the destination weight. Depending on the export, they may be swapped and/or transposed relative to what ComfyUI expects.
 
 This repo compares those matrix shapes against the mapped destination weight and applies one of the following fixes when a known pattern is detected:
 
@@ -79,7 +102,7 @@ This fix runs automatically when a base has `*.dora_scale` and matching directio
 
 ---
 
-### 5) Diffusers / PEFT DoRA magnitude-vector compatibility (`lora_magnitude_vector` → `dora_scale`)
+### 6) Diffusers / PEFT DoRA magnitude-vector compatibility (`lora_magnitude_vector` → `dora_scale`)
 
 Some Diffusers / PEFT DoRA exports store the DoRA magnitude tensor under:
 
@@ -104,7 +127,7 @@ This directly fixes the common log pattern:
 
 ---
 
-### 6) Flux2 / OneTrainer key compatibility transforms
+### 7) Flux2 / OneTrainer key compatibility transforms
 
 Before mapping / loading, the loader may transform the LoRA state dict:
 
@@ -122,7 +145,7 @@ Before mapping / loading, the loader may transform the LoRA state dict:
 
 ---
 
-### 7) Dynamic key mapping (suffix matching + `.linear` ↔ `.lin`)
+### 8) Dynamic key mapping (suffix matching + `.linear` ↔ `.lin`)
 
 After building ComfyUI’s standard key map via:
 
@@ -144,7 +167,7 @@ If multiple candidates match, it picks the shortest match and prefers candidates
 
 ---
 
-### 8) Z-Image Turbo / Lumina2 architecture-aware attention compatibility
+### 9) Z-Image Turbo / Lumina2 architecture-aware attention compatibility
 
 Before mapping / loading, the loader can normalize ZiT / Lumina2 LoRAs into the model’s native fused-attention form.
 
@@ -187,19 +210,19 @@ are concatenated along the output dimension when all three components are presen
 
 ---
 
-### 9) `convert_lora` bypass when it zeroes direction matrices
+### 10) `convert_lora` bypass when it zeroes direction matrices
 
 The loader normally runs:
 
 - `comfy.lora_convert.convert_lora(...)`
 
-It also computes stats on direction matrices before and after conversion. If conversion turns a non-zero set of `.lora_up.weight` tensors into all zeros, the loader reloads the file and bypasses conversion for that LoRA.
+It also computes stats on direction matrices before and after conversion. If conversion turns a non-zero set of direction matrices into all zeros, the loader reloads the file and bypasses conversion for that LoRA.
 
 This is meant to protect against destructive conversion paths on certain exports.
 
 ---
 
-### 10) Diagnostics: NaN / Inf checks + quantization warnings
+### 11) Diagnostics: NaN / Inf checks + quantization warnings
 
 The loader emits warnings when:
 
@@ -260,13 +283,13 @@ For each enabled row:
 2. optionally bypass `convert_lora` if it zeroes direction matrices
 3. build ComfyUI key maps for UNet and CLIP
 4. optionally apply ZiT / Lumina2 attention normalization  
-   QKV fuse + `to_out.0` remap + exact key aliases
+   qkv fuse + `to_out.0` remap + exact key aliases
 5. apply Flux2 / OneTrainer compatibility transforms  
    rename + optional broadcast
 6. normalize Diffusers / PEFT DoRA magnitude keys  
    `lora_magnitude_vector` → `dora_scale`
 7. extend the key map with dynamic suffix matches
-8. apply the OneTrainer output-axis direction-matrix fix when applicable
+8. apply direction-matrix compatibility fixes when applicable
 9. call `comfy.lora.load_lora(...)`
 10. apply patches via `model.add_patches(...)` / `clip.add_patches(...)`
 
@@ -293,11 +316,6 @@ These patches affect DoRA / LoRA application in the running ComfyUI process, not
   - LoRA tensors
   - loaded patches
 
-### LoRA loads but has almost no effect
-
-- in verbose mode, the loader warns if **all** `.lora_up` direction matrices are zero in the file
-- that usually points to a training / export issue rather than a loader issue
-
 ### `lora_magnitude_vector` keys show as unloaded
 
 - this indicates a Diffusers / PEFT DoRA export format
@@ -305,6 +323,31 @@ These patches affect DoRA / LoRA application in the running ComfyUI process, not
 - if you still see them after updating, enable:
   - `Verbose`
   - `Log Unloaded Keys`
+
+### Shape errors on Flux2 targets
+
+If you see errors such as:
+
+- `mat1 and mat2 shapes cannot be multiplied`
+- `shape '[6144, 6144]' is invalid for input of size 1024`
+
+that usually points to a direction-matrix layout / orientation mismatch in the export or a compatibility path interpreting Diffusers-style `.lora_A` / `.lora_B` pairs incorrectly.
+
+Current versions of this repo include compatibility handling for that path. If you still see these errors after updating, enable:
+
+- `Verbose`
+- `Log Unloaded Keys`
+
+and inspect:
+
+- `OneTrainer output-axis DoRA mat-fix: checked=... fixed=...`
+- `patches=... applied(model)=...`
+- the first few `ERROR lora ...` lines
+
+### LoRA loads but has almost no effect
+
+- in verbose mode, the loader warns if **all** direction matrices are zero in the file
+- that usually points to a training / export issue rather than a loader issue
 
 ### Suspected mapping problems
 
@@ -324,3 +367,4 @@ This repo is meant for cases where plain ComfyUI LoRA loading is not enough, esp
 - OneTrainer DoRA exports
 - Diffusers / PEFT DoRA exports
 - Z-Image Turbo / Lumina2 attention-format LoRAs
+```
