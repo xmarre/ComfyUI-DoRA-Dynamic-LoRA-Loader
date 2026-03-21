@@ -191,6 +191,9 @@ function defaultState() {
       broadcast_auto_scale: true,
       broadcast_scale: 1.0,
       broadcast_include_dora_scale: false,
+      auto_strength_enabled: false,
+      auto_strength_ratio_floor: 0.30,
+      auto_strength_ratio_ceiling: 1.50,
       dora_decompose_debug: false,
       dora_decompose_debug_n: 30,
       dora_decompose_debug_stack_depth: 10,
@@ -226,6 +229,13 @@ function sanitizeState(st) {
     broadcast_scale: Number.isFinite(+globalsIn.broadcast_scale) ? +globalsIn.broadcast_scale : 1.0,
     broadcast_include_dora_scale:
       globalsIn.broadcast_include_dora_scale !== undefined ? !!globalsIn.broadcast_include_dora_scale : false,
+    auto_strength_enabled: globalsIn.auto_strength_enabled !== undefined ? !!globalsIn.auto_strength_enabled : false,
+    auto_strength_ratio_floor: Number.isFinite(+globalsIn.auto_strength_ratio_floor)
+      ? Math.max(0, +globalsIn.auto_strength_ratio_floor)
+      : 0.30,
+    auto_strength_ratio_ceiling: Number.isFinite(+globalsIn.auto_strength_ratio_ceiling)
+      ? Math.max(0, +globalsIn.auto_strength_ratio_ceiling)
+      : 1.50,
     dora_decompose_debug: globalsIn.dora_decompose_debug !== undefined ? !!globalsIn.dora_decompose_debug : false,
     dora_decompose_debug_n: Number.isFinite(+globalsIn.dora_decompose_debug_n)
       ? Math.max(0, Math.floor(+globalsIn.dora_decompose_debug_n))
@@ -237,6 +247,12 @@ function sanitizeState(st) {
     dora_adaln_swap_fix: globalsIn.dora_adaln_swap_fix !== undefined ? !!globalsIn.dora_adaln_swap_fix : true,
     zimage_lumina2_compat: globalsIn.zimage_lumina2_compat !== undefined ? !!globalsIn.zimage_lumina2_compat : true,
   };
+
+  if (globals.auto_strength_ratio_ceiling < globals.auto_strength_ratio_floor) {
+    const tmp = globals.auto_strength_ratio_floor;
+    globals.auto_strength_ratio_floor = globals.auto_strength_ratio_ceiling;
+    globals.auto_strength_ratio_ceiling = tmp;
+  }
 
   return { rows, globals };
 }
@@ -871,6 +887,41 @@ function buildUI(node, state, loraValues) {
   );
   wDoraDbgStack.label = "DoRA debug stack depth";
 
+  const wAutoStrengthEnabled = node.addWidget(
+    "toggle",
+    "auto_strength_enabled",
+    !!node._doraGlobals.auto_strength_enabled,
+    (v) => {
+      node._doraGlobals.auto_strength_enabled = !!v;
+      persistNodeState(node);
+    }
+  );
+  wAutoStrengthEnabled.label = "Auto-strength (per-base ΔW rebalance)";
+
+  const wAutoStrengthFloor = node.addWidget(
+    "number",
+    "auto_strength_ratio_floor",
+    Number.isFinite(+node._doraGlobals.auto_strength_ratio_floor) ? +node._doraGlobals.auto_strength_ratio_floor : 0.30,
+    (v) => {
+      node._doraGlobals.auto_strength_ratio_floor = Math.max(0, +v || 0);
+      persistNodeState(node);
+    },
+    { min: 0.0, max: 16.0, step: 0.01 }
+  );
+  wAutoStrengthFloor.label = "Auto-strength ratio floor";
+
+  const wAutoStrengthCeiling = node.addWidget(
+    "number",
+    "auto_strength_ratio_ceiling",
+    Number.isFinite(+node._doraGlobals.auto_strength_ratio_ceiling) ? +node._doraGlobals.auto_strength_ratio_ceiling : 1.50,
+    (v) => {
+      node._doraGlobals.auto_strength_ratio_ceiling = Math.max(0, +v || 0);
+      persistNodeState(node);
+    },
+    { min: 0.0, max: 16.0, step: 0.01 }
+  );
+  wAutoStrengthCeiling.label = "Auto-strength ratio ceiling";
+
   const size = node.computeSize();
   node.size[0] = Math.max(node.size[0], size[0]);
   node.size[1] = Math.max(node.size[1], size[1]);
@@ -914,6 +965,9 @@ app.registerExtension({
               broadcast_auto_scale: true,
               broadcast_scale: 1.0,
               broadcast_include_dora_scale: false,
+              auto_strength_enabled: false,
+              auto_strength_ratio_floor: 0.30,
+              auto_strength_ratio_ceiling: 1.50,
               dora_decompose_debug: false,
               dora_decompose_debug_n: 30,
               dora_decompose_debug_stack_depth: 10,

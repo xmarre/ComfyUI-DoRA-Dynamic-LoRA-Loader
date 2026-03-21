@@ -578,6 +578,10 @@ _BROADCAST_DORA_SUFFIXES = _BROADCAST_DELTA_SUFFIXES + (
     ".b_norm",
 )
 
+_AUTO_STRENGTH_RATIO_FLOOR = 0.30
+_AUTO_STRENGTH_RATIO_CEILING = 1.50
+_AUTO_STRENGTH_EPS = 1e-8
+
 
 def _src_has_dora_params(lora_sd: Dict[str, Any], base: str) -> bool:
     p = base + "."
@@ -1527,6 +1531,232 @@ def _unwrap_key_map_target(v: Any) -> Tuple[Optional[str], Optional[Tuple[int, i
     return (None, None)
 
 
+def _auto_strength_destination_group(
+    base: str,
+    key_map: Dict[str, Any],
+    model_state_dict: Optional[Dict[str, Any]],
+    clip_state_dict: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    dest, _ = _unwrap_key_map_target(key_map.get(base))
+    if not dest:
+        return None
+    if model_state_dict is not None and dest in model_state_dict:
+        return "model"
+    if clip_state_dict is not None and dest in clip_state_dict:
+        return "clip"
+    return None
+
+
+def _auto_strength_measure_base_delta(
+    lora_sd: Dict[str, Any],
+    base: str,
+) -> Optional[float]:
+    """
+    Return a comparable magnitude score for a single base's linear update.
+
+    Supported cases:
+      - standard LoRA / DoRA low-rank pairs (score = || (alpha/rank) * up @ down ||_F)
+      - direct delta tensors (.diff / .diff_b / .set_weight / .reshape_weight)
+
+    Returns None when the base has no measurable linear delta representation.
+    """
+    prefix = base + "."
+    direct_norms: List[float] = []
+
+    for suffix in (".diff", ".diff_b", ".set_weight", ".reshape_weight"):
+        key = base + suffix
+        tensor = lora_sd.get(key)
+        if isinstance(tensor, torch.Tensor):
+            try:
+                direct_norms.append(float(tensor.float().norm().item()))
+            except Exception:
+                pass
+
+    for up_suffix, down_suffix in _LORA_DIRECTION_SUFFIX_PAIRS:
+        up = lora_sd.get(base + up_suffix)
+        down = lora_sd.get(base + down_suffix)
+        if not isinstance(up, torch.Tensor) or not isinstance(down, torch.Tensor):
+            continue
+        try:
+            up_mat = up.float().reshape(int(up.shape[0]), -1)
+            down_mat = down.float().reshape(int(down.shape[0]), -1)
+        except Exception:
+            continue
+        if up_mat.ndim != 2 or down_mat.ndim != 2:
+            continue
+        if int(up_mat.shape[1]) != int(down_mat.shape[0]):
+            continue
+
+        try:
+            delta_norm = float((up_mat @ down_mat).norm().item())
+        except Exception:
+            continue
+
+        alpha = _tensor_scalar_to_float(lora_sd.get(base + ".alpha"), default=1.0)
+        rank = max(1, int(down_mat.shape[0]))
+        scale = (alpha / float(rank)) if (base + ".alpha") in lora_sd else 1.0
+        try:
+            direct_norms.append(abs(scale) * delta_norm)
+        except Exception:
+            direct_norms.append(delta_norm)
+
+    if not direct_norms:
+        # Best-effort fallback for exotic exports that still expose one-side linear tensors.
+        vals: List[float] = []
+        for key, tensor in lora_sd.items():
+            if not str(key).startswith(prefix) or not isinstance(tensor, torch.Tensor):
+                continue
+            if str(key).endswith(_UP_ONLY_SCALE_SUFFIXES):
+                try:
+                    vals.append(float(tensor.float().norm().item()))
+                except Exception:
+                    pass
+        if vals:
+            return float(sum(vals) / len(vals))
+        return None
+
+    return float(sum(direct_norms) / len(direct_norms))
+
+
+def _auto_strength_compute_base_targets(
+    lora_sd: Dict[str, Any],
+    lora_bases: Iterable[str],
+    key_map: Dict[str, Any],
+    model_state_dict: Optional[Dict[str, Any]],
+    clip_state_dict: Optional[Dict[str, Any]],
+    strength_model: float,
+    strength_clip: float,
+    ratio_floor: float,
+    ratio_ceiling: float,
+    verbose: bool = False,
+) -> Dict[str, float]:
+    """
+    Compute per-base target strengths.
+
+    Invariant: auto-strength must modulate the same *linear delta* that standard LoRA and
+    DoRA feed into Comfy's patch loader. We therefore compute a base-local score from the
+    linear update representation and bake the final target strength into that representation
+    before comfy.lora.load_lora(...).
+    """
+    ratio_floor = max(0.0, float(ratio_floor))
+    ratio_ceiling = max(ratio_floor, float(ratio_ceiling))
+
+    grouped_norms: Dict[str, List[float]] = {"model": [], "clip": []}
+    base_groups: Dict[str, str] = {}
+    base_norms: Dict[str, float] = {}
+    targets: Dict[str, float] = {}
+
+    for base in lora_bases:
+        group = _auto_strength_destination_group(base, key_map, model_state_dict, clip_state_dict)
+        if group is None:
+            continue
+        base_groups[base] = group
+        global_strength = float(strength_model if group == "model" else strength_clip)
+        targets[base] = global_strength
+        if abs(global_strength) < _AUTO_STRENGTH_EPS:
+            continue
+        norm = _auto_strength_measure_base_delta(lora_sd, base)
+        if norm is None or not (norm > _AUTO_STRENGTH_EPS):
+            continue
+        base_norms[base] = norm
+        grouped_norms[group].append(norm)
+
+    group_means = {
+        group: (float(sum(vals) / len(vals)) if vals else None)
+        for group, vals in grouped_norms.items()
+    }
+
+    for base, group in base_groups.items():
+        global_strength = float(strength_model if group == "model" else strength_clip)
+        if abs(global_strength) < _AUTO_STRENGTH_EPS:
+            targets[base] = 0.0
+            continue
+
+        norm = base_norms.get(base)
+        mean_norm = group_means.get(group)
+        if norm is None or mean_norm is None or not (norm > _AUTO_STRENGTH_EPS):
+            targets[base] = global_strength
+            continue
+
+        ratio = mean_norm / norm
+        ratio = max(ratio_floor, min(ratio_ceiling, ratio))
+        targets[base] = float(global_strength * ratio)
+
+    if verbose:
+        measured = len(base_norms)
+        total = len(base_groups)
+        _LOG.info(
+            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (model_mean=%s clip_mean=%s ratio_floor=%s ratio_ceiling=%s)",
+            measured,
+            total,
+            group_means.get("model"),
+            group_means.get("clip"),
+            ratio_floor,
+            ratio_ceiling,
+        )
+        sample = sorted(targets.items())[:20]
+        for base, target in sample:
+            norm = base_norms.get(base)
+            _LOG.info(
+                "[DoRA Power LoRA Loader] auto-strength: base=%s group=%s norm=%s target=%s",
+                base,
+                base_groups.get(base),
+                norm,
+                target,
+            )
+
+    return targets
+
+
+def _apply_base_strength_targets(
+    lora_sd: Dict[str, Any],
+    base_strengths: Dict[str, float],
+) -> Tuple[Dict[str, Any], bool]:
+    """
+    Bake final target strengths into the LoRA tensors themselves.
+
+    Rules:
+      - if .alpha exists, scale ONLY .alpha
+      - otherwise scale only one linear factor (.lora_up / .lora_A / equivalent)
+      - direct delta tensors (.diff / .set_weight / ...) are scaled directly
+      - DoRA magnitude tensors (.dora_scale / .w_norm / .b_norm) are never scaled
+    """
+    if not base_strengths:
+        return (lora_sd, False)
+
+    scaled = dict(lora_sd)
+    changed = False
+    for base, target in base_strengths.items():
+        prefix = base + "."
+        keys = [k for k in lora_sd.keys() if str(k).startswith(prefix)]
+        if not keys:
+            continue
+
+        has_alpha = any(str(k) == (base + ".alpha") for k in keys)
+        for k in keys:
+            v = lora_sd.get(k)
+            if not isinstance(v, torch.Tensor):
+                continue
+            ks = str(k)
+
+            if ks.endswith((".dora_scale", ".w_norm", ".b_norm")):
+                continue
+
+            should_scale = False
+            if ks.endswith(".alpha"):
+                should_scale = True
+            elif ks.endswith((".diff", ".diff_b", ".set_weight", ".reshape_weight")):
+                should_scale = True
+            elif (not has_alpha) and ks.endswith(_UP_ONLY_SCALE_SUFFIXES):
+                should_scale = True
+
+            if should_scale:
+                scaled[k] = v * float(target)
+                changed = True
+
+    return (scaled, changed)
+
+
 def _fix_onetrainer_output_axis_dora_mats(
     lora_sd: Dict[str, Any],
     key_map: Dict[str, Any],
@@ -2092,6 +2322,11 @@ class DoraPowerLoraLoader:
                     "dora_adaln_swap_fix": ("BOOLEAN", {"default": True}),
                     # Z-Image Turbo / Lumina2 architecture-aware normalization
                     "zimage_lumina2_compat": ("BOOLEAN", {"default": True}),
+
+                    # Optional per-base auto-strength redistribution
+                    "auto_strength_enabled": ("BOOLEAN", {"default": False}),
+                    "auto_strength_ratio_floor": ("FLOAT", {"default": _AUTO_STRENGTH_RATIO_FLOOR, "min": 0.0, "max": 16.0, "step": 0.01}),
+                    "auto_strength_ratio_ceiling": ("FLOAT", {"default": _AUTO_STRENGTH_RATIO_CEILING, "min": 0.0, "max": 16.0, "step": 0.01}),
                 },
             ),
             "hidden": {},
@@ -2122,6 +2357,9 @@ class DoraPowerLoraLoader:
         clip_sd_keys: Optional[Set[str]],
         clip_sd_list: Optional[List[str]],
         zimage_lumina2_compat: bool,
+        auto_strength_enabled: bool,
+        auto_strength_ratio_floor: float,
+        auto_strength_ratio_ceiling: float,
     ):
         lora_path = folder_paths.get_full_path("loras", lora_name)
         if not lora_path:
@@ -2270,6 +2508,24 @@ class DoraPowerLoraLoader:
         )
         _log_lora_direction_stats(lora_name + " (post-fix)", lora_sd, verbose=verbose)
 
+        apply_strengths_in_patch = False
+        if auto_strength_enabled and (abs(float(strength_model)) > _AUTO_STRENGTH_EPS or abs(float(strength_clip)) > _AUTO_STRENGTH_EPS):
+            base_strengths = _auto_strength_compute_base_targets(
+                lora_sd=lora_sd,
+                lora_bases=lora_bases,
+                key_map=key_map,
+                model_state_dict=model_state_dict,
+                clip_state_dict=clip_state_dict,
+                strength_model=strength_model,
+                strength_clip=strength_clip,
+                ratio_floor=auto_strength_ratio_floor,
+                ratio_ceiling=auto_strength_ratio_ceiling,
+                verbose=verbose,
+            )
+            lora_sd, auto_strength_applied = _apply_base_strength_targets(lora_sd, base_strengths)
+            apply_strengths_in_patch = auto_strength_applied
+            _log_lora_direction_stats(lora_name + " (post-auto-strength)", lora_sd, verbose=verbose)
+
         # Load patches (DoRA handling remains in comfy.lora internals).
         try:
             loaded = comfy.lora.load_lora(lora_sd, key_map, log_missing=log_unloaded_keys)
@@ -2285,16 +2541,19 @@ class DoraPowerLoraLoader:
         # Apply patches to provided model/clip (already cloned by caller).
         applied_m = []
         applied_c = []
+        patch_strength_model = 1.0 if apply_strengths_in_patch else strength_model
+        patch_strength_clip = 1.0 if apply_strengths_in_patch else strength_clip
+
         if model is not None:
             try:
-                applied_m = model.add_patches(loaded, strength_model) or []
+                applied_m = model.add_patches(loaded, patch_strength_model) or []
             except Exception:
-                model.add_patches(loaded, strength_model)
+                model.add_patches(loaded, patch_strength_model)
         if clip is not None:
             try:
-                applied_c = clip.add_patches(loaded, strength_clip) or []
+                applied_c = clip.add_patches(loaded, patch_strength_clip) or []
             except Exception:
-                clip.add_patches(loaded, strength_clip)
+                clip.add_patches(loaded, patch_strength_clip)
 
         if verbose:
             def _n(x):
@@ -2309,8 +2568,8 @@ class DoraPowerLoraLoader:
                 _n(loaded),
                 _n(applied_m),
                 _n(applied_c),
-                strength_model,
-                strength_clip,
+                patch_strength_model,
+                patch_strength_clip,
             )
             if isinstance(applied_m, list) and applied_m:
                 _LOG.info("[DoRA Power LoRA Loader] %s: sample applied(model) keys: %s", lora_name, applied_m[:10])
@@ -2345,6 +2604,18 @@ class DoraPowerLoraLoader:
         dora_slice_fix = bool(kwargs.get("dora_slice_fix", True))
         dora_adaln_swap_fix = bool(kwargs.get("dora_adaln_swap_fix", True))
         zimage_lumina2_compat = bool(kwargs.get("zimage_lumina2_compat", True))
+        auto_strength_enabled = bool(kwargs.get("auto_strength_enabled", False))
+        try:
+            auto_strength_ratio_floor = float(kwargs.get("auto_strength_ratio_floor", _AUTO_STRENGTH_RATIO_FLOOR))
+        except Exception:
+            auto_strength_ratio_floor = _AUTO_STRENGTH_RATIO_FLOOR
+        try:
+            auto_strength_ratio_ceiling = float(kwargs.get("auto_strength_ratio_ceiling", _AUTO_STRENGTH_RATIO_CEILING))
+        except Exception:
+            auto_strength_ratio_ceiling = _AUTO_STRENGTH_RATIO_CEILING
+        if auto_strength_ratio_ceiling < auto_strength_ratio_floor:
+            auto_strength_ratio_floor, auto_strength_ratio_ceiling = auto_strength_ratio_ceiling, auto_strength_ratio_floor
+
         _set_dora_decomp_cfg(
             dbg=dora_dbg,
             dbg_n=dora_dbg_n,
@@ -2409,6 +2680,9 @@ class DoraPowerLoraLoader:
                 clip_sd_keys=clip_sd_keys,
                 clip_sd_list=clip_sd_list,
                 zimage_lumina2_compat=zimage_lumina2_compat,
+                auto_strength_enabled=auto_strength_enabled,
+                auto_strength_ratio_floor=auto_strength_ratio_floor,
+                auto_strength_ratio_ceiling=auto_strength_ratio_ceiling,
             )
 
         return (new_model, new_clip)
