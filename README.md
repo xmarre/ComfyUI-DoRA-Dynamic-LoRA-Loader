@@ -14,6 +14,10 @@ This repo contains two distinct parts:
    - fixes and compatibility layers needed for Flux / Flux2 DoRA LoRAs to load and apply correctly
    - protection against several known failure modes
 
+Auto-strength support in this loader was inspired by [Comfyui-flux2klein-Lora-loader](https://github.com/capitan01R/Comfyui-flux2klein-Lora-loader) and [Comfyui-ZiT-Lora-loader](https://github.com/capitan01R/Comfyui-ZiT-Lora-loader).
+
+This implementation was reworked for the unified DoRA + standard LoRA path in this loader, including Flux.2 Klein and ZiT/Lumina2 compatibility handling.
+
 ---
 
 ## AdaLN swap-scale alignment fix (Flux2 DoRA)
