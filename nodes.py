@@ -1592,6 +1592,37 @@ def _auto_strength_get_destination_weight(
         return None
 
 
+def _auto_strength_destination_family(weight: Optional[torch.Tensor]) -> str:
+    """
+    Return a coarse destination family for auto-strength cohorting.
+
+    Invariant: auto-strength ratios must compare like with like. Pooling SDXL spatial
+    conv kernels and large projection matrices into one mean biases the ratio toward
+    whichever family dominates parameter count, even if their update magnitudes are
+    not semantically comparable.
+    """
+    if not isinstance(weight, torch.Tensor):
+        return "unknown"
+    try:
+        ndim = int(weight.ndim)
+    except Exception:
+        return "unknown"
+
+    if ndim <= 0:
+        return "unknown"
+    if ndim == 1:
+        return "vector"
+    if ndim == 2:
+        return "linear"
+    try:
+        spatial = tuple(int(x) for x in weight.shape[2:])
+    except Exception:
+        spatial = ()
+    if spatial:
+        return "conv:" + "x".join(str(x) for x in spatial)
+    return f"tensor:{ndim}d"
+
+
 def _auto_strength_measure_dora_effect(
     weight: torch.Tensor,
     delta: torch.Tensor,
@@ -1773,11 +1804,13 @@ def _auto_strength_compute_base_targets(
     ratio_ceiling = max(ratio_floor, float(ratio_ceiling))
     logical_groups = logical_groups or {}
 
-    grouped_norms: Dict[str, Dict[str, List[float]]] = {"model": {}, "clip": {}}
+    grouped_norms: Dict[Tuple[str, str], Dict[str, List[float]]] = {}
     base_groups: Dict[str, str] = {}
+    base_families: Dict[str, str] = {}
+    base_cohorts: Dict[str, Tuple[str, str]] = {}
     base_norms: Dict[str, float] = {}
     base_logical_ids: Dict[str, str] = {}
-    logical_norms: Dict[str, float] = {}
+    logical_norms: Dict[Tuple[str, str, str], float] = {}
     targets: Dict[str, float] = {}
 
     for base in lora_bases:
@@ -1785,6 +1818,11 @@ def _auto_strength_compute_base_targets(
         if group is None:
             continue
         base_groups[base] = group
+        dest_weight = _auto_strength_get_destination_weight(base, key_map, model_state_dict, clip_state_dict)
+        family = _auto_strength_destination_family(dest_weight)
+        base_families[base] = family
+        cohort = (group, family)
+        base_cohorts[base] = cohort
         global_strength = float(strength_model if group == "model" else strength_clip)
         targets[base] = global_strength
         if abs(global_strength) < _AUTO_STRENGTH_EPS:
@@ -1815,16 +1853,17 @@ def _auto_strength_compute_base_targets(
             continue
         base_norms[base] = norm
         logical_norm = float(norm / logical_scale)
-        logical_norms[logical_id] = logical_norm
-        grouped_norms[group].setdefault(logical_id, []).append(logical_norm)
+        logical_key = (cohort[0], cohort[1], logical_id)
+        logical_norms[logical_key] = logical_norm
+        grouped_norms.setdefault(cohort, {}).setdefault(logical_id, []).append(logical_norm)
 
-    group_means = {}
-    for group, vals_by_logical in grouped_norms.items():
+    group_means: Dict[Tuple[str, str], Optional[float]] = {}
+    for cohort, vals_by_logical in grouped_norms.items():
         logical_vals = [float(sum(vals) / len(vals)) for vals in vals_by_logical.values() if vals]
-        group_means[group] = float(sum(logical_vals) / len(logical_vals)) if logical_vals else None
+        group_means[cohort] = float(sum(logical_vals) / len(logical_vals)) if logical_vals else None
         for logical_id, vals in vals_by_logical.items():
             if vals:
-                logical_norms[logical_id] = float(sum(vals) / len(vals))
+                logical_norms[(cohort[0], cohort[1], logical_id)] = float(sum(vals) / len(vals))
 
     for base, group in base_groups.items():
         global_strength = float(strength_model if group == "model" else strength_clip)
@@ -1832,9 +1871,11 @@ def _auto_strength_compute_base_targets(
             targets[base] = 0.0
             continue
 
+        family = base_families.get(base, "unknown")
+        cohort = base_cohorts.get(base, (group, family))
         logical_id = base_logical_ids.get(base, base)
-        norm = logical_norms.get(logical_id)
-        mean_norm = group_means.get(group)
+        norm = logical_norms.get((cohort[0], cohort[1], logical_id))
+        mean_norm = group_means.get(cohort)
         if norm is None or mean_norm is None or not (norm > _AUTO_STRENGTH_EPS):
             targets[base] = global_strength
             continue
@@ -1847,13 +1888,16 @@ def _auto_strength_compute_base_targets(
         measured = len(base_norms)
         measured_logical = sum(1 for v in logical_norms.values() if v > _AUTO_STRENGTH_EPS)
         total = len(base_groups)
+        cohort_summary = {
+            f"{group}/{family}": mean
+            for (group, family), mean in sorted(group_means.items())
+        }
         _LOG.info(
-            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (%s logical groups) (model_mean=%s clip_mean=%s ratio_floor=%s ratio_ceiling=%s)",
+            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (%s logical groups) (cohort_means=%s ratio_floor=%s ratio_ceiling=%s)",
             measured,
             total,
             measured_logical,
-            group_means.get("model"),
-            group_means.get("clip"),
+            cohort_summary,
             ratio_floor,
             ratio_ceiling,
         )
@@ -1862,10 +1906,11 @@ def _auto_strength_compute_base_targets(
             norm = base_norms.get(base)
             logical_id = base_logical_ids.get(base, base)
             _LOG.info(
-                "[DoRA Power LoRA Loader] auto-strength: base=%s logical=%s group=%s norm=%s target=%s",
+                "[DoRA Power LoRA Loader] auto-strength: base=%s logical=%s group=%s family=%s norm=%s target=%s",
                 base,
                 logical_id,
                 base_groups.get(base),
+                base_families.get(base),
                 norm,
                 target,
             )
