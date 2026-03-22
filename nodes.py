@@ -1555,22 +1555,36 @@ def _auto_strength_measure_base_delta(
     Return a comparable magnitude score for a single base's linear update.
 
     Supported cases:
-      - standard LoRA / DoRA low-rank pairs (score = || (alpha/rank) * up @ down ||_F)
+      - standard LoRA / DoRA low-rank pairs
       - direct delta tensors (.diff / .diff_b / .set_weight / .reshape_weight)
+
+    Invariant: scores must be comparable across destination tensor sizes. Using raw
+    Frobenius norms violates that invariant because ||ΔW||_F scales with sqrt(numel),
+    which over-boosts smaller spatial layers in mixed architectures like SDXL. We
+    therefore compare RMS update magnitude (scaled Frobenius / sqrt(numel)).
 
     Returns None when the base has no measurable linear delta representation.
     """
     prefix = base + "."
     direct_norms: List[float] = []
 
+    def _tensor_rms(tensor: torch.Tensor) -> Optional[float]:
+        try:
+            t = tensor.float()
+            n = int(t.numel())
+            if n <= 0:
+                return None
+            return float(t.norm().item()) / (float(n) ** 0.5)
+        except Exception:
+            return None
+
     for suffix in (".diff", ".diff_b", ".set_weight", ".reshape_weight"):
         key = base + suffix
         tensor = lora_sd.get(key)
         if isinstance(tensor, torch.Tensor):
-            try:
-                direct_norms.append(float(tensor.float().norm().item()))
-            except Exception:
-                pass
+            rms = _tensor_rms(tensor)
+            if rms is not None:
+                direct_norms.append(rms)
 
     for up_suffix, down_suffix in _LORA_DIRECTION_SUFFIX_PAIRS:
         up = lora_sd.get(base + up_suffix)
@@ -1588,17 +1602,20 @@ def _auto_strength_measure_base_delta(
             continue
 
         try:
-            delta_norm = float((up_mat @ down_mat).norm().item())
+            delta = up_mat @ down_mat
+            delta_rms = _tensor_rms(delta)
         except Exception:
+            continue
+        if delta_rms is None:
             continue
 
         alpha = _tensor_scalar_to_float(lora_sd.get(base + ".alpha"), default=1.0)
         rank = max(1, int(down_mat.shape[0]))
         scale = (alpha / float(rank)) if (base + ".alpha") in lora_sd else 1.0
         try:
-            direct_norms.append(abs(scale) * delta_norm)
+            direct_norms.append(abs(scale) * delta_rms)
         except Exception:
-            direct_norms.append(delta_norm)
+            direct_norms.append(delta_rms)
 
     if not direct_norms:
         # Best-effort fallback for exotic exports that still expose one-side linear tensors.
@@ -1607,10 +1624,9 @@ def _auto_strength_measure_base_delta(
             if not str(key).startswith(prefix) or not isinstance(tensor, torch.Tensor):
                 continue
             if str(key).endswith(_UP_ONLY_SCALE_SUFFIXES):
-                try:
-                    vals.append(float(tensor.float().norm().item()))
-                except Exception:
-                    pass
+                rms = _tensor_rms(tensor)
+                if rms is not None:
+                    vals.append(rms)
         if vals:
             return float(sum(vals) / len(vals))
         return None
@@ -1628,22 +1644,33 @@ def _auto_strength_compute_base_targets(
     strength_clip: float,
     ratio_floor: float,
     ratio_ceiling: float,
+    logical_groups: Optional[Dict[str, Tuple[str, float]]] = None,
     verbose: bool = False,
 ) -> Dict[str, float]:
     """
     Compute per-base target strengths.
 
-    Invariant: auto-strength must modulate the same *linear delta* that standard LoRA and
-    DoRA feed into Comfy's patch loader. We therefore compute a base-local score from the
-    linear update representation and bake the final target strength into that representation
-    before comfy.lora.load_lora(...).
+    Invariants:
+      - auto-strength must modulate the same *linear delta* that standard LoRA and
+        DoRA feed into Comfy's patch loader.
+      - auto-strength must be invariant to synthetic compat expansion. Broadcasting one
+        logical source into N per-block bases must not change its measured target just
+        because the loader expanded the keys before comfy.lora.load_lora(...).
+
+    We therefore compute a base-local score from the linear update representation, fold
+    compat-broadcast clones back into their logical source groups for measurement, and
+    then bake the final target strength into that same linear representation before
+    comfy.lora.load_lora(...).
     """
     ratio_floor = max(0.0, float(ratio_floor))
     ratio_ceiling = max(ratio_floor, float(ratio_ceiling))
+    logical_groups = logical_groups or {}
 
-    grouped_norms: Dict[str, List[float]] = {"model": [], "clip": []}
+    grouped_norms: Dict[str, Dict[str, List[float]]] = {"model": {}, "clip": {}}
     base_groups: Dict[str, str] = {}
     base_norms: Dict[str, float] = {}
+    base_logical_ids: Dict[str, str] = {}
+    logical_norms: Dict[str, float] = {}
     targets: Dict[str, float] = {}
 
     for base in lora_bases:
@@ -1655,16 +1682,36 @@ def _auto_strength_compute_base_targets(
         targets[base] = global_strength
         if abs(global_strength) < _AUTO_STRENGTH_EPS:
             continue
+
+        logical_id = base
+        logical_scale = 1.0
+        lg = logical_groups.get(base)
+        if isinstance(lg, tuple) and len(lg) >= 2:
+            try:
+                logical_id = str(lg[0])
+                logical_scale = abs(float(lg[1]))
+            except Exception:
+                logical_id = base
+                logical_scale = 1.0
+        if not (logical_scale > _AUTO_STRENGTH_EPS):
+            logical_scale = 1.0
+        base_logical_ids[base] = logical_id
+
         norm = _auto_strength_measure_base_delta(lora_sd, base)
         if norm is None or not (norm > _AUTO_STRENGTH_EPS):
             continue
         base_norms[base] = norm
-        grouped_norms[group].append(norm)
+        logical_norm = float(norm / logical_scale)
+        logical_norms[logical_id] = logical_norm
+        grouped_norms[group].setdefault(logical_id, []).append(logical_norm)
 
-    group_means = {
-        group: (float(sum(vals) / len(vals)) if vals else None)
-        for group, vals in grouped_norms.items()
-    }
+    group_means = {}
+    for group, vals_by_logical in grouped_norms.items():
+        logical_vals = [float(sum(vals) / len(vals)) for vals in vals_by_logical.values() if vals]
+        group_means[group] = float(sum(logical_vals) / len(logical_vals)) if logical_vals else None
+        for logical_id, vals in vals_by_logical.items():
+            if vals:
+                logical_norms[logical_id] = float(sum(vals) / len(vals))
 
     for base, group in base_groups.items():
         global_strength = float(strength_model if group == "model" else strength_clip)
@@ -1672,7 +1719,8 @@ def _auto_strength_compute_base_targets(
             targets[base] = 0.0
             continue
 
-        norm = base_norms.get(base)
+        logical_id = base_logical_ids.get(base, base)
+        norm = logical_norms.get(logical_id)
         mean_norm = group_means.get(group)
         if norm is None or mean_norm is None or not (norm > _AUTO_STRENGTH_EPS):
             targets[base] = global_strength
@@ -1684,11 +1732,13 @@ def _auto_strength_compute_base_targets(
 
     if verbose:
         measured = len(base_norms)
+        measured_logical = sum(1 for v in logical_norms.values() if v > _AUTO_STRENGTH_EPS)
         total = len(base_groups)
         _LOG.info(
-            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (model_mean=%s clip_mean=%s ratio_floor=%s ratio_ceiling=%s)",
+            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (%s logical groups) (model_mean=%s clip_mean=%s ratio_floor=%s ratio_ceiling=%s)",
             measured,
             total,
+            measured_logical,
             group_means.get("model"),
             group_means.get("clip"),
             ratio_floor,
@@ -1697,9 +1747,11 @@ def _auto_strength_compute_base_targets(
         sample = sorted(targets.items())[:20]
         for base, target in sample:
             norm = base_norms.get(base)
+            logical_id = base_logical_ids.get(base, base)
             _LOG.info(
-                "[DoRA Power LoRA Loader] auto-strength: base=%s group=%s norm=%s target=%s",
+                "[DoRA Power LoRA Loader] auto-strength: base=%s logical=%s group=%s norm=%s target=%s",
                 base,
+                logical_id,
                 base_groups.get(base),
                 norm,
                 target,
@@ -1891,6 +1943,7 @@ def _apply_flux2_onetrainer_dora_compat(
     broadcast_scale: float = 1.0,
     broadcast_modulations: bool = True,
     broadcast_include_dora_scale: bool = False,
+    auto_strength_logical_groups: Optional[Dict[str, Tuple[str, float]]] = None,
 ) -> None:
     """
     Flux2 / OneTrainer DoRA compat:
@@ -1972,6 +2025,19 @@ def _apply_flux2_onetrainer_dora_compat(
             return 1.0
         return (float(broadcast_scale) / float(n)) if broadcast_auto_scale else float(broadcast_scale)
 
+    def _register_auto_strength_group(source_base: str, targets: List[str], scale: float) -> None:
+        if auto_strength_logical_groups is None or not targets:
+            return
+        try:
+            scale_f = float(scale)
+        except Exception:
+            scale_f = 1.0
+        if not (abs(scale_f) > _AUTO_STRENGTH_EPS):
+            scale_f = 1.0
+        logical_id = f"broadcast:{source_base}"
+        for dst in targets:
+            auto_strength_logical_groups[dst] = (logical_id, scale_f)
+
     scale_img = _scale_for(len(img_targets))
     scale_txt = _scale_for(len(txt_targets))
     scale_single = _scale_for(len(single_targets))
@@ -2013,6 +2079,7 @@ def _apply_flux2_onetrainer_dora_compat(
             created = 0
             for dst in img_targets:
                 created += _clone_base_block(lora_sd, src_img, dst, scale=scale_img, allow_suffixes=suf_img)
+            _register_auto_strength_group(src_img, img_targets, scale_img)
             if verbose:
                 _LOG.info("[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)", src_img, len(img_targets), created)
             _delete_prefix_keys(lora_sd, src_img + ".")
@@ -2031,6 +2098,7 @@ def _apply_flux2_onetrainer_dora_compat(
             created = 0
             for dst in txt_targets:
                 created += _clone_base_block(lora_sd, src_txt, dst, scale=scale_txt, allow_suffixes=suf_txt)
+            _register_auto_strength_group(src_txt, txt_targets, scale_txt)
             if verbose:
                 _LOG.info("[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)", src_txt, len(txt_targets), created)
             _delete_prefix_keys(lora_sd, src_txt + ".")
@@ -2049,6 +2117,7 @@ def _apply_flux2_onetrainer_dora_compat(
             created = 0
             for dst in single_targets:
                 created += _clone_base_block(lora_sd, src_single, dst, scale=scale_single, allow_suffixes=suf_single)
+            _register_auto_strength_group(src_single, single_targets, scale_single)
             if verbose:
                 _LOG.info(
                     "[DoRA Power LoRA Loader] flux2 compat: broadcast %s -> %s targets (keys=%s)",
@@ -2462,6 +2531,7 @@ class DoraPowerLoraLoader:
 
         # Flux2/OneTrainer DoRA compat: rewrite + broadcast missing modules into keys ComfyUI maps.
         # This fixes cases where critical dora_scale/lora_up/down tensors never map/load.
+        auto_strength_logical_groups: Dict[str, Tuple[str, float]] = {}
         if model is not None:
             _apply_flux2_onetrainer_dora_compat(
                 lora_sd=lora_sd,
@@ -2473,6 +2543,7 @@ class DoraPowerLoraLoader:
                 broadcast_scale=broadcast_scale,
                 broadcast_modulations=broadcast_modulations,
                 broadcast_include_dora_scale=broadcast_include_dora_scale,
+                auto_strength_logical_groups=auto_strength_logical_groups,
             )
 
         # Extract base module names from file keys (after compat rewrites/broadcast).
@@ -2520,6 +2591,7 @@ class DoraPowerLoraLoader:
                 strength_clip=strength_clip,
                 ratio_floor=auto_strength_ratio_floor,
                 ratio_ceiling=auto_strength_ratio_ceiling,
+                logical_groups=auto_strength_logical_groups,
                 verbose=verbose,
             )
             lora_sd, auto_strength_applied = _apply_base_strength_targets(lora_sd, base_strengths)
