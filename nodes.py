@@ -1797,7 +1797,7 @@ def _auto_strength_compute_base_targets(
 
     We therefore compute a base-local score from the linear update representation, fold
     compat-broadcast clones back into their logical source groups for measurement, and
-    then bake the final target strength into that same linear representation before
+    then convert those absolute targets into per-base redistribution ratios before
     comfy.lora.load_lora(...).
     """
     ratio_floor = max(0.0, float(ratio_floor))
@@ -1918,25 +1918,69 @@ def _auto_strength_compute_base_targets(
     return targets
 
 
-def _apply_base_strength_targets(
-    lora_sd: Dict[str, Any],
+def _auto_strength_targets_to_ratios(
     base_strengths: Dict[str, float],
+    key_map: Dict[str, Any],
+    model_state_dict: Optional[Dict[str, Any]],
+    clip_state_dict: Optional[Dict[str, Any]],
+    strength_model: float,
+    strength_clip: float,
+) -> Dict[str, float]:
+    """
+    Convert absolute per-base targets into redistribution ratios relative to the
+    caller's global model/clip strengths.
+
+    Invariant: enabling auto-strength must be a no-op when every base's computed
+    ratio is 1.0. That requires preserving Comfy's normal outer patch strength path
+    instead of baking the caller's global strength into the tensors themselves.
+    """
+    ratios: Dict[str, float] = {}
+    for base, target in base_strengths.items():
+        group = _auto_strength_destination_group(base, key_map, model_state_dict, clip_state_dict)
+        if group is None:
+            continue
+        global_strength = float(strength_model if group == "model" else strength_clip)
+        if abs(global_strength) <= _AUTO_STRENGTH_EPS:
+            ratios[base] = 1.0
+            continue
+        try:
+            ratios[base] = float(target) / global_strength
+        except Exception:
+            ratios[base] = 1.0
+    return ratios
+
+
+def _apply_base_strength_ratios(
+    lora_sd: Dict[str, Any],
+    base_ratios: Dict[str, float],
 ) -> Tuple[Dict[str, Any], bool]:
     """
-    Bake final target strengths into the LoRA tensors themselves.
+    Bake per-base redistribution ratios into the LoRA tensors themselves.
 
     Rules:
       - if .alpha exists, scale ONLY .alpha
       - otherwise scale only one linear factor (.lora_up / .lora_A / equivalent)
       - direct delta tensors (.diff / .set_weight / ...) are scaled directly
       - DoRA magnitude tensors (.dora_scale / .w_norm / .b_norm) are never scaled
+
+    We intentionally scale only the relative auto-strength ratio, not the caller's
+    global model/clip strength. The outer patch strength must still be applied by
+    model.add_patches()/clip.add_patches() so DoRA keeps Comfy's normal post-
+    normalization strength mixing semantics.
     """
-    if not base_strengths:
+    if not base_ratios:
         return (lora_sd, False)
 
     scaled = dict(lora_sd)
     changed = False
-    for base, target in base_strengths.items():
+    for base, ratio in base_ratios.items():
+        try:
+            ratio_f = float(ratio)
+        except Exception:
+            continue
+        if abs(ratio_f - 1.0) <= _AUTO_STRENGTH_EPS:
+            continue
+
         prefix = base + "."
         keys = [k for k in lora_sd.keys() if str(k).startswith(prefix)]
         if not keys:
@@ -1961,7 +2005,7 @@ def _apply_base_strength_targets(
                 should_scale = True
 
             if should_scale:
-                scaled[k] = v * float(target)
+                scaled[k] = v * ratio_f
                 changed = True
 
     return (scaled, changed)
@@ -2737,7 +2781,6 @@ class DoraPowerLoraLoader:
         )
         _log_lora_direction_stats(lora_name + " (post-fix)", lora_sd, verbose=verbose)
 
-        apply_strengths_in_patch = False
         if auto_strength_enabled and (abs(float(strength_model)) > _AUTO_STRENGTH_EPS or abs(float(strength_clip)) > _AUTO_STRENGTH_EPS):
             base_strengths = _auto_strength_compute_base_targets(
                 lora_sd=lora_sd,
@@ -2752,8 +2795,15 @@ class DoraPowerLoraLoader:
                 logical_groups=auto_strength_logical_groups,
                 verbose=verbose,
             )
-            lora_sd, auto_strength_applied = _apply_base_strength_targets(lora_sd, base_strengths)
-            apply_strengths_in_patch = auto_strength_applied
+            base_ratios = _auto_strength_targets_to_ratios(
+                base_strengths=base_strengths,
+                key_map=key_map,
+                model_state_dict=model_state_dict,
+                clip_state_dict=clip_state_dict,
+                strength_model=strength_model,
+                strength_clip=strength_clip,
+            )
+            lora_sd, _ = _apply_base_strength_ratios(lora_sd, base_ratios)
             _log_lora_direction_stats(lora_name + " (post-auto-strength)", lora_sd, verbose=verbose)
 
         # Load patches (DoRA handling remains in comfy.lora internals).
@@ -2771,8 +2821,8 @@ class DoraPowerLoraLoader:
         # Apply patches to provided model/clip (already cloned by caller).
         applied_m = []
         applied_c = []
-        patch_strength_model = 1.0 if apply_strengths_in_patch else strength_model
-        patch_strength_clip = 1.0 if apply_strengths_in_patch else strength_clip
+        patch_strength_model = strength_model
+        patch_strength_clip = strength_clip
 
         if model is not None:
             try:
