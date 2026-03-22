@@ -1,7 +1,6 @@
-
 # ComfyUI-DoRA-Dynamic-LoRA-Loader
 
-Custom ComfyUI node that loads and stacks **regular LoRAs and DoRA LoRAs**, with additional **Flux / Flux2 + Diffusers/PEFT + OneTrainer compatibility**, **Z-Image Turbo / Lumina2 attention-format compatibility**, and multiple **DoRA correctness / stability fixes**.
+Custom ComfyUI node that loads and stacks **regular LoRAs and DoRA LoRAs**, with additional **Flux / Flux2 + Diffusers/PEFT + OneTrainer compatibility**, **Z-Image Turbo / Lumina2 attention-format compatibility**, optional **auto-strength redistribution**, and multiple **DoRA correctness / stability fixes**.
 
 This repo contains two distinct parts:
 
@@ -17,6 +16,41 @@ This repo contains two distinct parts:
 Auto-strength support in this loader was inspired by [Comfyui-flux2klein-Lora-loader](https://github.com/capitan01R/Comfyui-flux2klein-Lora-loader) and [Comfyui-ZiT-Lora-loader](https://github.com/capitan01R/Comfyui-ZiT-Lora-loader).
 
 This implementation was reworked for the unified DoRA + standard LoRA path in this loader, including Flux.2 Klein and ZiT/Lumina2 compatibility handling.
+
+---
+
+## Auto-strength
+
+This node includes optional **auto-strength** redistribution for loaded LoRAs / DoRAs.
+
+When enabled, the loader:
+
+- measures a comparable per-base update magnitude
+- computes a per-base target relative to the mean of similar mapped destinations
+- converts those absolute targets into **redistribution ratios**
+- bakes only that **ratio** into the LoRA tensors before loading
+
+### Important implementation detail
+
+The loader intentionally preserves the caller's normal outer **Model / CLIP patch strength** path.
+
+That means auto-strength adjusts only the **relative balance between bases**, while the row's normal weight still controls the final overall strength.
+
+This is especially important for **DoRA**: the outer strength is part of ComfyUI's normal post-normalization application path, so baking the full absolute target directly into the tensors would not be equivalent.
+
+If:
+
+- `auto_strength_ratio_floor = 1.0`
+- `auto_strength_ratio_ceiling = 1.0`
+
+then enabling auto-strength is a true no-op.
+
+### Current auto-strength behavior
+
+- compares mapped bases using a normalized magnitude score
+- keeps Flux / Flux2 compat-broadcasted logical sources from being over-counted during measurement
+- preserves the normal outer patch strength during final application
+- is intended to redistribute relative base strength, not replace the row's overall weight
 
 ---
 
@@ -41,7 +75,7 @@ When ComfyUI applies a `swap_scale_shift` transform to the LoRA delta for adaLN-
 This repo patches `comfy.weight_adapter.base.weight_decompose` to:
 
 - perform DoRA math in **fp32**
-- normalize using the norm of the **updated weight** `V = W + delta` (where `delta` is the LoRA delta after applying `alpha`), rather than normalizing against the base weight
+- normalize using the norm of the **updated weight** `V = W + delta` (where `delta` is the LoRA delta after applying `alpha`)
 - reshape `dora_scale` onto the active normalization axis before division so non-square targets do not broadcast incorrectly
 
 This is both more stable and more faithful to DoRA’s intended magnitude handling.
@@ -144,6 +178,12 @@ Before mapping / loading, the loader may transform the LoRA state dict:
 - `Auto-scale broadcast` (`broadcast_auto_scale`, default **ON**)  
   divides `broadcast_scale` by the number of broadcast targets
 - `Broadcast scale` (`broadcast_scale`, default `1.0`)
+
+#### Auto-strength interaction
+
+For compat-broadcasted Flux / Flux2 sources, auto-strength measures the **logical source group** rather than treating every synthetic broadcast clone as a separate weak layer.
+
+That prevents a single broadcasted source from skewing target computation just because the loader expanded it into multiple real mapped bases.
 
 ---
 
@@ -274,6 +314,9 @@ Each row has:
 - Stack Enabled
 - Verbose
 - Log Unloaded Keys
+- Auto-strength enabled
+- Auto-strength ratio floor
+- Auto-strength ratio ceiling
 - Broadcast OneTrainer modulation LoRAs
 - Include DoRA dora_scale in broadcast
 - Auto-scale broadcast
@@ -302,8 +345,11 @@ For each enabled row:
    `lora_magnitude_vector` → `dora_scale`
 7. extend the key map with dynamic suffix matches
 8. apply direction-matrix compatibility fixes when applicable
-9. call `comfy.lora.load_lora(...)`
-10. apply patches via `model.add_patches(...)` / `clip.add_patches(...)`
+9. if enabled, compute per-base auto-strength redistribution ratios  
+   and bake only those ratios into the LoRA tensors
+10. call `comfy.lora.load_lora(...)`
+11. apply patches via `model.add_patches(...)` / `clip.add_patches(...)`  
+    using the normal outer Model / CLIP strengths
 
 ---
 
@@ -360,6 +406,19 @@ and inspect:
 
 - in verbose mode, the loader warns if **all** direction matrices are zero in the file
 - that usually points to a training / export issue rather than a loader issue
+
+### Auto-strength changes the output in unexpected ways
+
+Auto-strength is meant to redistribute relative base strength, not replace the row’s normal overall weight.
+
+In current versions of this repo:
+
+- `auto_strength_ratio_floor = 1.0`
+- `auto_strength_ratio_ceiling = 1.0`
+
+should behave like auto-strength disabled.
+
+If it does not, that points to a loader bug rather than “strong settings”.
 
 ### Suspected mapping problems
 
