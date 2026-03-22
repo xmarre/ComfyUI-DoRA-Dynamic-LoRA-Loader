@@ -1547,15 +1547,116 @@ def _auto_strength_destination_group(
     return None
 
 
+def _auto_strength_tensor_rms(tensor: torch.Tensor) -> Optional[float]:
+    try:
+        t = tensor.float()
+        n = int(t.numel())
+        if n <= 0:
+            return None
+        return float(t.norm().item()) / (float(n) ** 0.5)
+    except Exception:
+        return None
+
+
+def _auto_strength_get_destination_weight(
+    base: str,
+    key_map: Dict[str, Any],
+    model_state_dict: Optional[Dict[str, Any]],
+    clip_state_dict: Optional[Dict[str, Any]],
+) -> Optional[torch.Tensor]:
+    dest, sl = _unwrap_key_map_target(key_map.get(base))
+    if not dest:
+        return None
+
+    weight = None
+    if model_state_dict is not None:
+        weight = model_state_dict.get(dest)
+    if weight is None and clip_state_dict is not None:
+        weight = clip_state_dict.get(dest)
+    if not isinstance(weight, torch.Tensor):
+        return None
+
+    if sl is None:
+        return weight
+
+    try:
+        dim, start, length = int(sl[0]), int(sl[1]), int(sl[2])
+        if length <= 0:
+            return None
+        if dim < 0 or dim >= weight.ndim:
+            return None
+        if start < 0 or (start + length) > int(weight.shape[dim]):
+            return None
+        return weight.narrow(dim, start, length)
+    except Exception:
+        return None
+
+
+def _auto_strength_measure_dora_effect(
+    weight: torch.Tensor,
+    delta: torch.Tensor,
+    dora_scale: torch.Tensor,
+) -> Optional[float]:
+    """
+    Return RMS(update) for the actual DoRA weight path applied by Comfy.
+
+    Invariant: for DoRA, layer scores must reflect the post-normalization weight update
+    against the destination base weight. Ranking by the raw low-rank delta alone is not
+    comparable across bases because DoRA normalizes V = W0 + Δ against W0 and rescales
+    by dora_scale, so equal ||Δ|| can produce radically different final updates.
+    """
+    try:
+        weight32 = weight.float()
+        delta32 = delta.float().reshape(weight32.shape)
+        dora_scale32 = dora_scale.float()
+    except Exception:
+        return None
+
+    if dora_scale32.ndim != 1 or weight32.ndim < 2:
+        return None
+
+    try:
+        if int(dora_scale32.shape[0]) == int(weight32.shape[0]):
+            weight_calc32 = weight32 + delta32
+            weight_norm = (
+                weight_calc32.reshape(weight_calc32.shape[0], -1)
+                .norm(dim=1, keepdim=True)
+                .reshape(weight_calc32.shape[0], *[1] * (weight_calc32.dim() - 1))
+            )
+            dora_scale32 = dora_scale32.reshape(weight_calc32.shape[0], *[1] * (weight_calc32.dim() - 1))
+        elif int(dora_scale32.shape[0]) == int(weight32.shape[1]):
+            weight_calc32 = weight32 + delta32
+            weight_norm = (
+                weight_calc32.transpose(0, 1)
+                .reshape(weight_calc32.shape[1], -1)
+                .norm(dim=1, keepdim=True)
+                .reshape(weight_calc32.shape[1], *[1] * (weight_calc32.dim() - 1))
+                .transpose(0, 1)
+            )
+            dora_scale32 = dora_scale32.reshape(1, weight_calc32.shape[1], *[1] * (weight_calc32.dim() - 2))
+        else:
+            return None
+
+        weight_norm = weight_norm + torch.finfo(torch.float32).eps
+        weight_dora32 = weight_calc32 * (dora_scale32 / weight_norm)
+        return _auto_strength_tensor_rms(weight_dora32 - weight32)
+    except Exception:
+        return None
+
+
 def _auto_strength_measure_base_delta(
     lora_sd: Dict[str, Any],
     base: str,
+    key_map: Dict[str, Any],
+    model_state_dict: Optional[Dict[str, Any]],
+    clip_state_dict: Optional[Dict[str, Any]],
 ) -> Optional[float]:
     """
-    Return a comparable magnitude score for a single base's linear update.
+    Return a comparable magnitude score for a single base's update.
 
     Supported cases:
-      - standard LoRA / DoRA low-rank pairs
+      - standard LoRA / DoRA low-rank pairs / direct deltas: RMS(delta)
+      - DoRA low-rank pairs: RMS(actual post-normalization DoRA update)
       - direct delta tensors (.diff / .diff_b / .set_weight / .reshape_weight)
 
     Invariant: scores must be comparable across destination tensor sizes. Using raw
@@ -1567,24 +1668,23 @@ def _auto_strength_measure_base_delta(
     """
     prefix = base + "."
     direct_norms: List[float] = []
-
-    def _tensor_rms(tensor: torch.Tensor) -> Optional[float]:
-        try:
-            t = tensor.float()
-            n = int(t.numel())
-            if n <= 0:
-                return None
-            return float(t.norm().item()) / (float(n) ** 0.5)
-        except Exception:
-            return None
+    dest_weight = _auto_strength_get_destination_weight(base, key_map, model_state_dict, clip_state_dict)
+    dora_scale = lora_sd.get(base + ".dora_scale")
+    has_dora = isinstance(dora_scale, torch.Tensor)
 
     for suffix in (".diff", ".diff_b", ".set_weight", ".reshape_weight"):
         key = base + suffix
         tensor = lora_sd.get(key)
-        if isinstance(tensor, torch.Tensor):
-            rms = _tensor_rms(tensor)
-            if rms is not None:
-                direct_norms.append(rms)
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if has_dora and isinstance(dest_weight, torch.Tensor):
+            dora_rms = _auto_strength_measure_dora_effect(dest_weight, tensor, dora_scale)
+            if dora_rms is not None:
+                direct_norms.append(dora_rms)
+                continue
+        rms = _auto_strength_tensor_rms(tensor)
+        if rms is not None:
+            direct_norms.append(rms)
 
     for up_suffix, down_suffix in _LORA_DIRECTION_SUFFIX_PAIRS:
         up = lora_sd.get(base + up_suffix)
@@ -1603,18 +1703,25 @@ def _auto_strength_measure_base_delta(
 
         try:
             delta = up_mat @ down_mat
-            delta_rms = _tensor_rms(delta)
         except Exception:
-            continue
-        if delta_rms is None:
             continue
 
         alpha = _tensor_scalar_to_float(lora_sd.get(base + ".alpha"), default=1.0)
         rank = max(1, int(down_mat.shape[0]))
         scale = (alpha / float(rank)) if (base + ".alpha") in lora_sd else 1.0
         try:
-            direct_norms.append(abs(scale) * delta_rms)
+            delta = delta * float(scale)
         except Exception:
+            pass
+
+        if has_dora and isinstance(dest_weight, torch.Tensor):
+            dora_rms = _auto_strength_measure_dora_effect(dest_weight, delta, dora_scale)
+            if dora_rms is not None:
+                direct_norms.append(dora_rms)
+                continue
+
+        delta_rms = _auto_strength_tensor_rms(delta)
+        if delta_rms is not None:
             direct_norms.append(delta_rms)
 
     if not direct_norms:
@@ -1624,7 +1731,7 @@ def _auto_strength_measure_base_delta(
             if not str(key).startswith(prefix) or not isinstance(tensor, torch.Tensor):
                 continue
             if str(key).endswith(_UP_ONLY_SCALE_SUFFIXES):
-                rms = _tensor_rms(tensor)
+                rms = _auto_strength_tensor_rms(tensor)
                 if rms is not None:
                     vals.append(rms)
         if vals:
@@ -1697,7 +1804,13 @@ def _auto_strength_compute_base_targets(
             logical_scale = 1.0
         base_logical_ids[base] = logical_id
 
-        norm = _auto_strength_measure_base_delta(lora_sd, base)
+        norm = _auto_strength_measure_base_delta(
+            lora_sd=lora_sd,
+            base=base,
+            key_map=key_map,
+            model_state_dict=model_state_dict,
+            clip_state_dict=clip_state_dict,
+        )
         if norm is None or not (norm > _AUTO_STRENGTH_EPS):
             continue
         base_norms[base] = norm
