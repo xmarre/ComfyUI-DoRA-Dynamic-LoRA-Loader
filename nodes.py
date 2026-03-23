@@ -640,13 +640,15 @@ def _auto_strength_cast_float32(tensor: torch.Tensor, analysis_device: Optional[
             except Exception:
                 pass
         return comfy.model_management.cast_to_device(tensor, analysis_device, torch.float32)
-    except Exception:
+    except _AutoStrengthAnalysisDeviceError:
+        raise
+    except Exception as exc1:
         try:
             if analysis_device is None:
                 return tensor.float()
             return tensor.to(device=analysis_device, dtype=torch.float32)
-        except Exception:
-            if analysis_device is not None and getattr(analysis_device, "type", "cpu") != "cpu":
+        except Exception as exc2:
+            if _auto_strength_is_device_failure(exc1, analysis_device) or _auto_strength_is_device_failure(exc2, analysis_device):
                 raise _AutoStrengthAnalysisDeviceError from None
             return None
 
@@ -2844,6 +2846,7 @@ class DoraPowerLoraLoader:
         clip_state_dict: Optional[Dict[str, Any]],
         clip_sd_keys: Optional[Set[str]],
         clip_sd_list: Optional[List[str]],
+        analysis_load_device: Any,
         zimage_lumina2_compat: bool,
         auto_strength_enabled: bool,
         auto_strength_device: str,
@@ -3007,7 +3010,7 @@ class DoraPowerLoraLoader:
                 model_state_dict=model_state_dict,
                 clip_state_dict=clip_state_dict,
                 analysis_device_mode=auto_strength_device,
-                analysis_load_device=_auto_strength_get_analysis_load_device(model, clip),
+                analysis_load_device=analysis_load_device,
                 strength_model=strength_model,
                 strength_clip=strength_clip,
                 ratio_floor=auto_strength_ratio_floor,
@@ -3152,6 +3155,14 @@ class DoraPowerLoraLoader:
             clip_sd_list = list(clip_state_dict.keys())
             clip_sd_keys = set(clip_sd_list)
 
+        analysis_load_device = _auto_strength_get_analysis_load_device(new_model, new_clip)
+        if auto_strength_enabled and auto_strength_device == "gpu":
+            resolved_analysis_device = _torch_device_or_none(analysis_load_device)
+            if resolved_analysis_device is None or resolved_analysis_device.type == "cpu":
+                _LOG.warning(
+                    "[DoRA Power LoRA Loader] auto-strength: requested analysis device 'gpu' but no usable accelerator load_device was found; falling back to cpu"
+                )
+
         for e in entries:
             lora_name = e.get("lora")
             if not lora_name or lora_name in ("None", "NONE"):
@@ -3180,6 +3191,7 @@ class DoraPowerLoraLoader:
                 clip_state_dict=clip_state_dict,
                 clip_sd_keys=clip_sd_keys,
                 clip_sd_list=clip_sd_list,
+                analysis_load_device=analysis_load_device,
                 zimage_lumina2_compat=zimage_lumina2_compat,
                 auto_strength_enabled=auto_strength_enabled,
                 auto_strength_device=auto_strength_device,
