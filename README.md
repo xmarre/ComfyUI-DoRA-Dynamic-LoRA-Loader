@@ -32,11 +32,11 @@ When enabled, the loader:
 
 ### Important implementation detail
 
-The loader intentionally preserves the caller's normal outer **Model / CLIP patch strength** path.
+The loader intentionally preserves the caller’s normal outer **Model / CLIP patch strength** path.
 
-That means auto-strength adjusts only the **relative balance between bases**, while the row's normal weight still controls the final overall strength.
+That means auto-strength adjusts only the **relative balance between bases**, while the row’s normal weight still controls the final overall strength.
 
-This is especially important for **DoRA**: the outer strength is part of ComfyUI's normal post-normalization application path, so baking the full absolute target directly into the tensors would not be equivalent.
+This is especially important for **DoRA**: the outer strength is part of ComfyUI’s normal post-normalization application path, so baking the full absolute target directly into the tensors would not be equivalent.
 
 If:
 
@@ -50,7 +50,35 @@ then enabling auto-strength is a true no-op.
 - compares mapped bases using a normalized magnitude score
 - keeps Flux / Flux2 compat-broadcasted logical sources from being over-counted during measurement
 - preserves the normal outer patch strength during final application
-- is intended to redistribute relative base strength, not replace the row's overall weight
+- is intended to redistribute relative base strength, not replace the row’s overall weight
+
+### Performance note
+
+Auto-strength still does **extra loader-time compute**, especially for:
+
+- **initial load / first generation**
+- workflows with **multiple loader nodes**
+- **high-rank DoRAs**
+- large backbones such as **Flux / Flux2**
+
+However, current versions are **much faster than the earlier CPU-bound analysis path**.
+
+The loader now supports an **auto-strength analysis device** option:
+
+- `auto` — uses GPU/accelerator for larger analyses when a usable load device is available, otherwise CPU
+- `cpu` — forces analysis to CPU
+- `gpu` — prefers the model/CLIP accelerator load device and falls back to CPU if needed
+
+In practice this means the expensive analysis pass no longer has to be purely CPU/RAM-bound. On supported setups, larger auto-strength measurements can run on the GPU/accelerator and load much faster while preserving the same redistribution logic.
+
+So the practical tradeoff is now:
+
+- still **higher loader-time compute** than auto-strength disabled
+- but **far better performance than the old CPU-only analysis path**
+- while keeping the stronger quality / accuracy gains from the more faithful redistribution and DoRA application path
+
+If you want the lowest overhead, disable auto-strength.  
+If you want strong layer-aware balancing with much better performance than before, keep it enabled and use `auto` or `gpu`.
 
 ---
 
@@ -315,6 +343,7 @@ Each row has:
 - Verbose
 - Log Unloaded Keys
 - Auto-strength enabled
+- Auto-strength analysis device
 - Auto-strength ratio floor
 - Auto-strength ratio ceiling
 - Broadcast OneTrainer modulation LoRAs
@@ -323,7 +352,6 @@ Each row has:
 - Broadcast scale
 - DoRA slice-fix for offset patches (Flux2)
 - DoRA adaLN swap_scale_shift fix
-- Auto-strength analysis device (`auto` / `cpu` / `gpu`)
 - ZiT/Lumina2 auto-fix (QKV fuse + out remap)
 - DoRA decompose debug logs
 - DoRA debug lines
@@ -347,7 +375,7 @@ For each enabled row:
 7. extend the key map with dynamic suffix matches
 8. apply direction-matrix compatibility fixes when applicable
 9. if enabled, compute per-base auto-strength redistribution ratios  
-   and bake only those ratios into the LoRA tensors
+   on the selected analysis device and bake only those ratios into the LoRA tensors
 10. call `comfy.lora.load_lora(...)`
 11. apply patches via `model.add_patches(...)` / `clip.add_patches(...)`  
     using the normal outer Model / CLIP strengths
@@ -420,6 +448,35 @@ In current versions of this repo:
 should behave like auto-strength disabled.
 
 If it does not, that points to a loader bug rather than “strong settings”.
+
+### Auto-strength is slower than disabled
+
+That is still expected to some degree.
+
+Auto-strength adds extra analysis work during loader execution, and the cost can still scale with:
+
+- number of loader nodes
+- number of enabled LoRAs
+- adapter rank
+- model size
+- DoRA usage
+
+However, current versions can run that analysis on GPU / accelerator for larger measurements, which makes it **much faster than the earlier CPU-bound path** on supported setups.
+
+If you want the best balance of speed and quality, use:
+
+- `Auto-strength enabled = ON`
+- `Auto-strength analysis device = auto`
+
+If you want to force the old safest path, use:
+
+- `Auto-strength analysis device = cpu`
+
+If you want to prefer GPU / accelerator analysis explicitly, use:
+
+- `Auto-strength analysis device = gpu`
+
+When `gpu` is selected but no usable accelerator load device is available, the loader falls back to CPU and logs a warning.
 
 ### Suspected mapping problems
 
