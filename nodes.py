@@ -581,6 +581,142 @@ _BROADCAST_DORA_SUFFIXES = _BROADCAST_DELTA_SUFFIXES + (
 _AUTO_STRENGTH_RATIO_FLOOR = 0.30
 _AUTO_STRENGTH_RATIO_CEILING = 1.50
 _AUTO_STRENGTH_EPS = 1e-8
+_AUTO_STRENGTH_ANALYSIS_MIN_NUMEL = 65536
+
+
+class _AutoStrengthAnalysisDeviceError(RuntimeError):
+    pass
+
+
+def _normalize_auto_strength_device(value: Any) -> str:
+    try:
+        mode = str(value).strip().lower()
+    except Exception:
+        return "auto"
+    return mode if mode in ("auto", "cpu", "gpu") else "auto"
+
+
+def _torch_device_or_none(value: Any) -> Optional[torch.device]:
+    try:
+        device = torch.device(value)
+    except Exception:
+        return None
+    if device.type == "meta":
+        return None
+    return device
+
+
+def _torch_device_available(device: Optional[torch.device]) -> bool:
+    if device is None:
+        return False
+    try:
+        resolved = torch.device(device)
+    except Exception:
+        return False
+    if resolved.type == "cpu":
+        return False
+    if resolved.type == "cuda":
+        return bool(torch.cuda.is_available())
+    if resolved.type == "xpu":
+        xpu = getattr(torch, "xpu", None)
+        return bool(getattr(xpu, "is_available", lambda: False)())
+    if resolved.type == "mps":
+        backends = getattr(torch, "backends", None)
+        mps = getattr(backends, "mps", None)
+        return bool(getattr(mps, "is_available", lambda: False)())
+    return True
+
+
+def _auto_strength_cast_float32(tensor: torch.Tensor, analysis_device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
+    if not isinstance(tensor, torch.Tensor):
+        return None
+    try:
+        if analysis_device is None:
+            return tensor if tensor.dtype == torch.float32 else tensor.float()
+        if tensor.dtype == torch.float32:
+            try:
+                if tensor.device == analysis_device:
+                    return tensor
+            except Exception:
+                pass
+        return comfy.model_management.cast_to_device(tensor, analysis_device, torch.float32)
+    except Exception:
+        try:
+            if analysis_device is None:
+                return tensor.float()
+            return tensor.to(device=analysis_device, dtype=torch.float32)
+        except Exception:
+            if analysis_device is not None and getattr(analysis_device, "type", "cpu") != "cpu":
+                raise _AutoStrengthAnalysisDeviceError from None
+            return None
+
+
+def _auto_strength_is_device_failure(exc: BaseException, analysis_device: Optional[torch.device]) -> bool:
+    if analysis_device is None or getattr(analysis_device, "type", "cpu") == "cpu":
+        return False
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "out of memory",
+            "cuda",
+            "xpu",
+            "mps",
+            "hip",
+            "device-side assert",
+            "cublas",
+            "cudnn",
+        )
+    )
+
+
+def _auto_strength_resolve_analysis_device(
+    analysis_device_mode: str,
+    load_device: Any,
+    weight: Optional[torch.Tensor] = None,
+) -> torch.device:
+    mode = _normalize_auto_strength_device(analysis_device_mode)
+    cpu = torch.device("cpu")
+    model_device = _torch_device_or_none(load_device)
+    if mode == "cpu":
+        return cpu
+    if not _torch_device_available(model_device):
+        return cpu
+    if mode == "gpu":
+        return model_device if model_device is not None else cpu
+    if mode != "auto":
+        return cpu
+    if not isinstance(weight, torch.Tensor):
+        return cpu
+    try:
+        if int(weight.numel()) < _AUTO_STRENGTH_ANALYSIS_MIN_NUMEL:
+            return cpu
+    except Exception:
+        return cpu
+    return model_device if model_device is not None else cpu
+
+
+def _auto_strength_get_analysis_load_device(model: Any, clip: Any = None) -> Any:
+    cpu_fallback = None
+    for root in (model, clip):
+        for candidate in (
+            root,
+            getattr(root, "model", None),
+            getattr(root, "diffusion_model", None),
+            getattr(root, "cond_stage_model", None),
+        ):
+            if candidate is None:
+                continue
+            load_device = getattr(candidate, "load_device", None)
+            if load_device is not None:
+                device = _torch_device_or_none(load_device)
+                if device is None:
+                    continue
+                if device.type != "cpu" and _torch_device_available(device):
+                    return device
+                if cpu_fallback is None:
+                    cpu_fallback = device
+    return cpu_fallback
 
 
 def _src_has_dora_params(lora_sd: Dict[str, Any], base: str) -> bool:
@@ -1547,14 +1683,20 @@ def _auto_strength_destination_group(
     return None
 
 
-def _auto_strength_tensor_rms(tensor: torch.Tensor) -> Optional[float]:
+def _auto_strength_tensor_rms(tensor: torch.Tensor, analysis_device: Optional[torch.device] = None) -> Optional[float]:
     try:
-        t = tensor.float()
+        t = _auto_strength_cast_float32(tensor, analysis_device)
+        if t is None:
+            return None
         n = int(t.numel())
         if n <= 0:
             return None
         return float(t.norm().item()) / (float(n) ** 0.5)
-    except Exception:
+    except _AutoStrengthAnalysisDeviceError:
+        raise
+    except Exception as exc:
+        if _auto_strength_is_device_failure(exc, analysis_device):
+            raise _AutoStrengthAnalysisDeviceError from None
         return None
 
 
@@ -1627,6 +1769,7 @@ def _auto_strength_measure_dora_effect(
     weight: torch.Tensor,
     delta: torch.Tensor,
     dora_scale: torch.Tensor,
+    analysis_device: Optional[torch.device] = None,
 ) -> Optional[float]:
     """
     Return RMS(update) for the actual DoRA weight path applied by Comfy.
@@ -1637,10 +1780,17 @@ def _auto_strength_measure_dora_effect(
     by dora_scale, so equal ||Δ|| can produce radically different final updates.
     """
     try:
-        weight32 = weight.float()
-        delta32 = delta.float().reshape(weight32.shape)
-        dora_scale32 = dora_scale.float()
-    except Exception:
+        weight32 = _auto_strength_cast_float32(weight, analysis_device)
+        delta32 = _auto_strength_cast_float32(delta, analysis_device)
+        dora_scale32 = _auto_strength_cast_float32(dora_scale, analysis_device)
+        if weight32 is None or delta32 is None or dora_scale32 is None:
+            return None
+        delta32 = delta32.reshape(weight32.shape)
+    except _AutoStrengthAnalysisDeviceError:
+        raise
+    except Exception as exc:
+        if _auto_strength_is_device_failure(exc, analysis_device):
+            raise _AutoStrengthAnalysisDeviceError from None
         return None
 
     if dora_scale32.ndim != 1 or weight32.ndim < 2:
@@ -1670,17 +1820,22 @@ def _auto_strength_measure_dora_effect(
 
         weight_norm = weight_norm + torch.finfo(torch.float32).eps
         weight_dora32 = weight_calc32 * (dora_scale32 / weight_norm)
-        return _auto_strength_tensor_rms(weight_dora32 - weight32)
-    except Exception:
+        return _auto_strength_tensor_rms(weight_dora32 - weight32, analysis_device=analysis_device)
+    except _AutoStrengthAnalysisDeviceError:
+        raise
+    except Exception as exc:
+        if _auto_strength_is_device_failure(exc, analysis_device):
+            raise _AutoStrengthAnalysisDeviceError from None
         return None
 
 
-def _auto_strength_measure_base_delta(
+def _auto_strength_measure_base_delta_on_device(
     lora_sd: Dict[str, Any],
     base: str,
     key_map: Dict[str, Any],
     model_state_dict: Optional[Dict[str, Any]],
     clip_state_dict: Optional[Dict[str, Any]],
+    analysis_device: Optional[torch.device],
 ) -> Optional[float]:
     """
     Return a comparable magnitude score for a single base's update.
@@ -1709,11 +1864,11 @@ def _auto_strength_measure_base_delta(
         if not isinstance(tensor, torch.Tensor):
             continue
         if has_dora and isinstance(dest_weight, torch.Tensor):
-            dora_rms = _auto_strength_measure_dora_effect(dest_weight, tensor, dora_scale)
+            dora_rms = _auto_strength_measure_dora_effect(dest_weight, tensor, dora_scale, analysis_device=analysis_device)
             if dora_rms is not None:
                 direct_norms.append(dora_rms)
                 continue
-        rms = _auto_strength_tensor_rms(tensor)
+        rms = _auto_strength_tensor_rms(tensor, analysis_device=analysis_device)
         if rms is not None:
             direct_norms.append(rms)
 
@@ -1723,9 +1878,17 @@ def _auto_strength_measure_base_delta(
         if not isinstance(up, torch.Tensor) or not isinstance(down, torch.Tensor):
             continue
         try:
-            up_mat = up.float().reshape(int(up.shape[0]), -1)
-            down_mat = down.float().reshape(int(down.shape[0]), -1)
-        except Exception:
+            up_cast = _auto_strength_cast_float32(up, analysis_device)
+            down_cast = _auto_strength_cast_float32(down, analysis_device)
+            if up_cast is None or down_cast is None:
+                continue
+            up_mat = up_cast.reshape(int(up.shape[0]), -1)
+            down_mat = down_cast.reshape(int(down.shape[0]), -1)
+        except _AutoStrengthAnalysisDeviceError:
+            raise
+        except Exception as exc:
+            if _auto_strength_is_device_failure(exc, analysis_device):
+                raise _AutoStrengthAnalysisDeviceError from None
             continue
         if up_mat.ndim != 2 or down_mat.ndim != 2:
             continue
@@ -1734,7 +1897,11 @@ def _auto_strength_measure_base_delta(
 
         try:
             delta = up_mat @ down_mat
-        except Exception:
+        except _AutoStrengthAnalysisDeviceError:
+            raise
+        except Exception as exc:
+            if _auto_strength_is_device_failure(exc, analysis_device):
+                raise _AutoStrengthAnalysisDeviceError from None
             continue
 
         alpha = _tensor_scalar_to_float(lora_sd.get(base + ".alpha"), default=1.0)
@@ -1742,16 +1909,20 @@ def _auto_strength_measure_base_delta(
         scale = (alpha / float(rank)) if (base + ".alpha") in lora_sd else 1.0
         try:
             delta = delta * float(scale)
-        except Exception:
+        except _AutoStrengthAnalysisDeviceError:
+            raise
+        except Exception as exc:
+            if _auto_strength_is_device_failure(exc, analysis_device):
+                raise _AutoStrengthAnalysisDeviceError from None
             pass
 
         if has_dora and isinstance(dest_weight, torch.Tensor):
-            dora_rms = _auto_strength_measure_dora_effect(dest_weight, delta, dora_scale)
+            dora_rms = _auto_strength_measure_dora_effect(dest_weight, delta, dora_scale, analysis_device=analysis_device)
             if dora_rms is not None:
                 direct_norms.append(dora_rms)
                 continue
 
-        delta_rms = _auto_strength_tensor_rms(delta)
+        delta_rms = _auto_strength_tensor_rms(delta, analysis_device=analysis_device)
         if delta_rms is not None:
             direct_norms.append(delta_rms)
 
@@ -1762,7 +1933,7 @@ def _auto_strength_measure_base_delta(
             if not str(key).startswith(prefix) or not isinstance(tensor, torch.Tensor):
                 continue
             if str(key).endswith(_UP_ONLY_SCALE_SUFFIXES):
-                rms = _auto_strength_tensor_rms(tensor)
+                rms = _auto_strength_tensor_rms(tensor, analysis_device=analysis_device)
                 if rms is not None:
                     vals.append(rms)
         if vals:
@@ -1772,12 +1943,54 @@ def _auto_strength_measure_base_delta(
     return float(sum(direct_norms) / len(direct_norms))
 
 
+def _auto_strength_measure_base_delta(
+    lora_sd: Dict[str, Any],
+    base: str,
+    key_map: Dict[str, Any],
+    model_state_dict: Optional[Dict[str, Any]],
+    clip_state_dict: Optional[Dict[str, Any]],
+    analysis_device_mode: str = "auto",
+    analysis_load_device: Any = None,
+    verbose: bool = False,
+) -> Optional[float]:
+    dest_weight = _auto_strength_get_destination_weight(base, key_map, model_state_dict, clip_state_dict)
+    analysis_device = _auto_strength_resolve_analysis_device(analysis_device_mode, analysis_load_device, dest_weight)
+    try:
+        return _auto_strength_measure_base_delta_on_device(
+            lora_sd=lora_sd,
+            base=base,
+            key_map=key_map,
+            model_state_dict=model_state_dict,
+            clip_state_dict=clip_state_dict,
+            analysis_device=analysis_device,
+        )
+    except _AutoStrengthAnalysisDeviceError:
+        if analysis_device is None or analysis_device.type == "cpu":
+            return None
+        if verbose:
+            _LOG.warning(
+                "[DoRA Power LoRA Loader] auto-strength: base=%s analysis device %s failed; retrying on CPU",
+                base,
+                analysis_device,
+            )
+        return _auto_strength_measure_base_delta_on_device(
+            lora_sd=lora_sd,
+            base=base,
+            key_map=key_map,
+            model_state_dict=model_state_dict,
+            clip_state_dict=clip_state_dict,
+            analysis_device=torch.device("cpu"),
+        )
+
+
 def _auto_strength_compute_base_targets(
     lora_sd: Dict[str, Any],
     lora_bases: Iterable[str],
     key_map: Dict[str, Any],
     model_state_dict: Optional[Dict[str, Any]],
     clip_state_dict: Optional[Dict[str, Any]],
+    analysis_device_mode: str,
+    analysis_load_device: Any,
     strength_model: float,
     strength_clip: float,
     ratio_floor: float,
@@ -1848,6 +2061,9 @@ def _auto_strength_compute_base_targets(
             key_map=key_map,
             model_state_dict=model_state_dict,
             clip_state_dict=clip_state_dict,
+            analysis_device_mode=analysis_device_mode,
+            analysis_load_device=analysis_load_device,
+            verbose=verbose,
         )
         if norm is None or not (norm > _AUTO_STRENGTH_EPS):
             continue
@@ -2596,6 +2812,7 @@ class DoraPowerLoraLoader:
 
                     # Optional per-base auto-strength redistribution
                     "auto_strength_enabled": ("BOOLEAN", {"default": False}),
+                    "auto_strength_device": (["auto", "cpu", "gpu"], {"default": "auto"}),
                     "auto_strength_ratio_floor": ("FLOAT", {"default": _AUTO_STRENGTH_RATIO_FLOOR, "min": 0.0, "max": 16.0, "step": 0.01}),
                     "auto_strength_ratio_ceiling": ("FLOAT", {"default": _AUTO_STRENGTH_RATIO_CEILING, "min": 0.0, "max": 16.0, "step": 0.01}),
                 },
@@ -2629,6 +2846,7 @@ class DoraPowerLoraLoader:
         clip_sd_list: Optional[List[str]],
         zimage_lumina2_compat: bool,
         auto_strength_enabled: bool,
+        auto_strength_device: str,
         auto_strength_ratio_floor: float,
         auto_strength_ratio_ceiling: float,
     ):
@@ -2788,6 +3006,8 @@ class DoraPowerLoraLoader:
                 key_map=key_map,
                 model_state_dict=model_state_dict,
                 clip_state_dict=clip_state_dict,
+                analysis_device_mode=auto_strength_device,
+                analysis_load_device=_auto_strength_get_analysis_load_device(model, clip),
                 strength_model=strength_model,
                 strength_clip=strength_clip,
                 ratio_floor=auto_strength_ratio_floor,
@@ -2885,6 +3105,7 @@ class DoraPowerLoraLoader:
         dora_adaln_swap_fix = bool(kwargs.get("dora_adaln_swap_fix", True))
         zimage_lumina2_compat = bool(kwargs.get("zimage_lumina2_compat", True))
         auto_strength_enabled = bool(kwargs.get("auto_strength_enabled", False))
+        auto_strength_device = _normalize_auto_strength_device(kwargs.get("auto_strength_device", "auto"))
         try:
             auto_strength_ratio_floor = float(kwargs.get("auto_strength_ratio_floor", _AUTO_STRENGTH_RATIO_FLOOR))
         except Exception:
@@ -2961,6 +3182,7 @@ class DoraPowerLoraLoader:
                 clip_sd_list=clip_sd_list,
                 zimage_lumina2_compat=zimage_lumina2_compat,
                 auto_strength_enabled=auto_strength_enabled,
+                auto_strength_device=auto_strength_device,
                 auto_strength_ratio_floor=auto_strength_ratio_floor,
                 auto_strength_ratio_ceiling=auto_strength_ratio_ceiling,
             )

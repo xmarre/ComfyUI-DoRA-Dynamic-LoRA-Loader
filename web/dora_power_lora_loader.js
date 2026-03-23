@@ -7,6 +7,7 @@ const ROW_HEIGHT = 24;
 const HORIZ_MARGIN = 15;
 const WEIGHT_STEP = 0.05;
 const WEIGHT_DRAG_PIXELS_PER_STEP = 6;
+const AUTO_STRENGTH_DEVICE_CHOICES = ["auto", "cpu", "gpu"];
 
 function roundToStep(v, step = WEIGHT_STEP) {
   const n = Number.isFinite(+v) ? +v : 0;
@@ -111,6 +112,14 @@ function makeRowDefaults() {
   };
 }
 
+function normalizeAutoStrengthDevice(value) {
+  if (Number.isInteger(value) && value >= 0 && value < AUTO_STRENGTH_DEVICE_CHOICES.length) {
+    return AUTO_STRENGTH_DEVICE_CHOICES[value];
+  }
+  const v = String(value ?? "auto").trim().toLowerCase();
+  return AUTO_STRENGTH_DEVICE_CHOICES.includes(v) ? v : "auto";
+}
+
 function parseRowsFromWidgetValues(widgetsValues) {
   const vals = Array.isArray(widgetsValues) ? widgetsValues : [];
 
@@ -192,6 +201,7 @@ function defaultState() {
       broadcast_scale: 1.0,
       broadcast_include_dora_scale: false,
       auto_strength_enabled: false,
+      auto_strength_device: "auto",
       auto_strength_ratio_floor: 0.30,
       auto_strength_ratio_ceiling: 1.50,
       dora_decompose_debug: false,
@@ -230,6 +240,7 @@ function sanitizeState(st) {
     broadcast_include_dora_scale:
       globalsIn.broadcast_include_dora_scale !== undefined ? !!globalsIn.broadcast_include_dora_scale : false,
     auto_strength_enabled: globalsIn.auto_strength_enabled !== undefined ? !!globalsIn.auto_strength_enabled : false,
+    auto_strength_device: normalizeAutoStrengthDevice(globalsIn.auto_strength_device),
     auto_strength_ratio_floor: Number.isFinite(+globalsIn.auto_strength_ratio_floor)
       ? Math.max(0, +globalsIn.auto_strength_ratio_floor)
       : 0.30,
@@ -898,6 +909,18 @@ function buildUI(node, state, loraValues) {
   );
   wAutoStrengthEnabled.label = "Auto-strength (per-base ΔW rebalance)";
 
+  const wAutoStrengthDevice = node.addWidget(
+    "combo",
+    "auto_strength_device",
+    normalizeAutoStrengthDevice(node._doraGlobals.auto_strength_device),
+    (v) => {
+      node._doraGlobals.auto_strength_device = normalizeAutoStrengthDevice(v);
+      persistNodeState(node);
+    },
+    { values: AUTO_STRENGTH_DEVICE_CHOICES }
+  );
+  wAutoStrengthDevice.label = "Auto-strength analysis device";
+
   const wAutoStrengthFloor = node.addWidget(
     "number",
     "auto_strength_ratio_floor",
@@ -966,6 +989,7 @@ app.registerExtension({
               broadcast_scale: 1.0,
               broadcast_include_dora_scale: false,
               auto_strength_enabled: false,
+              auto_strength_device: "auto",
               auto_strength_ratio_floor: 0.30,
               auto_strength_ratio_ceiling: 1.50,
               dora_decompose_debug: false,
