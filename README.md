@@ -323,6 +323,7 @@ Each row has:
 - Broadcast scale
 - DoRA slice-fix for offset patches (Flux2)
 - DoRA adaLN swap_scale_shift fix
+- Auto-strength analysis device (`auto` / `cpu` / `gpu`)
 - ZiT/Lumina2 auto-fix (QKV fuse + out remap)
 - DoRA decompose debug logs
 - DoRA debug lines
