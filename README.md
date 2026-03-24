@@ -51,6 +51,9 @@ then enabling auto-strength is a true no-op.
 - keeps Flux / Flux2 compat-broadcasted logical sources from being over-counted during measurement
 - preserves the normal outer patch strength during final application
 - is intended to redistribute relative base strength, not replace the row's overall weight
+- `auto` resolves to CPU-safe analysis
+- `gpu` is the explicit accelerator path
+- default node UI state is `gpu`
 
 ---
 
@@ -323,7 +326,7 @@ Each row has:
 - Broadcast scale
 - DoRA slice-fix for offset patches (Flux2)
 - DoRA adaLN swap_scale_shift fix
-- Auto-strength analysis device (`auto` / `cpu` / `gpu`)
+- Auto-strength analysis device (`auto` / `cpu` / `gpu`, default **GPU**; `auto` = CPU-safe analysis)
 - ZiT/Lumina2 auto-fix (QKV fuse + out remap)
 - DoRA decompose debug logs
 - DoRA debug lines

@@ -201,7 +201,7 @@ function defaultState() {
       broadcast_scale: 1.0,
       broadcast_include_dora_scale: false,
       auto_strength_enabled: false,
-      auto_strength_device: "auto",
+      auto_strength_device: "gpu",
       auto_strength_ratio_floor: 0.30,
       auto_strength_ratio_ceiling: 1.50,
       dora_decompose_debug: false,
@@ -240,7 +240,7 @@ function sanitizeState(st) {
     broadcast_include_dora_scale:
       globalsIn.broadcast_include_dora_scale !== undefined ? !!globalsIn.broadcast_include_dora_scale : false,
     auto_strength_enabled: globalsIn.auto_strength_enabled !== undefined ? !!globalsIn.auto_strength_enabled : false,
-    auto_strength_device: normalizeAutoStrengthDevice(globalsIn.auto_strength_device),
+    auto_strength_device: normalizeAutoStrengthDevice(globalsIn.auto_strength_device ?? "gpu"),
     auto_strength_ratio_floor: Number.isFinite(+globalsIn.auto_strength_ratio_floor)
       ? Math.max(0, +globalsIn.auto_strength_ratio_floor)
       : 0.30,
@@ -919,7 +919,7 @@ function buildUI(node, state, loraValues) {
     },
     { values: AUTO_STRENGTH_DEVICE_CHOICES }
   );
-  wAutoStrengthDevice.label = "Auto-strength analysis device";
+  wAutoStrengthDevice.label = "Auto-strength analysis device (auto = CPU-safe)";
 
   const wAutoStrengthFloor = node.addWidget(
     "number",
@@ -989,7 +989,7 @@ app.registerExtension({
               broadcast_scale: 1.0,
               broadcast_include_dora_scale: false,
               auto_strength_enabled: false,
-              auto_strength_device: "auto",
+              auto_strength_device: "gpu",
               auto_strength_ratio_floor: 0.30,
               auto_strength_ratio_ceiling: 1.50,
               dora_decompose_debug: false,

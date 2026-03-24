@@ -630,25 +630,36 @@ def _torch_device_available(device: Optional[torch.device]) -> bool:
 def _auto_strength_cast_float32(tensor: torch.Tensor, analysis_device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
     if not isinstance(tensor, torch.Tensor):
         return None
+    cpu = torch.device("cpu")
+    target = analysis_device if analysis_device is not None else cpu
     try:
-        if analysis_device is None:
-            return tensor if tensor.dtype == torch.float32 else tensor.float()
+        if target.type == "cpu":
+            # Materialize owned CPU float32 storage before any analysis work.
+            return tensor.to(device=cpu, dtype=torch.float32, copy=True)
+
+        if tensor.device.type == "cpu":
+            # File-backed safetensor storage must be owned on CPU before H2D copies.
+            cpu_owned = tensor.to(device=cpu, dtype=torch.float32, copy=True)
+            return cpu_owned.to(device=target, dtype=torch.float32, non_blocking=False, copy=True)
+
         if tensor.dtype == torch.float32:
             try:
-                if tensor.device == analysis_device:
+                if tensor.device == target:
                     return tensor
             except Exception:
                 pass
-        return comfy.model_management.cast_to_device(tensor, analysis_device, torch.float32)
+
+        return tensor.to(device=target, dtype=torch.float32, non_blocking=False, copy=False)
     except _AutoStrengthAnalysisDeviceError:
         raise
     except Exception as exc1:
         try:
-            if analysis_device is None:
-                return tensor.float()
-            return tensor.to(device=analysis_device, dtype=torch.float32)
+            if target.type == "cpu":
+                return tensor.to(device=cpu, dtype=torch.float32, copy=True)
+            cpu_owned = tensor.to(device=cpu, dtype=torch.float32, copy=True)
+            return cpu_owned.to(device=target, dtype=torch.float32, non_blocking=False, copy=True)
         except Exception as exc2:
-            if _auto_strength_is_device_failure(exc1, analysis_device) or _auto_strength_is_device_failure(exc2, analysis_device):
+            if _auto_strength_is_device_failure(exc1, target) or _auto_strength_is_device_failure(exc2, target):
                 raise _AutoStrengthAnalysisDeviceError from None
             return None
 
@@ -680,22 +691,13 @@ def _auto_strength_resolve_analysis_device(
     mode = _normalize_auto_strength_device(analysis_device_mode)
     cpu = torch.device("cpu")
     model_device = _torch_device_or_none(load_device)
-    if mode == "cpu":
-        return cpu
-    if not _torch_device_available(model_device):
+    if mode in ("auto", "cpu"):
         return cpu
     if mode == "gpu":
-        return model_device if model_device is not None else cpu
-    if mode != "auto":
-        return cpu
-    if not isinstance(weight, torch.Tensor):
-        return cpu
-    try:
-        if int(weight.numel()) < _AUTO_STRENGTH_ANALYSIS_MIN_NUMEL:
+        if not _torch_device_available(model_device):
             return cpu
-    except Exception:
-        return cpu
-    return model_device if model_device is not None else cpu
+        return model_device if model_device is not None else cpu
+    return cpu
 
 
 def _auto_strength_get_analysis_load_device(model: Any, clip: Any = None) -> Any:
@@ -2191,6 +2193,15 @@ def _apply_base_strength_ratios(
 
     scaled = dict(lora_sd)
     changed = False
+    all_keys = list(lora_sd.keys())
+    keys_by_base: Dict[str, List[Any]] = {}
+    has_alpha_by_base: Dict[str, bool] = {}
+    for base in base_ratios.keys():
+        prefix = base + "."
+        keys = [k for k in all_keys if str(k).startswith(prefix)]
+        keys_by_base[base] = keys
+        has_alpha_by_base[base] = any(str(k) == (base + ".alpha") for k in keys)
+
     for base, ratio in base_ratios.items():
         try:
             ratio_f = float(ratio)
@@ -2199,12 +2210,11 @@ def _apply_base_strength_ratios(
         if abs(ratio_f - 1.0) <= _AUTO_STRENGTH_EPS:
             continue
 
-        prefix = base + "."
-        keys = [k for k in lora_sd.keys() if str(k).startswith(prefix)]
+        keys = keys_by_base.get(base) or []
         if not keys:
             continue
 
-        has_alpha = any(str(k) == (base + ".alpha") for k in keys)
+        has_alpha = has_alpha_by_base.get(base, False)
         for k in keys:
             v = lora_sd.get(k)
             if not isinstance(v, torch.Tensor):
@@ -2814,7 +2824,7 @@ class DoraPowerLoraLoader:
 
                     # Optional per-base auto-strength redistribution
                     "auto_strength_enabled": ("BOOLEAN", {"default": False}),
-                    "auto_strength_device": (["auto", "cpu", "gpu"], {"default": "auto"}),
+                    "auto_strength_device": (["auto", "cpu", "gpu"], {"default": "gpu"}),
                     "auto_strength_ratio_floor": ("FLOAT", {"default": _AUTO_STRENGTH_RATIO_FLOOR, "min": 0.0, "max": 16.0, "step": 0.01}),
                     "auto_strength_ratio_ceiling": ("FLOAT", {"default": _AUTO_STRENGTH_RATIO_CEILING, "min": 0.0, "max": 16.0, "step": 0.01}),
                 },
@@ -3108,7 +3118,7 @@ class DoraPowerLoraLoader:
         dora_adaln_swap_fix = bool(kwargs.get("dora_adaln_swap_fix", True))
         zimage_lumina2_compat = bool(kwargs.get("zimage_lumina2_compat", True))
         auto_strength_enabled = bool(kwargs.get("auto_strength_enabled", False))
-        auto_strength_device = _normalize_auto_strength_device(kwargs.get("auto_strength_device", "auto"))
+        auto_strength_device = _normalize_auto_strength_device(kwargs.get("auto_strength_device", "gpu"))
         try:
             auto_strength_ratio_floor = float(kwargs.get("auto_strength_ratio_floor", _AUTO_STRENGTH_RATIO_FLOOR))
         except Exception:
