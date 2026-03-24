@@ -2996,6 +2996,47 @@ def _auto_strength_report_line_for_group(item: Dict[str, Any]) -> str:
     )
 
 
+def _auto_strength_report_split_groups(logical_groups: Iterable[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    boosts: List[Dict[str, Any]] = []
+    pullbacks: List[Dict[str, Any]] = []
+    neutral: List[Dict[str, Any]] = []
+
+    for item in logical_groups:
+        ratio = _auto_strength_safe_number(item.get("ratio_applied"))
+        if ratio is None or abs(ratio - 1.0) <= _AUTO_STRENGTH_EPS:
+            neutral.append(item)
+        elif ratio > 1.0:
+            boosts.append(item)
+        else:
+            pullbacks.append(item)
+
+    boosts.sort(
+        key=lambda item: (
+            -(_auto_strength_safe_number(item.get("ratio_applied")) or 1.0),
+            str(item.get("group") or ""),
+            str(item.get("family") or ""),
+            str(item.get("logical_id") or ""),
+        )
+    )
+    pullbacks.sort(
+        key=lambda item: (
+            (_auto_strength_safe_number(item.get("ratio_applied")) or 1.0),
+            str(item.get("group") or ""),
+            str(item.get("family") or ""),
+            str(item.get("logical_id") or ""),
+        )
+    )
+    neutral.sort(
+        key=lambda item: (
+            str(item.get("group") or ""),
+            str(item.get("family") or ""),
+            str(item.get("logical_id") or ""),
+        )
+    )
+
+    return boosts, pullbacks, neutral
+
+
 def _build_auto_strength_row_text_report(row: Dict[str, Any]) -> str:
     idx = int(row.get("row_index", 0)) + 1
     lora_name = str(row.get("lora_name") or "None")
@@ -3040,15 +3081,35 @@ def _build_auto_strength_row_text_report(row: Dict[str, Any]) -> str:
         lines.append("    - none")
 
     logical_groups = report.get("logical_groups") if isinstance(report.get("logical_groups"), list) else []
-    lines.append("  Largest ratio deviations:")
-    if logical_groups:
-        for item in logical_groups[:12]:
+    boosts, pullbacks, neutral = _auto_strength_report_split_groups(logical_groups)
+
+    lines.append("  Strongest boosts:")
+    if boosts:
+        for item in boosts[:6]:
             lines.append(_auto_strength_report_line_for_group(item))
-        remaining = len(logical_groups) - min(12, len(logical_groups))
+        remaining = len(boosts) - min(6, len(boosts))
         if remaining > 0:
-            lines.append(f"    - ... {remaining} more logical groups in JSON report")
+            lines.append(f"    - ... {remaining} more boost groups in JSON report")
     else:
         lines.append("    - none")
+
+    lines.append("  Strongest pullbacks:")
+    if pullbacks:
+        for item in pullbacks[:6]:
+            lines.append(_auto_strength_report_line_for_group(item))
+        remaining = len(pullbacks) - min(6, len(pullbacks))
+        if remaining > 0:
+            lines.append(f"    - ... {remaining} more pullback groups in JSON report")
+    else:
+        lines.append("    - none")
+
+    if neutral:
+        lines.append("  Near global:")
+        for item in neutral[:6]:
+            lines.append(_auto_strength_report_line_for_group(item))
+        remaining = len(neutral) - min(6, len(neutral))
+        if remaining > 0:
+            lines.append(f"    - ... {remaining} more near-global groups in JSON report")
 
     return "\n".join(lines)
 
@@ -3513,15 +3574,6 @@ class DoraPowerLoraLoader:
                 report_rows.append(row_info)
                 continue
             if not e.get("on", True):
-                sm_disabled = float(e.get("strength_model", 0.0))
-                sc_disabled = float(e.get("strength_clip", sm_disabled))
-                row_info.update({
-                    "status": "disabled_row",
-                    "status_detail": "Row toggle is off.",
-                    "strength_model": sm_disabled,
-                    "strength_clip": sc_disabled,
-                })
-                report_rows.append(row_info)
                 continue
             sm = float(e.get("strength_model", 0.0))
             sc = float(e.get("strength_clip", sm))

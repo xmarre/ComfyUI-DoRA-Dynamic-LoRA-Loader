@@ -120,6 +120,202 @@ function fitText(ctx, text, maxWidth) {
   return out.length ? `${out}…` : "";
 }
 
+const DISPLAY_GROUP_LIMIT = 3;
+const DISPLAY_RATIO_EPS = 1e-3;
+const CLASSIC_DISPLAY_PREFIXES = [
+  "lora_unet_",
+  "lycoris_",
+  "diffusion_model.",
+  "diffusion_model_",
+  "base_model.model.",
+  "base_model_model_",
+  "base_model.",
+  "base_model_",
+  "transformer.",
+  "transformer_",
+  "model.",
+  "model_",
+  "unet.",
+  "unet_",
+];
+
+function normalizeClassicDisplayGroupKind(parts) {
+  const tokens = new Set(parts);
+  if (tokens.has("attentions") || tokens.has("attention") || tokens.has("attn")) return "attn";
+  if (
+    tokens.has("resnets") ||
+    tokens.has("resnet") ||
+    tokens.has("in_layers") ||
+    tokens.has("out_layers") ||
+    tokens.has("emb_layers") ||
+    tokens.has("skip_connection") ||
+    tokens.has("nin_shortcut") ||
+    tokens.has("conv1") ||
+    tokens.has("conv2")
+  ) {
+    return "resnet";
+  }
+  if (tokens.has("downsamplers") || tokens.has("downsampler") || tokens.has("downsample")) return "downsampler";
+  if (tokens.has("upsamplers") || tokens.has("upsampler") || tokens.has("upsample")) return "upsampler";
+  if (tokens.has("proj") || tokens.has("proj_in") || tokens.has("proj_out") || tokens.has("time_emb_proj")) return "proj";
+  if (tokens.has("conv") || tokens.has("conv_in") || tokens.has("conv_out")) return "conv";
+  if (tokens.has("norm")) return "norm";
+  return null;
+}
+
+function normalizeClassicDisplayGroupId(base) {
+  let text = String(base ?? "").trim();
+  if (!text) return null;
+
+  for (const prefix of CLASSIC_DISPLAY_PREFIXES) {
+    if (text.startsWith(prefix)) {
+      text = text.slice(prefix.length);
+      break;
+    }
+  }
+
+  if (!text) return null;
+
+  const parts = text.replace(/[./]+/g, "_").split("_").filter(Boolean);
+  if (!parts.length) return null;
+
+  let root = null;
+  let cursor = 0;
+  if (parts[0] === "middle" && parts[1] === "block") {
+    root = "middle_block";
+    cursor = 2;
+  } else if ((parts[0] === "input" || parts[0] === "output" || parts[0] === "down" || parts[0] === "up") && parts[1] === "blocks") {
+    root = `${parts[0]}_blocks`;
+    cursor = 2;
+  } else {
+    return null;
+  }
+
+  let blockIndex = null;
+  if (cursor < parts.length && /^\d+$/.test(parts[cursor])) {
+    blockIndex = parts[cursor];
+    cursor += 1;
+  }
+  if (cursor < parts.length && /^\d+$/.test(parts[cursor])) {
+    cursor += 1;
+  }
+
+  const kind = normalizeClassicDisplayGroupKind(parts.slice(cursor));
+  if (root === "middle_block") {
+    return kind ? `${root}.${kind}` : root;
+  }
+  if (blockIndex == null) {
+    return kind ? `${root}.${kind}` : root;
+  }
+  return kind ? `${root}.${blockIndex}.${kind}` : `${root}.${blockIndex}`;
+}
+
+function buildDisplayGroups(logicalGroups) {
+  const buckets = new Map();
+  const groups = Array.isArray(logicalGroups) ? logicalGroups : [];
+
+  for (const item of groups) {
+    if (!item || typeof item !== "object") continue;
+
+    const rawId = String(item.logical_id ?? "");
+    const displayId = normalizeClassicDisplayGroupId(rawId) || rawId || "?";
+    let bucket = buckets.get(displayId);
+    if (!bucket) {
+      bucket = {
+        display_id: displayId,
+        fanout: 0,
+        logical_group_count: 0,
+        measured_base_count: 0,
+        ratio_weight: 0,
+        ratio_weight_count: 0,
+      };
+      buckets.set(displayId, bucket);
+    }
+
+    const fanout = Math.max(1, Number(item.fanout) || 0);
+    const ratio = Number(item.ratio_applied);
+    if (Number.isFinite(ratio)) {
+      bucket.ratio_weight += ratio * fanout;
+      bucket.ratio_weight_count += fanout;
+    }
+    bucket.fanout += fanout;
+    bucket.logical_group_count += 1;
+    bucket.measured_base_count += Number(item.measured_base_count) || 0;
+  }
+
+  const out = [];
+  for (const bucket of buckets.values()) {
+    out.push({
+      display_id: bucket.display_id,
+      fanout: bucket.fanout || bucket.logical_group_count,
+      logical_group_count: bucket.logical_group_count,
+      measured_base_count: bucket.measured_base_count,
+      ratio_applied: bucket.ratio_weight_count > 0 ? bucket.ratio_weight / bucket.ratio_weight_count : null,
+    });
+  }
+
+  out.sort((a, b) => String(a.display_id).localeCompare(String(b.display_id)));
+  return out;
+}
+
+function compareDisplayGroupsByRatio(a, b, descending = false) {
+  const ar = Number.isFinite(+a?.ratio_applied) ? +a.ratio_applied : 1.0;
+  const br = Number.isFinite(+b?.ratio_applied) ? +b.ratio_applied : 1.0;
+  if (Math.abs(ar - br) > 1e-9) {
+    return descending ? br - ar : ar - br;
+  }
+  return String(a?.display_id ?? "").localeCompare(String(b?.display_id ?? ""));
+}
+
+function buildDisplayGroupSections(logicalGroups, expanded) {
+  const groups = buildDisplayGroups(logicalGroups);
+  const boosts = [];
+  const pullbacks = [];
+  const neutral = [];
+
+  for (const group of groups) {
+    const ratio = Number(group.ratio_applied);
+    if (!Number.isFinite(ratio) || Math.abs(ratio - 1.0) <= DISPLAY_RATIO_EPS) {
+      neutral.push(group);
+    } else if (ratio > 1.0) {
+      boosts.push(group);
+    } else {
+      pullbacks.push(group);
+    }
+  }
+
+  boosts.sort((a, b) => compareDisplayGroupsByRatio(a, b, true));
+  pullbacks.sort((a, b) => compareDisplayGroupsByRatio(a, b, false));
+  neutral.sort((a, b) => String(a.display_id).localeCompare(String(b.display_id)));
+
+  const sections = [];
+  const addSection = (kind, title, items, limit) => {
+    if (!items.length) return;
+    const visibleItems = expanded || limit == null ? items.slice() : items.slice(0, limit);
+    sections.push({
+      kind,
+      title,
+      items: visibleItems,
+      totalCount: items.length,
+      visibleCount: visibleItems.length,
+    });
+  };
+
+  addSection("boost", "Strongest boosts", boosts, DISPLAY_GROUP_LIMIT);
+  addSection("pullback", "Strongest pullbacks", pullbacks, DISPLAY_GROUP_LIMIT);
+  if (expanded) {
+    addSection("neutral", "Near global", neutral, null);
+  } else if (!boosts.length && !pullbacks.length) {
+    addSection("neutral", "Near global", neutral, 6);
+  }
+
+  return {
+    groups,
+    sections,
+    hasMore: !expanded && sections.some((section) => section.visibleCount < section.totalCount),
+  };
+}
+
 function parseExecutionOutputValue(output, key) {
   const value = output?.[key];
   if (Array.isArray(value)) return value[0] ?? null;
@@ -831,16 +1027,40 @@ class DoraAutoStrengthReportWidget {
     return this._rows().filter((row) => row && typeof row === "object");
   }
 
+  _rowLayout(row) {
+    const analyzed = row.status === "analyzed" && Array.isArray(row.report?.logical_groups);
+    const logicalGroups = analyzed ? row.report.logical_groups : [];
+    const expanded = !!this.parentNode?._doraAutoStrengthExpanded?.[row.row_index];
+    const grouped = analyzed ? buildDisplayGroupSections(logicalGroups, expanded) : { groups: [], sections: [], hasMore: false };
+    return {
+      analyzed,
+      expanded,
+      logicalGroups,
+      displayGroups: grouped.groups,
+      sections: grouped.sections,
+      hasMore: grouped.hasMore,
+    };
+  }
+
+  _estimateRowHeight(layout) {
+    if (!layout.analyzed) return 68;
+    let height = 92;
+    for (const section of layout.sections) {
+      height += 18;
+      height += section.items.length * 20;
+      if (section.items.length) height += 6;
+    }
+    if (layout.hasMore) height += 18;
+    return height;
+  }
+
   computeSize(width) {
     const rows = this._displayRows();
     let height = 72;
     if (!rows.length) return [width || 320, height];
     for (const row of rows) {
-      const analyzed = row.status === "analyzed" && Array.isArray(row.report?.logical_groups);
-      const logicalGroups = analyzed ? row.report.logical_groups : [];
-      const expanded = !!this.parentNode?._doraAutoStrengthExpanded?.[row.row_index];
-      const shown = analyzed ? (expanded ? logicalGroups.length : Math.min(6, logicalGroups.length)) : 0;
-      height += analyzed ? 92 + shown * 20 + (logicalGroups.length > shown ? 18 : 0) : 68;
+      const layout = this._rowLayout(row);
+      height += this._estimateRowHeight(layout);
       height += 10;
     }
     return [width || 320, height];
@@ -894,11 +1114,8 @@ class DoraAutoStrengthReportWidget {
 
     let y = posY + 68;
     for (const row of rows) {
-      const analyzed = row.status === "analyzed" && Array.isArray(row.report?.logical_groups);
-      const logicalGroups = analyzed ? row.report.logical_groups : [];
-      const expanded = !!this.parentNode?._doraAutoStrengthExpanded?.[row.row_index];
-      const shown = analyzed ? (expanded ? logicalGroups.length : Math.min(6, logicalGroups.length)) : 0;
-      const cardHeight = analyzed ? 92 + shown * 20 + (logicalGroups.length > shown ? 18 : 0) : 68;
+      const layout = this._rowLayout(row);
+      const cardHeight = this._estimateRowHeight(layout);
 
       drawRoundedRect(ctx, x, y, cardWidth, cardHeight, 8);
       ctx.fillStyle = "#101318";
@@ -912,15 +1129,15 @@ class DoraAutoStrengthReportWidget {
         w: cardWidth,
         h: 28,
         rowIndex: row.row_index,
-        toggleable: analyzed,
+        toggleable: layout.analyzed,
       });
 
       ctx.fillStyle = colors.text;
       ctx.font = "bold 12px Arial";
-      const toggleGlyph = analyzed ? (expanded ? "▾" : "▸") : "•";
+      const toggleGlyph = layout.analyzed ? (layout.expanded ? "▾" : "▸") : "•";
       ctx.fillText(`${toggleGlyph} ${fitText(ctx, row.lora_name || "None", cardWidth - 150)}`, x + 12, y + 16);
 
-      const badge = analyzed
+      const badge = layout.analyzed
         ? `${row.report.analyzable_bases ?? row.report.mapped_bases}/${row.report.measured_bases} bases`
         : String(row.status_detail || row.status || "");
       ctx.textAlign = "right";
@@ -936,26 +1153,14 @@ class DoraAutoStrengthReportWidget {
       ctx.stroke();
 
       ctx.fillStyle = colors.secondary;
-      if (!analyzed) {
+      if (!layout.analyzed) {
         const line = `${row.status || "unknown"} · model ${formatNumber(row.strength_model, 2)} · clip ${formatNumber(row.strength_clip, 2)}`;
         ctx.fillText(fitText(ctx, line, cardWidth - 24), x + 12, y + 48);
         y += cardHeight + 10;
         continue;
       }
 
-      const topLine = [
-        `model ${formatNumber(row.strength_model, 2)}`,
-        `clip ${formatNumber(row.strength_clip, 2)}`,
-        `${row.report.logical_groups_measured}/${row.report.logical_groups_total} logical`,
-        `load ${row.report.analysis_load_device}`,
-      ].join("  ·  ");
-      ctx.fillText(fitText(ctx, topLine, cardWidth - 24), x + 12, y + 48);
-
-      const cohortNames = Array.isArray(row.report?.cohorts)
-        ? row.report.cohorts.map((cohort) => `${cohort.group}/${cohort.family}`).join("  ·  ")
-        : "";
-      ctx.fillText(fitText(ctx, cohortNames, cardWidth - 24), x + 12, y + 66);
-
+      const displayGroups = layout.displayGroups;
       const floor = Number.isFinite(+row.report?.ratio_floor) ? +row.report.ratio_floor : 0;
       const ceiling = Number.isFinite(+row.report?.ratio_ceiling) ? +row.report.ratio_ceiling : 1;
       const denom = Math.max(1e-6, ceiling - floor);
@@ -965,54 +1170,82 @@ class DoraAutoStrengthReportWidget {
       const barW = Math.max(64, cardWidth - 24 - labelWidth - ratioWidth);
       const center = barX + ((clamp(1, floor, ceiling) - floor) / denom) * barW;
 
+      const topLine = [
+        `model ${formatNumber(row.strength_model, 2)}`,
+        `clip ${formatNumber(row.strength_clip, 2)}`,
+        `${row.report.logical_groups_measured}/${row.report.logical_groups_total} logical`,
+        `display ${displayGroups.length}`,
+        `load ${row.report.analysis_load_device}`,
+      ].join("  ·  ");
+      ctx.fillText(fitText(ctx, topLine, cardWidth - 24), x + 12, y + 48);
+
+      const cohortNames = Array.isArray(row.report?.cohorts)
+        ? row.report.cohorts.map((cohort) => `${cohort.group}/${cohort.family}`).join("  ·  ")
+        : "";
+      ctx.fillText(fitText(ctx, cohortNames, cardWidth - 24), x + 12, y + 66);
+
       let rowY = y + 88;
-      ctx.font = "11px Arial";
-      for (let i = 0; i < shown; i++) {
-        const item = logicalGroups[i];
-        const ratio = Number(item?.ratio_applied);
-        const validRatio = Number.isFinite(ratio);
-        const ratioText = validRatio ? `${ratio.toFixed(2)}×` : "global";
-        const itemLabel = `${item?.logical_id ?? "?"} ×${item?.fanout ?? 1}`;
-
-        ctx.fillStyle = colors.text;
+      ctx.font = "bold 11px Arial";
+      for (const section of layout.sections) {
+        const sectionTitle = section.visibleCount < section.totalCount
+          ? `${section.title} (${section.visibleCount}/${section.totalCount})`
+          : `${section.title} (${section.totalCount})`;
+        ctx.fillStyle = section.kind === "boost" ? "#8bb2ff" : section.kind === "pullback" ? "#f0b05b" : colors.secondary;
         ctx.textAlign = "left";
-        ctx.fillText(fitText(ctx, itemLabel, labelWidth - 8), x + 12, rowY);
+        ctx.fillText(fitText(ctx, sectionTitle, cardWidth - 24), x + 12, rowY + 10);
+        rowY += 18;
 
-        drawRoundedRect(ctx, barX, rowY - 6, barW, 12, 6);
-        ctx.fillStyle = "#0b1020";
-        ctx.fill();
-        ctx.strokeStyle = "#2a2f39";
-        ctx.stroke();
+        ctx.font = "11px Arial";
+        for (const item of section.items) {
+          const ratio = Number(item?.ratio_applied);
+          const validRatio = Number.isFinite(ratio);
+          const ratioText = validRatio ? `${ratio.toFixed(2)}×` : "global";
+          const itemLabel = `${item?.display_id ?? item?.logical_id ?? "?"} ×${item?.fanout ?? 1}`;
 
-        ctx.strokeStyle = "#7c8597";
-        ctx.beginPath();
-        ctx.moveTo(center, rowY - 7);
-        ctx.lineTo(center, rowY + 7);
-        ctx.stroke();
+          ctx.fillStyle = colors.text;
+          ctx.textAlign = "left";
+          ctx.fillText(fitText(ctx, itemLabel, labelWidth - 8), x + 12, rowY);
 
-        const px = validRatio ? barX + ((clamp(ratio, floor, ceiling) - floor) / denom) * barW : center;
-        if (Math.abs(px - center) > 1) {
-          const fillX = Math.min(center, px);
-          const fillW = Math.max(1, Math.abs(px - center));
-          drawRoundedRect(ctx, fillX, rowY - 4, fillW, 8, 4);
-          ctx.fillStyle = px >= center ? "#4f8cff" : "#e3a33b";
+          drawRoundedRect(ctx, barX, rowY - 6, barW, 12, 6);
+          ctx.fillStyle = "#0b1020";
           ctx.fill();
-        }
-        ctx.beginPath();
-        ctx.fillStyle = validRatio ? (px >= center ? "#bcd4ff" : "#ffd08a") : colors.secondary;
-        ctx.arc(px, rowY, 3, 0, Math.PI * 2);
-        ctx.fill();
+          ctx.strokeStyle = "#2a2f39";
+          ctx.stroke();
 
-        ctx.textAlign = "right";
-        ctx.fillStyle = colors.secondary;
-        ctx.fillText(ratioText, x + cardWidth - 12, rowY);
-        rowY += 20;
+          ctx.strokeStyle = "#7c8597";
+          ctx.beginPath();
+          ctx.moveTo(center, rowY - 7);
+          ctx.lineTo(center, rowY + 7);
+          ctx.stroke();
+
+          const px = validRatio ? barX + ((clamp(ratio, floor, ceiling) - floor) / denom) * barW : center;
+          if (Math.abs(px - center) > 1) {
+            const fillX = Math.min(center, px);
+            const fillW = Math.max(1, Math.abs(px - center));
+            drawRoundedRect(ctx, fillX, rowY - 4, fillW, 8, 4);
+            ctx.fillStyle = px >= center ? "#4f8cff" : "#e3a33b";
+            ctx.fill();
+          }
+          ctx.beginPath();
+          ctx.fillStyle = validRatio ? (px >= center ? "#bcd4ff" : "#ffd08a") : colors.secondary;
+          ctx.arc(px, rowY, 3, 0, Math.PI * 2);
+          ctx.fill();
+
+          ctx.textAlign = "right";
+          ctx.fillStyle = colors.secondary;
+          ctx.fillText(ratioText, x + cardWidth - 12, rowY);
+          rowY += 20;
+        }
+
+        if (section.items.length) {
+          rowY += 6;
+        }
       }
 
-      if (logicalGroups.length > shown) {
+      if (layout.hasMore) {
         ctx.textAlign = "left";
         ctx.fillStyle = colors.secondary;
-        ctx.fillText(`click header to ${expanded ? "collapse" : `expand all ${logicalGroups.length}`} logical groups`, x + 12, rowY + 2);
+        ctx.fillText(`click header to ${layout.expanded ? "collapse" : `expand all ${displayGroups.length}`} display groups`, x + 12, rowY + 2);
       }
 
       y += cardHeight + 10;
