@@ -582,6 +582,7 @@ _BROADCAST_DORA_SUFFIXES = _BROADCAST_DELTA_SUFFIXES + (
 
 _AUTO_STRENGTH_RATIO_FLOOR = 0.30
 _AUTO_STRENGTH_RATIO_CEILING = 1.50
+_AUTO_STRENGTH_DISPLAY_RATIO_EPS = 1e-3
 _AUTO_STRENGTH_EPS = 1e-8
 _AUTO_STRENGTH_ANALYSIS_MIN_NUMEL = 65536
 
@@ -3003,7 +3004,7 @@ def _auto_strength_report_split_groups(logical_groups: Iterable[Dict[str, Any]])
 
     for item in logical_groups:
         ratio = _auto_strength_safe_number(item.get("ratio_applied"))
-        if ratio is None or abs(ratio - 1.0) <= _AUTO_STRENGTH_EPS:
+        if ratio is None or abs(ratio - 1.0) <= _AUTO_STRENGTH_DISPLAY_RATIO_EPS:
             neutral.append(item)
         elif ratio > 1.0:
             boosts.append(item)
