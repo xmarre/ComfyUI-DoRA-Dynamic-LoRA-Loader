@@ -1,7 +1,7 @@
 [project]
 name = "dora-dynamic-lora-loader"
 description = "A ComfyUI custom node that loads and stacks regular LoRAs and DoRA LoRAs with Flux/Flux2 and OneTrainer compatibility fixes."
-version = "1.0.17"
+version = "1.0.18"
 license = { file = "LICENSE" }
 
 [project.urls]
