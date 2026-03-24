@@ -109,6 +109,23 @@ function formatNumber(value, digits = 3) {
   return n.toFixed(digits);
 }
 
+function toFiniteNumberOrNull(value) {
+  if (value == null) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function setCanvasTooltip(text) {
+  const canvas = app?.canvas?.canvas;
+  if (canvas) {
+    canvas.title = text || "";
+  }
+}
+
+function clearCanvasTooltip() {
+  setCanvasTooltip("");
+}
+
 function fitText(ctx, text, maxWidth) {
   const s = String(text ?? "");
   if (maxWidth <= 8 || !s) return "";
@@ -118,6 +135,20 @@ function fitText(ctx, text, maxWidth) {
     out = out.slice(0, -1);
   }
   return out.length ? `${out}…` : "";
+}
+
+function syncNodeHeightToContent(node) {
+  if (!node || typeof node.computeSize !== "function") return;
+  const size = node.computeSize();
+  if (!Array.isArray(size) || size.length < 2) return;
+
+  const minSize = Array.isArray(node.min_size) ? node.min_size : [];
+  const minWidth = Number(minSize[0]) || 0;
+  const minHeight = Number(minSize[1]) || 0;
+
+  node.size = Array.isArray(node.size) ? node.size : [0, 0];
+  node.size[0] = Math.max(Number(node.size[0]) || 0, minWidth);
+  node.size[1] = Math.max(size[1], minHeight);
 }
 
 const DISPLAY_GROUP_LIMIT = 3;
@@ -233,8 +264,8 @@ function buildDisplayGroups(logicalGroups) {
     }
 
     const fanout = Math.max(1, Number(item.fanout) || 0);
-    const ratio = Number(item.ratio_applied);
-    if (Number.isFinite(ratio)) {
+    const ratio = toFiniteNumberOrNull(item.ratio_applied);
+    if (ratio !== null) {
       bucket.ratio_weight += ratio * fanout;
       bucket.ratio_weight_count += fanout;
     }
@@ -259,8 +290,8 @@ function buildDisplayGroups(logicalGroups) {
 }
 
 function compareDisplayGroupsByRatio(a, b, descending = false) {
-  const ar = Number.isFinite(+a?.ratio_applied) ? +a.ratio_applied : 1.0;
-  const br = Number.isFinite(+b?.ratio_applied) ? +b.ratio_applied : 1.0;
+  const ar = toFiniteNumberOrNull(a?.ratio_applied) ?? 1.0;
+  const br = toFiniteNumberOrNull(b?.ratio_applied) ?? 1.0;
   if (Math.abs(ar - br) > 1e-9) {
     return descending ? br - ar : ar - br;
   }
@@ -274,8 +305,8 @@ function buildDisplayGroupSections(logicalGroups, expanded) {
   const neutral = [];
 
   for (const group of groups) {
-    const ratio = Number(group.ratio_applied);
-    if (!Number.isFinite(ratio) || Math.abs(ratio - 1.0) <= DISPLAY_RATIO_EPS) {
+    const ratio = toFiniteNumberOrNull(group.ratio_applied);
+    if (ratio == null || Math.abs(ratio - 1.0) <= DISPLAY_RATIO_EPS) {
       neutral.push(group);
     } else if (ratio > 1.0) {
       boosts.push(group);
@@ -328,6 +359,7 @@ function clearExecutionReport(node) {
   node._doraAutoStrengthReportJson = "";
   node._doraAutoStrengthReportText = "";
   node._doraAutoStrengthExpanded = {};
+  syncNodeHeightToContent(node);
   node.setDirtyCanvas?.(true, true);
 }
 
@@ -349,11 +381,7 @@ function applyExecutionReportToNode(node, reportJson, reportText) {
   node._doraAutoStrengthReportJson = typeof reportJson === "string" ? reportJson : "";
   node._doraAutoStrengthReportText = typeof reportText === "string" ? reportText : "";
   node._doraAutoStrengthExpanded = node._doraAutoStrengthExpanded || {};
-  const size = typeof node.computeSize === "function" ? node.computeSize() : null;
-  if (Array.isArray(size) && size.length >= 2) {
-    node.size[0] = Math.max(node.size[0], size[0]);
-    node.size[1] = Math.max(node.size[1], size[1]);
-  }
+  syncNodeHeightToContent(node);
   node.setDirtyCanvas?.(true, true);
 }
 
@@ -591,6 +619,7 @@ class DoraLoraRowWidget {
     this.row = row;
     this.last_y = 0;
     this._drag = null;
+    this.nameTooltip = "";
     this.hitAreas = {
       toggle: [0, 0],
       name: [0, 0],
@@ -657,15 +686,9 @@ class DoraLoraRowWidget {
     ctx.font = "12px Arial";
     ctx.textAlign = "left";
 
-    let displayLabel = this.row.name || "None";
-    const metrics = ctx.measureText(displayLabel);
-    if (metrics.width > nameWidth) {
-      const avgCharWidth = 7;
-      const maxChars = Math.max(4, Math.floor(nameWidth / avgCharWidth));
-      if (displayLabel.length > maxChars) {
-        displayLabel = `${displayLabel.substring(0, maxChars - 3)}...`;
-      }
-    }
+    const fullLabel = String(this.row.name || "None");
+    const displayLabel = fitText(ctx, fullLabel, nameWidth);
+    this.nameTooltip = displayLabel !== fullLabel ? fullLabel : "";
 
     ctx.fillText(displayLabel, nameX, midY + 4);
     this.hitAreas.name = [nameX, nameX + nameWidth];
@@ -966,7 +989,23 @@ class DoraLoraRowWidget {
   }
 
   mouse(event, pos, node) {
-    if (event.type === "pointermove") return this.handleWeightDrag(event);
+    if (event.type === "pointermove" || event.type === "mousemove") {
+      const dragging = this.handleWeightDrag(event);
+      const widgetX = pos[0];
+      const hoverText =
+        !this._drag &&
+        this.nameTooltip &&
+        widgetX >= this.hitAreas.name[0] &&
+        widgetX <= this.hitAreas.name[1]
+          ? this.nameTooltip
+          : "";
+      setCanvasTooltip(hoverText);
+      return dragging;
+    }
+    if (event.type === "pointerleave" || event.type === "mouseout") {
+      clearCanvasTooltip();
+      return false;
+    }
     if (event.type === "pointerup" || event.type === "pointercancel" || event.type === "mouseup") {
       return this.finishWeightDrag(event);
     }
@@ -1012,6 +1051,7 @@ class DoraAutoStrengthReportWidget {
     this.parentNode = parentNode;
     this.last_y = 0;
     this.hitAreas = [];
+    this.hoverAreas = [];
   }
 
   serializeValue() {
@@ -1069,6 +1109,7 @@ class DoraAutoStrengthReportWidget {
   draw(ctx, node, width, posY, height) {
     this.last_y = posY;
     this.hitAreas = [];
+    this.hoverAreas = [];
     const colors = getThemeColors();
     const x = HORIZ_MARGIN;
     const cardWidth = width - HORIZ_MARGIN * 2;
@@ -1135,7 +1176,18 @@ class DoraAutoStrengthReportWidget {
       ctx.fillStyle = colors.text;
       ctx.font = "bold 12px Arial";
       const toggleGlyph = layout.analyzed ? (layout.expanded ? "▾" : "▸") : "•";
-      ctx.fillText(`${toggleGlyph} ${fitText(ctx, row.lora_name || "None", cardWidth - 150)}`, x + 12, y + 16);
+      const fullHeader = String(row.lora_name || "None");
+      const shownHeader = fitText(ctx, fullHeader, cardWidth - 150);
+      ctx.fillText(`${toggleGlyph} ${shownHeader}`, x + 12, y + 16);
+      if (shownHeader !== fullHeader) {
+        this.hoverAreas.push({
+          x: x + 12,
+          y: y + 4,
+          w: Math.max(40, cardWidth - 170),
+          h: 18,
+          tooltip: fullHeader,
+        });
+      }
 
       const badge = layout.analyzed
         ? `${row.report.analyzable_bases ?? row.report.mapped_bases}/${row.report.measured_bases} bases`
@@ -1164,10 +1216,12 @@ class DoraAutoStrengthReportWidget {
       const floor = Number.isFinite(+row.report?.ratio_floor) ? +row.report.ratio_floor : 0;
       const ceiling = Number.isFinite(+row.report?.ratio_ceiling) ? +row.report.ratio_ceiling : 1;
       const denom = Math.max(1e-6, ceiling - floor);
-      const labelWidth = Math.min(220, Math.max(150, Math.floor(cardWidth * 0.4)));
+      const barMinWidth = 96;
       const ratioWidth = 54;
+      const availableWidth = Math.max(0, cardWidth - 24 - ratioWidth);
+      const labelWidth = Math.max(80, Math.min(520, availableWidth - barMinWidth));
       const barX = x + 12 + labelWidth;
-      const barW = Math.max(64, cardWidth - 24 - labelWidth - ratioWidth);
+      const barW = Math.max(48, availableWidth - labelWidth);
       const center = barX + ((clamp(1, floor, ceiling) - floor) / denom) * barW;
 
       const topLine = [
@@ -1197,14 +1251,25 @@ class DoraAutoStrengthReportWidget {
 
         ctx.font = "11px Arial";
         for (const item of section.items) {
-          const ratio = Number(item?.ratio_applied);
-          const validRatio = Number.isFinite(ratio);
+          const ratio = toFiniteNumberOrNull(item?.ratio_applied);
+          const validRatio = ratio !== null;
           const ratioText = validRatio ? `${ratio.toFixed(2)}×` : "global";
           const itemLabel = `${item?.display_id ?? item?.logical_id ?? "?"} ×${item?.fanout ?? 1}`;
 
+          const shownItemLabel = fitText(ctx, itemLabel, labelWidth - 8);
+
           ctx.fillStyle = colors.text;
           ctx.textAlign = "left";
-          ctx.fillText(fitText(ctx, itemLabel, labelWidth - 8), x + 12, rowY);
+          ctx.fillText(shownItemLabel, x + 12, rowY);
+          if (shownItemLabel !== itemLabel) {
+            this.hoverAreas.push({
+              x: x + 12,
+              y: rowY - 8,
+              w: labelWidth,
+              h: 16,
+              tooltip: itemLabel,
+            });
+          }
 
           drawRoundedRect(ctx, barX, rowY - 6, barW, 12, 6);
           ctx.fillStyle = "#0b1020";
@@ -1255,6 +1320,23 @@ class DoraAutoStrengthReportWidget {
   }
 
   mouse(event, pos) {
+    if (event.type === "pointermove" || event.type === "mousemove") {
+      const mx = pos[0];
+      const my = pos[1];
+      let tooltip = "";
+      for (const hit of this.hoverAreas) {
+        if (mx >= hit.x && mx <= hit.x + hit.w && my >= hit.y && my <= hit.y + hit.h) {
+          tooltip = hit.tooltip || "";
+          break;
+        }
+      }
+      setCanvasTooltip(tooltip);
+      return false;
+    }
+    if (event.type === "pointerleave" || event.type === "mouseout") {
+      clearCanvasTooltip();
+      return false;
+    }
     if (event.type !== "pointerdown") return false;
     const mx = pos[0];
     const my = pos[1];
@@ -1263,6 +1345,7 @@ class DoraAutoStrengthReportWidget {
         if (!hit.toggleable) return true;
         const expanded = this.parentNode._doraAutoStrengthExpanded || (this.parentNode._doraAutoStrengthExpanded = {});
         expanded[hit.rowIndex] = !expanded[hit.rowIndex];
+        syncNodeHeightToContent(this.parentNode);
         this.parentNode.setDirtyCanvas?.(true, true);
         return true;
       }
@@ -1273,10 +1356,12 @@ class DoraAutoStrengthReportWidget {
 
 function buildUI(node, state, loraValues) {
   const st = sanitizeState(state);
+  clearCanvasTooltip();
   setState(node, st);
   removeAllWidgets(node);
   node._doraRows = st.rows;
   node._doraGlobals = st.globals;
+  node.resizable = true;
 
   const loras = Array.isArray(loraValues) ? loraValues : ["None"];
 
@@ -1503,8 +1588,13 @@ function buildUI(node, state, loraValues) {
   wAutoStrengthReport.serialize = false;
 
   const size = node.computeSize();
-  node.size[0] = Math.max(node.size[0], size[0]);
-  node.size[1] = Math.max(node.size[1], size[1]);
+  const minWidth = 360;
+  const minSize = Array.isArray(node.min_size) ? node.min_size.slice(0, 2) : [0, 0];
+  minSize[0] = Math.max(Number(minSize[0]) || 0, minWidth);
+  minSize[1] = Number(minSize[1]) || 0;
+  node.min_size = minSize;
+  node.size[0] = Math.max(node.size[0], size[0], minWidth);
+  syncNodeHeightToContent(node);
 }
 
 app.registerExtension({
@@ -1526,6 +1616,7 @@ app.registerExtension({
     const origOnNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const r = origOnNodeCreated?.apply(this, arguments);
+      this.resizable = true;
       rebuild(this);
       return r;
     };
