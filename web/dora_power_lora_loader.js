@@ -1,4 +1,5 @@
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
 const NODE_CLASS = "DoRA Power LoRA Loader";
 const EXT_NAME = "comfyui_dora_dynamic_lora.power_lora_loader";
@@ -96,6 +97,91 @@ function drawRoundedRect(ctx, x, y, w, h, r) {
   ctx.arcTo(x, y + h, x, y, rr);
   ctx.arcTo(x, y, x + w, y, rr);
   ctx.closePath();
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function formatNumber(value, digits = 3) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "—";
+  return n.toFixed(digits);
+}
+
+function fitText(ctx, text, maxWidth) {
+  const s = String(text ?? "");
+  if (maxWidth <= 8 || !s) return "";
+  if (ctx.measureText(s).width <= maxWidth) return s;
+  let out = s;
+  while (out.length > 3 && ctx.measureText(`${out}…`).width > maxWidth) {
+    out = out.slice(0, -1);
+  }
+  return out.length ? `${out}…` : "";
+}
+
+function parseExecutionOutputValue(output, key) {
+  const value = output?.[key];
+  if (Array.isArray(value)) return value[0] ?? null;
+  return typeof value === "string" ? value : null;
+}
+
+function clearExecutionReport(node) {
+  if (!node) return;
+  node._doraAutoStrengthReport = null;
+  node._doraAutoStrengthReportJson = "";
+  node._doraAutoStrengthReportText = "";
+  node._doraAutoStrengthExpanded = {};
+  node.setDirtyCanvas?.(true, true);
+}
+
+function isTargetNodeInstance(node) {
+  return !!node && (node.type === NODE_CLASS || node.comfyClass === NODE_CLASS || node.title === NODE_CLASS);
+}
+
+function applyExecutionReportToNode(node, reportJson, reportText) {
+  if (!node) return;
+  let parsed = null;
+  if (typeof reportJson === "string" && reportJson.trim()) {
+    try {
+      parsed = JSON.parse(reportJson);
+    } catch (err) {
+      console.warn(`[${EXT_NAME}] Failed to parse auto-strength report JSON`, err);
+    }
+  }
+  node._doraAutoStrengthReport = parsed;
+  node._doraAutoStrengthReportJson = typeof reportJson === "string" ? reportJson : "";
+  node._doraAutoStrengthReportText = typeof reportText === "string" ? reportText : "";
+  node._doraAutoStrengthExpanded = node._doraAutoStrengthExpanded || {};
+  const size = typeof node.computeSize === "function" ? node.computeSize() : null;
+  if (Array.isArray(size) && size.length >= 2) {
+    node.size[0] = Math.max(node.size[0], size[0]);
+    node.size[1] = Math.max(node.size[1], size[1]);
+  }
+  node.setDirtyCanvas?.(true, true);
+}
+
+let _executionListenerInstalled = false;
+function installExecutionListener() {
+  if (_executionListenerInstalled) return;
+  _executionListenerInstalled = true;
+  if (!api?.addEventListener) return;
+
+  api.addEventListener("executed", (event) => {
+    const detail = event?.detail || event || {};
+    const output = detail?.output || {};
+    const reportJson = parseExecutionOutputValue(output, "auto_strength_report_json");
+    const reportText = parseExecutionOutputValue(output, "analysis_report");
+    if (typeof reportJson !== "string" && typeof reportText !== "string") return;
+
+    const rawNodeId = detail?.display_node ?? detail?.node;
+    const nodeId = Number(rawNodeId);
+    const graph = app.graph;
+    const node = Number.isFinite(nodeId) && graph?.getNodeById ? graph.getNodeById(nodeId) : null;
+    if (!isTargetNodeInstance(node)) return;
+
+    applyExecutionReportToNode(node, reportJson, reportText);
+  });
 }
 
 function removeAllWidgets(node) {
@@ -281,6 +367,7 @@ function setState(node, st) {
 
 function persistNodeState(node) {
   setState(node, { rows: node._doraRows || [], globals: node._doraGlobals || {} });
+  clearExecutionReport(node);
 }
 
 function setButtonCallback(widget, cb) {
@@ -722,6 +809,235 @@ class DoraLoraRowWidget {
   }
 }
 
+class DoraAutoStrengthReportWidget {
+  constructor(name, parentNode) {
+    this.name = name;
+    this.type = "custom";
+    this.parentNode = parentNode;
+    this.last_y = 0;
+    this.hitAreas = [];
+  }
+
+  serializeValue() {
+    return null;
+  }
+
+  _rows() {
+    const rows = this.parentNode?._doraAutoStrengthReport?.rows;
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  _displayRows() {
+    return this._rows().filter((row) => row && typeof row === "object");
+  }
+
+  computeSize(width) {
+    const rows = this._displayRows();
+    let height = 72;
+    if (!rows.length) return [width || 320, height];
+    for (const row of rows) {
+      const analyzed = row.status === "analyzed" && Array.isArray(row.report?.logical_groups);
+      const logicalGroups = analyzed ? row.report.logical_groups : [];
+      const expanded = !!this.parentNode?._doraAutoStrengthExpanded?.[row.row_index];
+      const shown = analyzed ? (expanded ? logicalGroups.length : Math.min(6, logicalGroups.length)) : 0;
+      height += analyzed ? 92 + shown * 20 + (logicalGroups.length > shown ? 18 : 0) : 68;
+      height += 10;
+    }
+    return [width || 320, height];
+  }
+
+  draw(ctx, node, width, posY, height) {
+    this.last_y = posY;
+    this.hitAreas = [];
+    const colors = getThemeColors();
+    const x = HORIZ_MARGIN;
+    const cardWidth = width - HORIZ_MARGIN * 2;
+    const report = this.parentNode?._doraAutoStrengthReport;
+    const rows = this._displayRows();
+    const analyzedRows = rows.filter((row) => row?.status === "analyzed" && Array.isArray(row.report?.logical_groups));
+
+    ctx.save();
+    ctx.font = "12px Arial";
+    ctx.textBaseline = "middle";
+
+    drawRoundedRect(ctx, x, posY + 2, cardWidth, 58, 8);
+    ctx.fillStyle = "#14171c";
+    ctx.fill();
+    ctx.strokeStyle = colors.outline;
+    ctx.stroke();
+
+    ctx.fillStyle = colors.text;
+    ctx.font = "bold 12px Arial";
+    ctx.textAlign = "left";
+    ctx.fillText("Auto-strength analysis", x + 12, posY + 20);
+
+    ctx.font = "11px Arial";
+    ctx.fillStyle = colors.secondary;
+    if (!report) {
+      const autoEnabled = node._doraGlobals?.auto_strength_enabled === true;
+      ctx.fillText(
+        autoEnabled ? "Run the node to populate the logical-group auto-strength report." : "Enable auto-strength and run the node to see the report.",
+        x + 12,
+        posY + 40
+      );
+      ctx.restore();
+      return;
+    }
+
+    const summary = [
+      `rows ${rows.length}`,
+      `analyzed ${analyzedRows.length}`,
+      `device ${report.auto_strength_device ?? "auto"}`,
+      `window ${formatNumber(report.ratio_floor, 2)}–${formatNumber(report.ratio_ceiling, 2)}`,
+    ].join("  ·  ");
+    ctx.fillText(summary, x + 12, posY + 40);
+
+    let y = posY + 68;
+    for (const row of rows) {
+      const analyzed = row.status === "analyzed" && Array.isArray(row.report?.logical_groups);
+      const logicalGroups = analyzed ? row.report.logical_groups : [];
+      const expanded = !!this.parentNode?._doraAutoStrengthExpanded?.[row.row_index];
+      const shown = analyzed ? (expanded ? logicalGroups.length : Math.min(6, logicalGroups.length)) : 0;
+      const cardHeight = analyzed ? 92 + shown * 20 + (logicalGroups.length > shown ? 18 : 0) : 68;
+
+      drawRoundedRect(ctx, x, y, cardWidth, cardHeight, 8);
+      ctx.fillStyle = "#101318";
+      ctx.fill();
+      ctx.strokeStyle = colors.outline;
+      ctx.stroke();
+
+      this.hitAreas.push({
+        x,
+        y,
+        w: cardWidth,
+        h: 28,
+        rowIndex: row.row_index,
+        toggleable: analyzed,
+      });
+
+      ctx.fillStyle = colors.text;
+      ctx.font = "bold 12px Arial";
+      const toggleGlyph = analyzed ? (expanded ? "▾" : "▸") : "•";
+      ctx.fillText(`${toggleGlyph} ${fitText(ctx, row.lora_name || "None", cardWidth - 150)}`, x + 12, y + 16);
+
+      const badge = analyzed
+        ? `${row.report.analyzable_bases ?? row.report.mapped_bases}/${row.report.measured_bases} bases`
+        : String(row.status_detail || row.status || "");
+      ctx.textAlign = "right";
+      ctx.font = "11px Arial";
+      ctx.fillStyle = colors.secondary;
+      ctx.fillText(fitText(ctx, badge, 180), x + cardWidth - 12, y + 16);
+      ctx.textAlign = "left";
+
+      ctx.strokeStyle = "#2a2f39";
+      ctx.beginPath();
+      ctx.moveTo(x + 12, y + 30);
+      ctx.lineTo(x + cardWidth - 12, y + 30);
+      ctx.stroke();
+
+      ctx.fillStyle = colors.secondary;
+      if (!analyzed) {
+        const line = `${row.status || "unknown"} · model ${formatNumber(row.strength_model, 2)} · clip ${formatNumber(row.strength_clip, 2)}`;
+        ctx.fillText(fitText(ctx, line, cardWidth - 24), x + 12, y + 48);
+        y += cardHeight + 10;
+        continue;
+      }
+
+      const topLine = [
+        `model ${formatNumber(row.strength_model, 2)}`,
+        `clip ${formatNumber(row.strength_clip, 2)}`,
+        `${row.report.logical_groups_measured}/${row.report.logical_groups_total} logical`,
+        `load ${row.report.analysis_load_device}`,
+      ].join("  ·  ");
+      ctx.fillText(fitText(ctx, topLine, cardWidth - 24), x + 12, y + 48);
+
+      const cohortNames = Array.isArray(row.report?.cohorts)
+        ? row.report.cohorts.map((cohort) => `${cohort.group}/${cohort.family}`).join("  ·  ")
+        : "";
+      ctx.fillText(fitText(ctx, cohortNames, cardWidth - 24), x + 12, y + 66);
+
+      const floor = Number.isFinite(+row.report?.ratio_floor) ? +row.report.ratio_floor : 0;
+      const ceiling = Number.isFinite(+row.report?.ratio_ceiling) ? +row.report.ratio_ceiling : 1;
+      const denom = Math.max(1e-6, ceiling - floor);
+      const labelWidth = Math.min(220, Math.max(150, Math.floor(cardWidth * 0.4)));
+      const ratioWidth = 54;
+      const barX = x + 12 + labelWidth;
+      const barW = Math.max(64, cardWidth - 24 - labelWidth - ratioWidth);
+      const center = barX + ((clamp(1, floor, ceiling) - floor) / denom) * barW;
+
+      let rowY = y + 88;
+      ctx.font = "11px Arial";
+      for (let i = 0; i < shown; i++) {
+        const item = logicalGroups[i];
+        const ratio = Number(item?.ratio_applied);
+        const validRatio = Number.isFinite(ratio);
+        const ratioText = validRatio ? `${ratio.toFixed(2)}×` : "global";
+        const itemLabel = `${item?.logical_id ?? "?"} ×${item?.fanout ?? 1}`;
+
+        ctx.fillStyle = colors.text;
+        ctx.textAlign = "left";
+        ctx.fillText(fitText(ctx, itemLabel, labelWidth - 8), x + 12, rowY);
+
+        drawRoundedRect(ctx, barX, rowY - 6, barW, 12, 6);
+        ctx.fillStyle = "#0b1020";
+        ctx.fill();
+        ctx.strokeStyle = "#2a2f39";
+        ctx.stroke();
+
+        ctx.strokeStyle = "#7c8597";
+        ctx.beginPath();
+        ctx.moveTo(center, rowY - 7);
+        ctx.lineTo(center, rowY + 7);
+        ctx.stroke();
+
+        const px = validRatio ? barX + ((clamp(ratio, floor, ceiling) - floor) / denom) * barW : center;
+        if (Math.abs(px - center) > 1) {
+          const fillX = Math.min(center, px);
+          const fillW = Math.max(1, Math.abs(px - center));
+          drawRoundedRect(ctx, fillX, rowY - 4, fillW, 8, 4);
+          ctx.fillStyle = px >= center ? "#4f8cff" : "#e3a33b";
+          ctx.fill();
+        }
+        ctx.beginPath();
+        ctx.fillStyle = validRatio ? (px >= center ? "#bcd4ff" : "#ffd08a") : colors.secondary;
+        ctx.arc(px, rowY, 3, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.textAlign = "right";
+        ctx.fillStyle = colors.secondary;
+        ctx.fillText(ratioText, x + cardWidth - 12, rowY);
+        rowY += 20;
+      }
+
+      if (logicalGroups.length > shown) {
+        ctx.textAlign = "left";
+        ctx.fillStyle = colors.secondary;
+        ctx.fillText(`click header to ${expanded ? "collapse" : `expand all ${logicalGroups.length}`} logical groups`, x + 12, rowY + 2);
+      }
+
+      y += cardHeight + 10;
+    }
+
+    ctx.restore();
+  }
+
+  mouse(event, pos) {
+    if (event.type !== "pointerdown") return false;
+    const mx = pos[0];
+    const my = pos[1];
+    for (const hit of this.hitAreas) {
+      if (mx >= hit.x && mx <= hit.x + hit.w && my >= hit.y && my <= hit.y + hit.h) {
+        if (!hit.toggleable) return true;
+        const expanded = this.parentNode._doraAutoStrengthExpanded || (this.parentNode._doraAutoStrengthExpanded = {});
+        expanded[hit.rowIndex] = !expanded[hit.rowIndex];
+        this.parentNode.setDirtyCanvas?.(true, true);
+        return true;
+      }
+    }
+    return false;
+  }
+}
+
 function buildUI(node, state, loraValues) {
   const st = sanitizeState(state);
   setState(node, st);
@@ -945,6 +1261,14 @@ function buildUI(node, state, loraValues) {
   );
   wAutoStrengthCeiling.label = "Auto-strength ratio ceiling";
 
+  const wAutoStrengthReport = new DoraAutoStrengthReportWidget("auto_strength_visualization", node);
+  if (typeof node.addCustomWidget === "function") {
+    node.addCustomWidget(wAutoStrengthReport);
+  } else {
+    node.widgets.push(wAutoStrengthReport);
+  }
+  wAutoStrengthReport.serialize = false;
+
   const size = node.computeSize();
   node.size[0] = Math.max(node.size[0], size[0]);
   node.size[1] = Math.max(node.size[1], size[1]);
@@ -953,6 +1277,7 @@ function buildUI(node, state, loraValues) {
 app.registerExtension({
   name: EXT_NAME,
   async beforeRegisterNodeDef(nodeType, nodeData) {
+    installExecutionListener();
     const nodeName = nodeData?.name ?? "";
     const displayName = nodeData?.display_name ?? "";
     const comfyClass = nodeType?.comfyClass ?? "";
