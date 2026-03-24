@@ -1,4 +1,6 @@
 import logging
+import json
+import math
 import inspect
 import re
 import sys
@@ -721,6 +723,37 @@ def _auto_strength_get_analysis_load_device(model: Any, clip: Any = None) -> Any
                 if cpu_fallback is None:
                     cpu_fallback = device
     return cpu_fallback
+
+
+def _auto_strength_safe_number(value: Any) -> Optional[float]:
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(v):
+        return None
+    return v
+
+
+def _auto_strength_describe_device(value: Any) -> str:
+    device = _torch_device_or_none(value)
+    if device is not None:
+        return str(device)
+    if value is None:
+        return "cpu"
+    try:
+        return str(value)
+    except Exception:
+        return "unknown"
+
+
+def _auto_strength_json_dumps(value: Any, *, pretty: bool = False) -> str:
+    kwargs = {"ensure_ascii": False, "sort_keys": False}
+    if pretty:
+        kwargs["indent"] = 2
+    else:
+        kwargs["separators"] = (",", ":")
+    return json.dumps(value, **kwargs)
 
 
 def _src_has_dora_params(lora_sd: Dict[str, Any], base: str) -> bool:
@@ -1987,7 +2020,7 @@ def _auto_strength_measure_base_delta(
         )
 
 
-def _auto_strength_compute_base_targets(
+def _auto_strength_analyze_base_targets(
     lora_sd: Dict[str, Any],
     lora_bases: Iterable[str],
     key_map: Dict[str, Any],
@@ -2001,9 +2034,10 @@ def _auto_strength_compute_base_targets(
     ratio_ceiling: float,
     logical_groups: Optional[Dict[str, Tuple[str, float]]] = None,
     verbose: bool = False,
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """
-    Compute per-base target strengths.
+    Compute per-base target strengths and preserve a structured report that matches
+    the loader's real logical-group-aware measurement model.
 
     Invariants:
       - auto-strength must modulate the same *linear delta* that standard LoRA and
@@ -2027,7 +2061,11 @@ def _auto_strength_compute_base_targets(
     base_cohorts: Dict[str, Tuple[str, str]] = {}
     base_norms: Dict[str, float] = {}
     base_logical_ids: Dict[str, str] = {}
+    base_logical_scales: Dict[str, float] = {}
     logical_norms: Dict[Tuple[str, str, str], float] = {}
+    logical_members: Dict[Tuple[str, str, str], List[str]] = {}
+    skipped_zero_strength_members: Dict[Tuple[str, str, str], List[str]] = {}
+    skipped_zero_strength_bases: List[str] = []
     targets: Dict[str, float] = {}
 
     for base in lora_bases:
@@ -2042,8 +2080,6 @@ def _auto_strength_compute_base_targets(
         base_cohorts[base] = cohort
         global_strength = float(strength_model if group == "model" else strength_clip)
         targets[base] = global_strength
-        if abs(global_strength) < _AUTO_STRENGTH_EPS:
-            continue
 
         logical_id = base
         logical_scale = 1.0
@@ -2058,6 +2094,15 @@ def _auto_strength_compute_base_targets(
         if not (logical_scale > _AUTO_STRENGTH_EPS):
             logical_scale = 1.0
         base_logical_ids[base] = logical_id
+        base_logical_scales[base] = logical_scale
+        logical_key = (cohort[0], cohort[1], logical_id)
+
+        if abs(global_strength) < _AUTO_STRENGTH_EPS:
+            skipped_zero_strength_members.setdefault(logical_key, []).append(base)
+            skipped_zero_strength_bases.append(base)
+            continue
+
+        logical_members.setdefault(logical_key, []).append(base)
 
         norm = _auto_strength_measure_base_delta(
             lora_sd=lora_sd,
@@ -2073,7 +2118,6 @@ def _auto_strength_compute_base_targets(
             continue
         base_norms[base] = norm
         logical_norm = float(norm / logical_scale)
-        logical_key = (cohort[0], cohort[1], logical_id)
         logical_norms[logical_key] = logical_norm
         grouped_norms.setdefault(cohort, {}).setdefault(logical_id, []).append(logical_norm)
 
@@ -2104,40 +2148,183 @@ def _auto_strength_compute_base_targets(
         ratio = max(ratio_floor, min(ratio_ceiling, ratio))
         targets[base] = float(global_strength * ratio)
 
+    measured = len(base_norms)
+    total = len(base_groups)
+    analyzable = sum(len(v) for v in logical_members.values())
+    measured_logical = sum(1 for logical_key in logical_members.keys() if logical_norms.get(logical_key, 0.0) > _AUTO_STRENGTH_EPS)
+
+    cohorts_report: List[Dict[str, Any]] = []
+    for cohort in sorted(set(base_cohorts.values())):
+        group, family = cohort
+        cohort_members = [k for k in logical_members.keys() if k[0] == group and k[1] == family]
+        measured_members = [k for k in cohort_members if logical_norms.get(k, 0.0) > _AUTO_STRENGTH_EPS]
+        total_bases = sum(len(logical_members.get(k, [])) for k in cohort_members)
+        measured_bases = sum(sum(1 for base in logical_members.get(k, []) if base in base_norms) for k in cohort_members)
+        skipped_bases = sum(
+            len(skipped_zero_strength_members.get(k, []))
+            for k in skipped_zero_strength_members.keys()
+            if k[0] == group and k[1] == family
+        )
+        cohorts_report.append(
+            {
+                "group": group,
+                "family": family,
+                "mean_norm": _auto_strength_safe_number(group_means.get(cohort)),
+                "logical_count": len(cohort_members),
+                "measured_logical_count": len(measured_members),
+                "base_count": total_bases,
+                "skipped_zero_strength_base_count": skipped_bases,
+                "measured_base_count": measured_bases,
+            }
+        )
+
+    logical_reports: List[Dict[str, Any]] = []
+    for logical_key, members in logical_members.items():
+        group, family, logical_id = logical_key
+        global_strength = float(strength_model if group == "model" else strength_clip)
+        logical_norm = logical_norms.get(logical_key)
+        cohort_mean = group_means.get((group, family))
+        ratio_raw = None
+        ratio_applied = None
+        if logical_norm is not None and cohort_mean is not None and logical_norm > _AUTO_STRENGTH_EPS:
+            ratio_raw = float(cohort_mean / logical_norm)
+            ratio_applied = float(max(ratio_floor, min(ratio_ceiling, ratio_raw)))
+        fallback_to_global = ratio_applied is None
+        target_strength = float(global_strength if fallback_to_global else global_strength * ratio_applied)
+        bases_report = []
+        measured_base_count = 0
+        for base in sorted(members):
+            base_target = float(targets.get(base, global_strength))
+            base_ratio = None
+            if abs(global_strength) > _AUTO_STRENGTH_EPS:
+                base_ratio = float(base_target / global_strength)
+            if base in base_norms:
+                measured_base_count += 1
+            bases_report.append(
+                {
+                    "base": base,
+                    "norm": _auto_strength_safe_number(base_norms.get(base)),
+                    "logical_scale": _auto_strength_safe_number(base_logical_scales.get(base, 1.0)),
+                    "measured": base in base_norms,
+                    "ratio_applied": _auto_strength_safe_number(base_ratio),
+                    "target_strength": base_target,
+                }
+            )
+
+        logical_reports.append(
+            {
+                "group": group,
+                "family": family,
+                "logical_id": logical_id,
+                "fanout": len(members),
+                "measured_base_count": measured_base_count,
+                "mean_norm": _auto_strength_safe_number(logical_norm),
+                "cohort_mean_norm": _auto_strength_safe_number(cohort_mean),
+                "ratio_raw": _auto_strength_safe_number(ratio_raw),
+                "ratio_applied": _auto_strength_safe_number(ratio_applied),
+                "global_strength": global_strength,
+                "target_strength": target_strength,
+                "fallback_to_global": fallback_to_global,
+                "bases": bases_report,
+            }
+        )
+
+    logical_reports.sort(
+        key=lambda item: (
+            -abs((_auto_strength_safe_number(item.get("ratio_applied")) or 1.0) - 1.0),
+            str(item.get("group") or ""),
+            str(item.get("family") or ""),
+            str(item.get("logical_id") or ""),
+        )
+    )
+
+    report = {
+        "schema": 1,
+        "kind": "dora_auto_strength_report",
+        "analysis_device_mode": str(analysis_device_mode),
+        "analysis_load_device": _auto_strength_describe_device(analysis_load_device),
+        "strength_model": float(strength_model),
+        "strength_clip": float(strength_clip),
+        "ratio_floor": ratio_floor,
+        "ratio_ceiling": ratio_ceiling,
+        "mapped_bases": total,
+        "analyzable_bases": analyzable,
+        "measured_bases": measured,
+        "logical_groups_total": len(logical_members),
+        "logical_groups_measured": measured_logical,
+        "logical_groups_skipped_zero_strength": len(skipped_zero_strength_members),
+        "cohorts": cohorts_report,
+        "logical_groups": logical_reports,
+        "skipped_zero_strength_bases": sorted(skipped_zero_strength_bases),
+        "unmeasured_bases": sorted(
+            base for base in base_groups.keys()
+            if base not in base_norms and base not in skipped_zero_strength_bases
+        ),
+    }
+
     if verbose:
-        measured = len(base_norms)
-        measured_logical = sum(1 for v in logical_norms.values() if v > _AUTO_STRENGTH_EPS)
-        total = len(base_groups)
         cohort_summary = {
             f"{group}/{family}": mean
             for (group, family), mean in sorted(group_means.items())
         }
         _LOG.info(
-            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (%s logical groups) (cohort_means=%s ratio_floor=%s ratio_ceiling=%s)",
+            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (%s/%s logical groups) (cohort_means=%s ratio_floor=%s ratio_ceiling=%s)",
             measured,
             total,
             measured_logical,
+            len(logical_members),
             cohort_summary,
             ratio_floor,
             ratio_ceiling,
         )
-        sample = sorted(targets.items())[:20]
-        for base, target in sample:
-            norm = base_norms.get(base)
-            logical_id = base_logical_ids.get(base, base)
+        sample = logical_reports[:20]
+        for item in sample:
             _LOG.info(
-                "[DoRA Power LoRA Loader] auto-strength: base=%s logical=%s group=%s family=%s norm=%s target=%s",
-                base,
-                logical_id,
-                base_groups.get(base),
-                base_families.get(base),
-                norm,
-                target,
+                "[DoRA Power LoRA Loader] auto-strength: logical=%s group=%s family=%s fanout=%s mean_norm=%s cohort_mean=%s ratio=%s target=%s",
+                item.get("logical_id"),
+                item.get("group"),
+                item.get("family"),
+                item.get("fanout"),
+                item.get("mean_norm"),
+                item.get("cohort_mean_norm"),
+                item.get("ratio_applied"),
+                item.get("target_strength"),
             )
 
+    return targets, report
+
+
+def _auto_strength_compute_base_targets(
+    lora_sd: Dict[str, Any],
+    lora_bases: Iterable[str],
+    key_map: Dict[str, Any],
+    model_state_dict: Optional[Dict[str, Any]],
+    clip_state_dict: Optional[Dict[str, Any]],
+    analysis_device_mode: str,
+    analysis_load_device: Any,
+    strength_model: float,
+    strength_clip: float,
+    ratio_floor: float,
+    ratio_ceiling: float,
+    logical_groups: Optional[Dict[str, Tuple[str, float]]] = None,
+    verbose: bool = False,
+) -> Dict[str, float]:
+    targets, _ = _auto_strength_analyze_base_targets(
+        lora_sd=lora_sd,
+        lora_bases=lora_bases,
+        key_map=key_map,
+        model_state_dict=model_state_dict,
+        clip_state_dict=clip_state_dict,
+        analysis_device_mode=analysis_device_mode,
+        analysis_load_device=analysis_load_device,
+        strength_model=strength_model,
+        strength_clip=strength_clip,
+        ratio_floor=ratio_floor,
+        ratio_ceiling=ratio_ceiling,
+        logical_groups=logical_groups,
+        verbose=verbose,
+    )
     return targets
-
-
 def _auto_strength_targets_to_ratios(
     base_strengths: Dict[str, float],
     key_map: Dict[str, Any],
@@ -2788,6 +2975,105 @@ def _parse_lora_stack_kwargs(kwargs: Dict[str, Any]) -> List[Dict[str, Any]]:
     return entries
 
 
+
+def _auto_strength_report_line_for_group(item: Dict[str, Any]) -> str:
+    logical_id = str(item.get("logical_id") or "?")
+    fanout = int(item.get("fanout") or 0)
+    ratio = _auto_strength_safe_number(item.get("ratio_applied"))
+    target = _auto_strength_safe_number(item.get("target_strength"))
+    mean_norm = _auto_strength_safe_number(item.get("mean_norm"))
+    cohort_mean = _auto_strength_safe_number(item.get("cohort_mean_norm"))
+    if ratio is None:
+        ratio_text = "global"
+    else:
+        ratio_text = f"{ratio:.3f}x"
+    target_text = "?" if target is None else f"{target:.4f}"
+    norm_text = "?" if mean_norm is None else f"{mean_norm:.6g}"
+    cohort_text = "?" if cohort_mean is None else f"{cohort_mean:.6g}"
+    return (
+        f"    - {item.get('group')}/{item.get('family')} :: {logical_id} "
+        f"(fanout={fanout}, ratio={ratio_text}, target={target_text}, norm={norm_text}, cohort={cohort_text})"
+    )
+
+
+def _build_auto_strength_row_text_report(row: Dict[str, Any]) -> str:
+    idx = int(row.get("row_index", 0)) + 1
+    lora_name = str(row.get("lora_name") or "None")
+    status = str(row.get("status") or "unknown")
+    lines = [f"[{idx}] {lora_name}", f"  Status           : {status}"]
+    if row.get("status_detail"):
+        lines.append(f"  Detail           : {row.get('status_detail')}")
+    lines.append(f"  Strength model   : {float(row.get('strength_model', 0.0)):.4f}")
+    lines.append(f"  Strength clip    : {float(row.get('strength_clip', 0.0)):.4f}")
+
+    report = row.get("report") if isinstance(row.get("report"), dict) else None
+    if report is None:
+        return "\n".join(lines)
+
+    lines.extend(
+        [
+            f"  Analysis device  : {report.get('analysis_device_mode')} (load_device={report.get('analysis_load_device')})",
+            f"  Ratio window     : {float(report.get('ratio_floor', 0.0)):.4f} .. {float(report.get('ratio_ceiling', 0.0)):.4f}",
+            f"  Bases            : mapped={int(report.get('mapped_bases', 0))} analyzable={int(report.get('analyzable_bases', 0))} measured={int(report.get('measured_bases', 0))}",
+            f"  Logical groups   : total={int(report.get('logical_groups_total', 0))} measured={int(report.get('logical_groups_measured', 0))} skipped_zero_strength={int(report.get('logical_groups_skipped_zero_strength', 0))}",
+            "  Cohorts:",
+        ]
+    )
+    cohorts = report.get("cohorts") if isinstance(report.get("cohorts"), list) else []
+    if cohorts:
+        for cohort in cohorts:
+            mean_norm = _auto_strength_safe_number(cohort.get("mean_norm"))
+            mean_text = "?" if mean_norm is None else f"{mean_norm:.6g}"
+            lines.append(
+                "    - {group}/{family}: mean={mean} logical={logical} measured_logical={measured_logical} bases={bases} measured_bases={measured_bases} skipped_zero_strength_bases={skipped}".format(
+                    group=cohort.get("group"),
+                    family=cohort.get("family"),
+                    mean=mean_text,
+                    logical=int(cohort.get("logical_count", 0)),
+                    measured_logical=int(cohort.get("measured_logical_count", 0)),
+                    bases=int(cohort.get("base_count", 0)),
+                    measured_bases=int(cohort.get("measured_base_count", 0)),
+                    skipped=int(cohort.get("skipped_zero_strength_base_count", 0)),
+                )
+            )
+    else:
+        lines.append("    - none")
+
+    logical_groups = report.get("logical_groups") if isinstance(report.get("logical_groups"), list) else []
+    lines.append("  Largest ratio deviations:")
+    if logical_groups:
+        for item in logical_groups[:12]:
+            lines.append(_auto_strength_report_line_for_group(item))
+        remaining = len(logical_groups) - min(12, len(logical_groups))
+        if remaining > 0:
+            lines.append(f"    - ... {remaining} more logical groups in JSON report")
+    else:
+        lines.append("    - none")
+
+    return "\n".join(lines)
+
+
+def _build_auto_strength_stack_text_report(stack_report: Dict[str, Any]) -> str:
+    rows = stack_report.get("rows") if isinstance(stack_report.get("rows"), list) else []
+    analyzed = sum(1 for row in rows if row.get("status") == "analyzed" and isinstance(row.get("report"), dict))
+    lines = [
+        "DoRA Power LoRA Loader — auto-strength analysis report",
+        f"Node auto-strength enabled : {bool(stack_report.get('auto_strength_enabled', False))}",
+        f"Requested device           : {stack_report.get('auto_strength_device', 'auto')}",
+        f"Ratio window              : {float(stack_report.get('ratio_floor', 0.0)):.4f} .. {float(stack_report.get('ratio_ceiling', 0.0)):.4f}",
+        f"Rows total/analyzed       : {len(rows)}/{analyzed}",
+    ]
+    if not rows:
+        lines.append("No active LoRA rows were processed.")
+        return "\n".join(lines)
+
+    lines.append("")
+    for idx, row in enumerate(rows):
+        if idx > 0:
+            lines.append("-" * 88)
+        lines.append(_build_auto_strength_row_text_report(row))
+    return "\n".join(lines)
+
 class DoraPowerLoraLoader:
     """
     Power LoRA Loader-style stack + DoRA/Flux2 key-fix loader.
@@ -2832,8 +3118,8 @@ class DoraPowerLoraLoader:
             "hidden": {},
         }
 
-    RETURN_TYPES = ("MODEL", "CLIP")
-    RETURN_NAMES = ("MODEL", "CLIP")
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "STRING")
+    RETURN_NAMES = ("MODEL", "CLIP", "auto_strength_report_json", "analysis_report")
     FUNCTION = "load_loras"
     CATEGORY = "loaders"
 
@@ -2863,6 +3149,7 @@ class DoraPowerLoraLoader:
         auto_strength_ratio_floor: float,
         auto_strength_ratio_ceiling: float,
     ):
+        auto_strength_report: Optional[Dict[str, Any]] = None
         lora_path = folder_paths.get_full_path("loras", lora_name)
         if not lora_path:
             raise FileNotFoundError(f"LoRA not found: {lora_name}")
@@ -3013,7 +3300,7 @@ class DoraPowerLoraLoader:
         _log_lora_direction_stats(lora_name + " (post-fix)", lora_sd, verbose=verbose)
 
         if auto_strength_enabled and (abs(float(strength_model)) > _AUTO_STRENGTH_EPS or abs(float(strength_clip)) > _AUTO_STRENGTH_EPS):
-            base_strengths = _auto_strength_compute_base_targets(
+            base_strengths, auto_strength_report = _auto_strength_analyze_base_targets(
                 lora_sd=lora_sd,
                 lora_bases=lora_bases,
                 key_map=key_map,
@@ -3089,7 +3376,7 @@ class DoraPowerLoraLoader:
             if isinstance(applied_c, list) and applied_c:
                 _LOG.info("[DoRA Power LoRA Loader] %s: sample applied(clip) keys: %s", lora_name, applied_c[:10])
 
-        return model, clip
+        return model, clip, auto_strength_report
 
     def load_loras(self, model, clip, **kwargs):
         # Global controls (provided by JS UI; also safe if absent)
@@ -3138,12 +3425,48 @@ class DoraPowerLoraLoader:
             adaln_swap_fix=dora_adaln_swap_fix,
         )
 
+        report_rows: List[Dict[str, Any]] = []
+
         if not stack_enabled:
-            return (model, clip)
+            stack_report = {
+                "schema": 1,
+                "kind": "dora_power_lora_auto_strength_stack_report",
+                "auto_strength_enabled": auto_strength_enabled,
+                "auto_strength_device": auto_strength_device,
+                "ratio_floor": auto_strength_ratio_floor,
+                "ratio_ceiling": auto_strength_ratio_ceiling,
+                "rows": report_rows,
+            }
+            report_json = _auto_strength_json_dumps(stack_report, pretty=True)
+            report_text = _build_auto_strength_stack_text_report(stack_report)
+            return {
+                "result": (model, clip, report_json, report_text),
+                "ui": {
+                    "auto_strength_report_json": (report_json,),
+                    "analysis_report": (report_text,),
+                },
+            }
 
         entries = _parse_lora_stack_kwargs(kwargs)
         if not entries:
-            return (model, clip)
+            stack_report = {
+                "schema": 1,
+                "kind": "dora_power_lora_auto_strength_stack_report",
+                "auto_strength_enabled": auto_strength_enabled,
+                "auto_strength_device": auto_strength_device,
+                "ratio_floor": auto_strength_ratio_floor,
+                "ratio_ceiling": auto_strength_ratio_ceiling,
+                "rows": report_rows,
+            }
+            report_json = _auto_strength_json_dumps(stack_report, pretty=True)
+            report_text = _build_auto_strength_stack_text_report(stack_report)
+            return {
+                "result": (model, clip, report_json, report_text),
+                "ui": {
+                    "auto_strength_report_json": (report_json,),
+                    "analysis_report": (report_text,),
+                },
+            }
 
         # Clone once, then apply multiple loras onto the same patched instances.
         new_model = model.clone() if model is not None else None
@@ -3173,17 +3496,48 @@ class DoraPowerLoraLoader:
                     "[DoRA Power LoRA Loader] auto-strength: requested analysis device 'gpu' but no usable accelerator load_device was found; falling back to cpu"
                 )
 
-        for e in entries:
+        for row_index, e in enumerate(entries):
             lora_name = e.get("lora")
+            row_info: Dict[str, Any] = {
+                "row_index": row_index,
+                "enabled": bool(e.get("on", True)),
+                "lora_name": str(lora_name or "None"),
+            }
             if not lora_name or lora_name in ("None", "NONE"):
+                row_info.update({
+                    "status": "empty",
+                    "status_detail": "No LoRA selected.",
+                    "strength_model": 0.0,
+                    "strength_clip": 0.0,
+                })
+                report_rows.append(row_info)
                 continue
             if not e.get("on", True):
+                sm_disabled = float(e.get("strength_model", 0.0))
+                sc_disabled = float(e.get("strength_clip", sm_disabled))
+                row_info.update({
+                    "status": "disabled_row",
+                    "status_detail": "Row toggle is off.",
+                    "strength_model": sm_disabled,
+                    "strength_clip": sc_disabled,
+                })
+                report_rows.append(row_info)
                 continue
             sm = float(e.get("strength_model", 0.0))
             sc = float(e.get("strength_clip", sm))
-            if sm == 0.0 and sc == 0.0:
+            row_info.update({
+                "strength_model": sm,
+                "strength_clip": sc,
+            })
+            if abs(sm) <= _AUTO_STRENGTH_EPS and abs(sc) <= _AUTO_STRENGTH_EPS:
+                row_info.update({
+                    "status": "zero_strength",
+                    "status_detail": "Both model and clip strengths are zero or below analysis epsilon.",
+                })
+                report_rows.append(row_info)
                 continue
-            new_model, new_clip = self._load_one(
+
+            new_model, new_clip, auto_strength_report = self._load_one(
                 new_model,
                 new_clip,
                 lora_name=lora_name,
@@ -3208,5 +3562,41 @@ class DoraPowerLoraLoader:
                 auto_strength_ratio_floor=auto_strength_ratio_floor,
                 auto_strength_ratio_ceiling=auto_strength_ratio_ceiling,
             )
+            did_analyze = isinstance(auto_strength_report, dict)
+            if did_analyze:
+                status = "analyzed"
+                detail = "Auto-strength report generated."
+            elif auto_strength_enabled:
+                status = "auto_strength_skipped"
+                detail = "Auto-strength was enabled, but no analysis report was generated."
+            else:
+                status = "applied_without_auto_strength"
+                detail = "LoRA applied without auto-strength analysis."
 
-        return (new_model, new_clip)
+            row_info.update(
+                {
+                    "status": status,
+                    "status_detail": detail,
+                    "report": auto_strength_report if did_analyze else None,
+                }
+            )
+            report_rows.append(row_info)
+
+        stack_report = {
+            "schema": 1,
+            "kind": "dora_power_lora_auto_strength_stack_report",
+            "auto_strength_enabled": auto_strength_enabled,
+            "auto_strength_device": auto_strength_device,
+            "ratio_floor": auto_strength_ratio_floor,
+            "ratio_ceiling": auto_strength_ratio_ceiling,
+            "rows": report_rows,
+        }
+        report_json = _auto_strength_json_dumps(stack_report, pretty=True)
+        report_text = _build_auto_strength_stack_text_report(stack_report)
+        return {
+            "result": (new_model, new_clip, report_json, report_text),
+            "ui": {
+                "auto_strength_report_json": (report_json,),
+                "analysis_report": (report_text,),
+            },
+        }
