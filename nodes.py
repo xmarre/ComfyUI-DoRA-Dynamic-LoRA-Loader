@@ -1738,6 +1738,25 @@ def _auto_strength_tensor_rms(tensor: torch.Tensor, analysis_device: Optional[to
         return None
 
 
+def _auto_strength_slice_destination_weight(weight: Any, sl: Optional[Tuple[int, int, int]]) -> Optional[torch.Tensor]:
+    if not isinstance(weight, torch.Tensor):
+        return None
+    if sl is None:
+        return weight
+
+    try:
+        dim, start, length = int(sl[0]), int(sl[1]), int(sl[2])
+        if length <= 0:
+            return None
+        if dim < 0 or dim >= weight.ndim:
+            return None
+        if start < 0 or (start + length) > int(weight.shape[dim]):
+            return None
+        return weight.narrow(dim, start, length)
+    except Exception:
+        return None
+
+
 def _auto_strength_get_destination_weight(
     base: str,
     key_map: Dict[str, Any],
@@ -1753,23 +1772,51 @@ def _auto_strength_get_destination_weight(
         weight = model_state_dict.get(dest)
     if weight is None and clip_state_dict is not None:
         weight = clip_state_dict.get(dest)
-    if not isinstance(weight, torch.Tensor):
+    return _auto_strength_slice_destination_weight(weight, sl)
+
+
+def _auto_strength_get_effective_destination_weight(
+    base: str,
+    key_map: Dict[str, Any],
+    model_state_dict: Optional[Dict[str, Any]],
+    clip_state_dict: Optional[Dict[str, Any]],
+    current_model: Any = None,
+    current_clip: Any = None,
+    analysis_device: Optional[torch.device] = None,
+) -> Optional[torch.Tensor]:
+    """
+    Return the destination weight currently seen by this loader invocation.
+
+    Invariant: stacked DoRA auto-strength must measure against the actual destination
+    weight that the current row will modify. Later rows on the same branch therefore
+    need to see earlier rows already present in the patcher, not just the pristine
+    state_dict snapshot captured before the row loop.
+    """
+    dest, sl = _unwrap_key_map_target(key_map.get(base))
+    if not dest:
         return None
 
-    if sl is None:
-        return weight
+    patcher = None
+    if model_state_dict is not None and dest in model_state_dict:
+        if hasattr(current_model, "patch_weight_to_device"):
+            patcher = current_model
+    elif clip_state_dict is not None and dest in clip_state_dict:
+        clip_patcher = getattr(current_clip, "patcher", None)
+        if hasattr(clip_patcher, "patch_weight_to_device"):
+            patcher = clip_patcher
 
-    try:
-        dim, start, length = int(sl[0]), int(sl[1]), int(sl[2])
-        if length <= 0:
-            return None
-        if dim < 0 or dim >= weight.ndim:
-            return None
-        if start < 0 or (start + length) > int(weight.shape[dim]):
-            return None
-        return weight.narrow(dim, start, length)
-    except Exception:
-        return None
+    if patcher is not None:
+        try:
+            patches = getattr(patcher, "patches", None)
+            if isinstance(patches, dict) and dest in patches:
+                weight = patcher.patch_weight_to_device(dest, device_to=analysis_device, return_weight=True)
+                sliced = _auto_strength_slice_destination_weight(weight, sl)
+                if isinstance(sliced, torch.Tensor):
+                    return sliced
+        except Exception:
+            pass
+
+    return _auto_strength_get_destination_weight(base, key_map, model_state_dict, clip_state_dict)
 
 
 def _auto_strength_destination_family(weight: Optional[torch.Tensor]) -> str:
@@ -1874,6 +1921,8 @@ def _auto_strength_measure_base_delta_on_device(
     model_state_dict: Optional[Dict[str, Any]],
     clip_state_dict: Optional[Dict[str, Any]],
     analysis_device: Optional[torch.device],
+    current_model: Any = None,
+    current_clip: Any = None,
 ) -> Optional[float]:
     """
     Return a comparable magnitude score for a single base's update.
@@ -1892,9 +1941,19 @@ def _auto_strength_measure_base_delta_on_device(
     """
     prefix = base + "."
     direct_norms: List[float] = []
-    dest_weight = _auto_strength_get_destination_weight(base, key_map, model_state_dict, clip_state_dict)
     dora_scale = lora_sd.get(base + ".dora_scale")
     has_dora = isinstance(dora_scale, torch.Tensor)
+    dest_weight = None
+    if has_dora:
+        dest_weight = _auto_strength_get_effective_destination_weight(
+            base,
+            key_map,
+            model_state_dict,
+            clip_state_dict,
+            current_model=current_model,
+            current_clip=current_clip,
+            analysis_device=analysis_device,
+        )
 
     for suffix in (".diff", ".diff_b", ".set_weight", ".reshape_weight"):
         key = base + suffix
@@ -1990,6 +2049,8 @@ def _auto_strength_measure_base_delta(
     analysis_device_mode: str = "auto",
     analysis_load_device: Any = None,
     verbose: bool = False,
+    current_model: Any = None,
+    current_clip: Any = None,
 ) -> Optional[float]:
     dest_weight = _auto_strength_get_destination_weight(base, key_map, model_state_dict, clip_state_dict)
     analysis_device = _auto_strength_resolve_analysis_device(analysis_device_mode, analysis_load_device, dest_weight)
@@ -2001,6 +2062,8 @@ def _auto_strength_measure_base_delta(
             model_state_dict=model_state_dict,
             clip_state_dict=clip_state_dict,
             analysis_device=analysis_device,
+            current_model=current_model,
+            current_clip=current_clip,
         )
     except _AutoStrengthAnalysisDeviceError:
         if analysis_device is None or analysis_device.type == "cpu":
@@ -2018,6 +2081,8 @@ def _auto_strength_measure_base_delta(
             model_state_dict=model_state_dict,
             clip_state_dict=clip_state_dict,
             analysis_device=torch.device("cpu"),
+            current_model=current_model,
+            current_clip=current_clip,
         )
 
 
@@ -2035,6 +2100,8 @@ def _auto_strength_analyze_base_targets(
     ratio_ceiling: float,
     logical_groups: Optional[Dict[str, Tuple[str, float]]] = None,
     verbose: bool = False,
+    current_model: Any = None,
+    current_clip: Any = None,
 ) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """
     Compute per-base target strengths and preserve a structured report that matches
@@ -2114,6 +2181,8 @@ def _auto_strength_analyze_base_targets(
             analysis_device_mode=analysis_device_mode,
             analysis_load_device=analysis_load_device,
             verbose=verbose,
+            current_model=current_model,
+            current_clip=current_clip,
         )
         if norm is None or not (norm > _AUTO_STRENGTH_EPS):
             continue
@@ -2309,6 +2378,8 @@ def _auto_strength_compute_base_targets(
     ratio_ceiling: float,
     logical_groups: Optional[Dict[str, Tuple[str, float]]] = None,
     verbose: bool = False,
+    current_model: Any = None,
+    current_clip: Any = None,
 ) -> Dict[str, float]:
     targets, _ = _auto_strength_analyze_base_targets(
         lora_sd=lora_sd,
@@ -2324,6 +2395,8 @@ def _auto_strength_compute_base_targets(
         ratio_ceiling=ratio_ceiling,
         logical_groups=logical_groups,
         verbose=verbose,
+        current_model=current_model,
+        current_clip=current_clip,
     )
     return targets
 def _auto_strength_targets_to_ratios(
@@ -3376,6 +3449,8 @@ class DoraPowerLoraLoader:
                 ratio_ceiling=auto_strength_ratio_ceiling,
                 logical_groups=auto_strength_logical_groups,
                 verbose=verbose,
+                current_model=model,
+                current_clip=clip,
             )
             base_ratios = _auto_strength_targets_to_ratios(
                 base_strengths=base_strengths,
