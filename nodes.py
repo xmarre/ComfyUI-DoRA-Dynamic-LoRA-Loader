@@ -3255,6 +3255,7 @@ class DoraPowerLoraLoader:
 
     RETURN_TYPES = ("MODEL", "CLIP", "STRING", "STRING")
     RETURN_NAMES = ("MODEL", "CLIP", "auto_strength_report_json", "analysis_report")
+    HAS_INTERMEDIATE_OUTPUT = True
     FUNCTION = "load_loras"
     CATEGORY = "loaders"
 
