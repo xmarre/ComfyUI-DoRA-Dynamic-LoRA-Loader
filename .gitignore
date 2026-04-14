@@ -4,3 +4,4 @@
 *.VC.opendb
 __pycache__/
 *.pyc
+.codex
