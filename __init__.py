@@ -1,4 +1,4 @@
-from .nodes import DoraPowerLoraLoader
+from .nodes import DoraPowerLoraLoader, DoraStateManager
 
 # Backend API for frontend LoRA dropdown (avoids relying on /object_info variants).
 import folder_paths
@@ -17,8 +17,10 @@ WEB_DIRECTORY = "./web"
 
 NODE_CLASS_MAPPINGS = {
     "DoRA Power LoRA Loader": DoraPowerLoraLoader,
+    "DoRA State Manager": DoraStateManager,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DoRA Power LoRA Loader": "DoRA Power LoRA Loader",
+    "DoRA State Manager": "DoRA State Manager",
 }

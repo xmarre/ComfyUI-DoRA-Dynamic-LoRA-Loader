@@ -500,3 +500,44 @@ This repo is meant for cases where plain ComfyUI LoRA loading is not enough, esp
 - OneTrainer DoRA exports
 - Diffusers / PEFT DoRA exports
 - Z-Image Turbo / Lumina2 attention-format LoRAs
+
+---
+
+## DoRA State Manager
+
+This build adds a **DoRA State Manager** node for workflow-serialized character states.
+
+Use it to save:
+
+- character / LoRA combinations
+- per-character loader settings such as auto-strength and DoRA compatibility toggles
+- multiple positive / negative prompt presets per character
+- arbitrary JSON settings for future downstream nodes
+
+### Basic wiring
+
+1. Add **DoRA State Manager**.
+2. Add **DoRA Power LoRA Loader**.
+3. Connect `dora_state` from the manager to the loader's optional `dora_state` input.
+4. Connect `positive_prompt` / `negative_prompt` outputs to your text encode path as needed.
+
+When `dora_state` is connected, the loader uses the selected character's saved LoRA stack. If it is not connected, the loader keeps its normal local row-widget behavior.
+
+### Outputs
+
+- `dora_state` — typed `DORA_STATE` payload for **DoRA Power LoRA Loader**
+- `positive_prompt` — selected prompt preset's positive text
+- `negative_prompt` — selected prompt preset's negative text
+- `settings_json` — selected prompt preset's arbitrary settings object serialized as JSON
+
+### Persistence and payload behavior
+
+The manager state is stored in the workflow through hidden backend widgets:
+
+- `state_json`
+- `selected_character_id`
+- `selected_prompt_id`
+
+No external preset database is required for this first version.
+
+The `DORA_STATE` payload contains the selected character identity, selected prompt identity, saved LoRA rows, saved loader-global overrides, prompt text, and prompt settings. The loader accepts only this typed payload shape; invalid or missing `dora_state` data falls back to the loader's existing local row-widget parsing.

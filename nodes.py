@@ -429,6 +429,351 @@ class FlexibleOptionalInputType(dict):
         return self._fallback_type
 
 
+
+# --------------------------------------------------------------------------------------
+# DoRA state manager payload helpers
+# --------------------------------------------------------------------------------------
+
+_DORA_STATE_MANAGER_SCHEMA_VERSION = 1
+_DORA_STATE_KIND = "dora_state_manager_state"
+_DORA_STATE_LOADER_GLOBAL_KEYS: Set[str] = {
+    "stack_enabled",
+    "verbose",
+    "log_unloaded_keys",
+    "broadcast_auto_scale",
+    "broadcast_modulations",
+    "broadcast_include_dora_scale",
+    "broadcast_scale",
+    "dora_decompose_debug",
+    "dora_decompose_debug_n",
+    "dora_decompose_debug_stack_depth",
+    "dora_slice_fix",
+    "dora_adaln_swap_fix",
+    "zimage_lumina2_compat",
+    "auto_strength_enabled",
+    "auto_strength_device",
+    "auto_strength_ratio_floor",
+    "auto_strength_ratio_ceiling",
+}
+
+
+def _state_manager_make_id(prefix: str, index: int) -> str:
+    return f"{prefix}_{index + 1}"
+
+
+def _state_manager_default_state() -> Dict[str, Any]:
+    return {
+        "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
+        "characters": [
+            {
+                "id": "default_character",
+                "name": "Default Character",
+                "loras": [],
+                "loader_globals": {},
+                "prompts": [
+                    {
+                        "id": "default_prompt",
+                        "name": "Default Prompt",
+                        "positive": "",
+                        "negative": "",
+                        "settings": {},
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _safe_json_load(raw: Any, fallback: Any) -> Any:
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return fallback
+        try:
+            return json.loads(text)
+        except Exception:
+            return fallback
+    if isinstance(raw, dict):
+        return raw
+    return fallback
+
+
+def _clean_state_id(value: Any, fallback: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    text = re.sub(r"[^A-Za-z0-9_.:-]+", "_", text).strip("_")
+    return text or fallback
+
+
+def _state_manager_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+        return default
+    return bool(value)
+
+
+def _normalize_manager_lora_row(row: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(row, dict):
+        return None
+    name = str(row.get("name", row.get("lora", row.get("lora_name", "None"))) or "None").strip()
+    if not name:
+        name = "None"
+    try:
+        strength_model = float(row.get("strength_model", row.get("strengthModel", row.get("strength", 1.0))))
+    except Exception:
+        strength_model = 1.0
+    try:
+        strength_clip = float(row.get("strength_clip", row.get("strengthClip", row.get("strengthTwo", strength_model))))
+    except Exception:
+        strength_clip = strength_model
+    return {
+        "enabled": _state_manager_bool(row.get("enabled", row.get("on", True)), default=True),
+        "name": name,
+        "strength_model": strength_model,
+        "strength_clip": strength_clip,
+    }
+
+
+def _normalize_manager_settings(settings: Any) -> Dict[str, Any]:
+    if isinstance(settings, dict):
+        return settings
+    parsed = _safe_json_load(settings, {})
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _normalize_manager_loader_globals(globals_in: Any) -> Dict[str, Any]:
+    if not isinstance(globals_in, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key in _DORA_STATE_LOADER_GLOBAL_KEYS:
+        if key not in globals_in:
+            continue
+        value = globals_in.get(key)
+        if key in {
+            "stack_enabled",
+            "verbose",
+            "log_unloaded_keys",
+            "broadcast_auto_scale",
+            "broadcast_modulations",
+            "broadcast_include_dora_scale",
+            "dora_decompose_debug",
+            "dora_slice_fix",
+            "dora_adaln_swap_fix",
+            "zimage_lumina2_compat",
+            "auto_strength_enabled",
+        }:
+            out[key] = _state_manager_bool(value)
+        elif key in {"dora_decompose_debug_n", "dora_decompose_debug_stack_depth"}:
+            try:
+                out[key] = int(value)
+            except Exception:
+                continue
+        elif key == "auto_strength_device":
+            out[key] = _normalize_auto_strength_device(value)
+        else:
+            try:
+                out[key] = float(value)
+            except Exception:
+                continue
+    return out
+
+
+def _normalize_manager_prompt(prompt: Any, index: int) -> Optional[Dict[str, Any]]:
+    if not isinstance(prompt, dict):
+        return None
+    prompt_id = _clean_state_id(prompt.get("id"), _state_manager_make_id("prompt", index))
+    name = str(prompt.get("name") or f"Prompt {index + 1}").strip() or f"Prompt {index + 1}"
+    settings = _normalize_manager_settings(prompt.get("settings", {}))
+    return {
+        "id": prompt_id,
+        "name": name,
+        "positive": str(prompt.get("positive", prompt.get("positive_prompt", "")) or ""),
+        "negative": str(prompt.get("negative", prompt.get("negative_prompt", "")) or ""),
+        "settings": settings,
+    }
+
+
+def _normalize_state_manager_state(raw: Any) -> Dict[str, Any]:
+    parsed = _safe_json_load(raw, _state_manager_default_state())
+    if not isinstance(parsed, dict):
+        parsed = _state_manager_default_state()
+
+    characters_in = parsed.get("characters")
+    if not isinstance(characters_in, list):
+        characters_in = []
+
+    characters: List[Dict[str, Any]] = []
+    used_ids: Set[str] = set()
+    for char_index, char in enumerate(characters_in):
+        if not isinstance(char, dict):
+            continue
+        base_id = _clean_state_id(char.get("id"), _state_manager_make_id("character", char_index))
+        char_id = base_id
+        suffix = 2
+        while char_id in used_ids:
+            char_id = f"{base_id}_{suffix}"
+            suffix += 1
+        used_ids.add(char_id)
+
+        name = str(char.get("name") or f"Character {char_index + 1}").strip() or f"Character {char_index + 1}"
+        loras_in = char.get("loras")
+        loras = []
+        if isinstance(loras_in, list):
+            for row in loras_in:
+                normalized = _normalize_manager_lora_row(row)
+                if normalized is not None:
+                    loras.append(normalized)
+
+        prompts_in = char.get("prompts")
+        prompts: List[Dict[str, Any]] = []
+        if isinstance(prompts_in, list):
+            used_prompt_ids: Set[str] = set()
+            for prompt_index, prompt in enumerate(prompts_in):
+                normalized_prompt = _normalize_manager_prompt(prompt, prompt_index)
+                if normalized_prompt is None:
+                    continue
+                prompt_base_id = normalized_prompt["id"]
+                prompt_id = prompt_base_id
+                prompt_suffix = 2
+                while prompt_id in used_prompt_ids:
+                    prompt_id = f"{prompt_base_id}_{prompt_suffix}"
+                    prompt_suffix += 1
+                used_prompt_ids.add(prompt_id)
+                normalized_prompt["id"] = prompt_id
+                prompts.append(normalized_prompt)
+        if not prompts:
+            prompts = _state_manager_default_state()["characters"][0]["prompts"]
+
+        characters.append(
+            {
+                "id": char_id,
+                "name": name,
+                "loras": loras,
+                "loader_globals": _normalize_manager_loader_globals(char.get("loader_globals", char.get("globals", {}))),
+                "prompts": prompts,
+            }
+        )
+
+    if not characters:
+        characters = _state_manager_default_state()["characters"]
+
+    return {
+        "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
+        "characters": characters,
+    }
+
+
+def _pick_state_manager_character(state: Dict[str, Any], selected_character_id: Any) -> Dict[str, Any]:
+    selected = str(selected_character_id or "").strip()
+    characters = state.get("characters") if isinstance(state.get("characters"), list) else []
+    for char in characters:
+        if isinstance(char, dict) and char.get("id") == selected:
+            return char
+    return characters[0]
+
+
+def _pick_state_manager_prompt(character: Dict[str, Any], selected_prompt_id: Any) -> Dict[str, Any]:
+    selected = str(selected_prompt_id or "").strip()
+    prompts = character.get("prompts") if isinstance(character.get("prompts"), list) else []
+    for prompt in prompts:
+        if isinstance(prompt, dict) and prompt.get("id") == selected:
+            return prompt
+    return prompts[0] if prompts else _state_manager_default_state()["characters"][0]["prompts"][0]
+
+
+def _resolve_dora_state_payload(state_json: Any, selected_character_id: Any, selected_prompt_id: Any) -> Dict[str, Any]:
+    state = _normalize_state_manager_state(state_json)
+    character = _pick_state_manager_character(state, selected_character_id)
+    prompt = _pick_state_manager_prompt(character, selected_prompt_id)
+    settings = _normalize_manager_settings(prompt.get("settings", {}))
+    return {
+        "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
+        "kind": _DORA_STATE_KIND,
+        "character": {
+            "id": character.get("id", ""),
+            "name": character.get("name", ""),
+        },
+        "prompt": {
+            "id": prompt.get("id", ""),
+            "name": prompt.get("name", ""),
+        },
+        "loras": character.get("loras", []),
+        "loader_globals": character.get("loader_globals", {}),
+        "settings": settings,
+        "positive_prompt": str(prompt.get("positive", "") or ""),
+        "negative_prompt": str(prompt.get("negative", "") or ""),
+    }
+
+
+def _normalize_runtime_dora_state_payload(raw: Any) -> Optional[Dict[str, Any]]:
+    payload = _safe_json_load(raw, None)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("kind") != _DORA_STATE_KIND:
+        return None
+    rows_in = payload.get("loras")
+    if not isinstance(rows_in, list):
+        return None
+    loras = []
+    for row in rows_in:
+        normalized = _normalize_manager_lora_row(row)
+        if normalized is not None:
+            loras.append(normalized)
+    globals_out = _normalize_manager_loader_globals(payload.get("loader_globals", payload.get("globals", {})))
+    return {
+        "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
+        "kind": _DORA_STATE_KIND,
+        "character": payload.get("character") if isinstance(payload.get("character"), dict) else {},
+        "prompt": payload.get("prompt") if isinstance(payload.get("prompt"), dict) else {},
+        "loras": loras,
+        "loader_globals": globals_out,
+        "settings": _normalize_manager_settings(payload.get("settings", {})),
+        "positive_prompt": str(payload.get("positive_prompt", "") or ""),
+        "negative_prompt": str(payload.get("negative_prompt", "") or ""),
+    }
+
+
+def _parse_dora_state_lora_entries(state_payload: Optional[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    if not isinstance(state_payload, dict):
+        return None
+    rows = state_payload.get("loras")
+    if not isinstance(rows, list):
+        return None
+    entries: List[Dict[str, Any]] = []
+    for row in rows:
+        normalized = _normalize_manager_lora_row(row)
+        if normalized is None:
+            continue
+        name = normalized.get("name", "None")
+        if name in ("", "None", "NONE"):
+            continue
+        entries.append(
+            {
+                "on": bool(normalized.get("enabled", True)),
+                "lora": name,
+                "strength_model": float(normalized.get("strength_model", 1.0)),
+                "strength_clip": float(normalized.get("strength_clip", normalized.get("strength_model", 1.0))),
+            }
+        )
+    return entries
+
+
+def _state_payload_get_loader_global(state_payload: Optional[Dict[str, Any]], key: str, fallback: Any) -> Any:
+    if isinstance(state_payload, dict):
+        globals_in = state_payload.get("loader_globals")
+        if isinstance(globals_in, dict) and key in globals_in:
+            return globals_in[key]
+    return fallback
+
 _LORA_MAGNITUDE_VECTOR_RE = re.compile(
     r"^(?P<base>.+?)\.lora_magnitude_vector(?:\.(?P<adapter>[A-Za-z0-9_-]+))?(?:\.weight)?$"
 )
@@ -3209,6 +3554,68 @@ def _build_auto_strength_stack_text_report(stack_report: Dict[str, Any]) -> str:
         lines.append(_build_auto_strength_row_text_report(row))
     return "\n".join(lines)
 
+
+class DoraStateManager:
+    """
+    Workflow-serialized state manager for character LoRA stacks and prompt/settings presets.
+
+    Output `dora_state` can be connected to DoRA Power LoRA Loader's optional `dora_state`
+    input. When connected, the loader uses the selected character's LoRA stack and any saved
+    loader-global overrides from this manager instead of its local row widgets.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "state_json": (
+                    "STRING",
+                    {
+                        "default": json.dumps(_state_manager_default_state(), separators=(",", ":")),
+                        "multiline": True,
+                    },
+                ),
+                "selected_character_id": ("STRING", {"default": "default_character", "multiline": False}),
+                "selected_prompt_id": ("STRING", {"default": "default_prompt", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("DORA_STATE", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("dora_state", "positive_prompt", "negative_prompt", "settings_json")
+    FUNCTION = "resolve_state"
+    CATEGORY = "state managers"
+
+    @classmethod
+    def IS_CHANGED(cls, state_json: Any, selected_character_id: Any = "", selected_prompt_id: Any = ""):
+        payload = {
+            "state_json": state_json,
+            "selected_character_id": selected_character_id,
+            "selected_prompt_id": selected_prompt_id,
+        }
+        return json.dumps(payload, sort_keys=True, default=str)
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, state_json: Any, selected_character_id: Any = "", selected_prompt_id: Any = ""):
+        state = _normalize_state_manager_state(state_json)
+        character = _pick_state_manager_character(state, selected_character_id)
+        prompt = _pick_state_manager_prompt(character, selected_prompt_id)
+        if not character:
+            return "DoRA State Manager: no character states are available."
+        if not prompt:
+            return "DoRA State Manager: no prompt states are available for the selected character."
+        return True
+
+    def resolve_state(self, state_json: Any, selected_character_id: Any = "", selected_prompt_id: Any = ""):
+        payload = _resolve_dora_state_payload(state_json, selected_character_id, selected_prompt_id)
+        settings_json = json.dumps(payload.get("settings", {}), ensure_ascii=False, sort_keys=True, indent=2)
+        return (
+            payload,
+            payload.get("positive_prompt", ""),
+            payload.get("negative_prompt", ""),
+            settings_json,
+        )
+
+
 class DoraPowerLoraLoader:
     """
     Power LoRA Loader-style stack + DoRA/Flux2 key-fix loader.
@@ -3229,6 +3636,10 @@ class DoraPowerLoraLoader:
             "optional": FlexibleOptionalInputType(
                 any_type,
                 data={
+                    # Optional state-manager input. When connected, this overrides local LoRA rows
+                    # and any saved loader-global settings in the manager payload.
+                    "dora_state": ("DORA_STATE",),
+
                     # Flux2 modulation handling
                     "broadcast_modulations": ("BOOLEAN", {"default": True}),
                     "broadcast_include_dora_scale": ("BOOLEAN", {"default": False}),
@@ -3517,39 +3928,41 @@ class DoraPowerLoraLoader:
         return model, clip, auto_strength_report
 
     def load_loras(self, model, clip, **kwargs):
-        # Global controls (provided by JS UI; also safe if absent)
-        stack_enabled = bool(kwargs.get("stack_enabled", True))
-        verbose = bool(kwargs.get("verbose", False))
-        log_unloaded_keys = bool(kwargs.get("log_unloaded_keys", False))
-        broadcast_auto_scale = bool(kwargs.get("broadcast_auto_scale", True))
-        broadcast_modulations = bool(kwargs.get("broadcast_modulations", True))
-        broadcast_include_dora_scale = bool(kwargs.get("broadcast_include_dora_scale", False))
+        state_payload = _normalize_runtime_dora_state_payload(kwargs.get("dora_state"))
+
+        # Global controls (provided by JS UI; optionally overridden by DoRA State Manager)
+        stack_enabled = bool(_state_payload_get_loader_global(state_payload, "stack_enabled", kwargs.get("stack_enabled", True)))
+        verbose = bool(_state_payload_get_loader_global(state_payload, "verbose", kwargs.get("verbose", False)))
+        log_unloaded_keys = bool(_state_payload_get_loader_global(state_payload, "log_unloaded_keys", kwargs.get("log_unloaded_keys", False)))
+        broadcast_auto_scale = bool(_state_payload_get_loader_global(state_payload, "broadcast_auto_scale", kwargs.get("broadcast_auto_scale", True)))
+        broadcast_modulations = bool(_state_payload_get_loader_global(state_payload, "broadcast_modulations", kwargs.get("broadcast_modulations", True)))
+        broadcast_include_dora_scale = bool(_state_payload_get_loader_global(state_payload, "broadcast_include_dora_scale", kwargs.get("broadcast_include_dora_scale", False)))
         try:
-            broadcast_scale = float(kwargs.get("broadcast_scale", 1.0))
+            broadcast_scale = float(_state_payload_get_loader_global(state_payload, "broadcast_scale", kwargs.get("broadcast_scale", 1.0)))
         except Exception:
             broadcast_scale = 1.0
 
-        # DoRA decompose debug controls (node-adjustable)
-        dora_dbg = bool(kwargs.get("dora_decompose_debug", False))
+        # DoRA decompose debug controls (node-adjustable / state-manager overrideable)
+        dora_dbg = bool(_state_payload_get_loader_global(state_payload, "dora_decompose_debug", kwargs.get("dora_decompose_debug", False)))
         try:
-            dora_dbg_n = int(kwargs.get("dora_decompose_debug_n", 30))
+            dora_dbg_n = int(_state_payload_get_loader_global(state_payload, "dora_decompose_debug_n", kwargs.get("dora_decompose_debug_n", 30)))
         except Exception:
             dora_dbg_n = 30
         try:
-            dora_dbg_stack = int(kwargs.get("dora_decompose_debug_stack_depth", 10))
+            dora_dbg_stack = int(_state_payload_get_loader_global(state_payload, "dora_decompose_debug_stack_depth", kwargs.get("dora_decompose_debug_stack_depth", 10)))
         except Exception:
             dora_dbg_stack = 10
-        dora_slice_fix = bool(kwargs.get("dora_slice_fix", True))
-        dora_adaln_swap_fix = bool(kwargs.get("dora_adaln_swap_fix", True))
-        zimage_lumina2_compat = bool(kwargs.get("zimage_lumina2_compat", True))
-        auto_strength_enabled = bool(kwargs.get("auto_strength_enabled", False))
-        auto_strength_device = _normalize_auto_strength_device(kwargs.get("auto_strength_device", "gpu"))
+        dora_slice_fix = bool(_state_payload_get_loader_global(state_payload, "dora_slice_fix", kwargs.get("dora_slice_fix", True)))
+        dora_adaln_swap_fix = bool(_state_payload_get_loader_global(state_payload, "dora_adaln_swap_fix", kwargs.get("dora_adaln_swap_fix", True)))
+        zimage_lumina2_compat = bool(_state_payload_get_loader_global(state_payload, "zimage_lumina2_compat", kwargs.get("zimage_lumina2_compat", True)))
+        auto_strength_enabled = bool(_state_payload_get_loader_global(state_payload, "auto_strength_enabled", kwargs.get("auto_strength_enabled", False)))
+        auto_strength_device = _normalize_auto_strength_device(_state_payload_get_loader_global(state_payload, "auto_strength_device", kwargs.get("auto_strength_device", "gpu")))
         try:
-            auto_strength_ratio_floor = float(kwargs.get("auto_strength_ratio_floor", _AUTO_STRENGTH_RATIO_FLOOR))
+            auto_strength_ratio_floor = float(_state_payload_get_loader_global(state_payload, "auto_strength_ratio_floor", kwargs.get("auto_strength_ratio_floor", _AUTO_STRENGTH_RATIO_FLOOR)))
         except Exception:
             auto_strength_ratio_floor = _AUTO_STRENGTH_RATIO_FLOOR
         try:
-            auto_strength_ratio_ceiling = float(kwargs.get("auto_strength_ratio_ceiling", _AUTO_STRENGTH_RATIO_CEILING))
+            auto_strength_ratio_ceiling = float(_state_payload_get_loader_global(state_payload, "auto_strength_ratio_ceiling", kwargs.get("auto_strength_ratio_ceiling", _AUTO_STRENGTH_RATIO_CEILING)))
         except Exception:
             auto_strength_ratio_ceiling = _AUTO_STRENGTH_RATIO_CEILING
         if auto_strength_ratio_ceiling < auto_strength_ratio_floor:
@@ -3585,7 +3998,9 @@ class DoraPowerLoraLoader:
                 },
             }
 
-        entries = _parse_lora_stack_kwargs(kwargs)
+        entries = _parse_dora_state_lora_entries(state_payload) if state_payload is not None else None
+        if entries is None:
+            entries = _parse_lora_stack_kwargs(kwargs)
         if not entries:
             stack_report = {
                 "schema": 1,
