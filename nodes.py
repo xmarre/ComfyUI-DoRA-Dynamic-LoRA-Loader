@@ -506,6 +506,21 @@ def _clean_state_id(value: Any, fallback: str) -> str:
     return text or fallback
 
 
+def _state_manager_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+        return default
+    return bool(value)
+
+
 def _normalize_manager_lora_row(row: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(row, dict):
         return None
@@ -521,7 +536,7 @@ def _normalize_manager_lora_row(row: Any) -> Optional[Dict[str, Any]]:
     except Exception:
         strength_clip = strength_model
     return {
-        "enabled": bool(row.get("enabled", row.get("on", True))),
+        "enabled": _state_manager_bool(row.get("enabled", row.get("on", True)), default=True),
         "name": name,
         "strength_model": strength_model,
         "strength_clip": strength_clip,
@@ -556,7 +571,7 @@ def _normalize_manager_loader_globals(globals_in: Any) -> Dict[str, Any]:
             "zimage_lumina2_compat",
             "auto_strength_enabled",
         }:
-            out[key] = bool(value)
+            out[key] = _state_manager_bool(value)
         elif key in {"dora_decompose_debug_n", "dora_decompose_debug_stack_depth"}:
             try:
                 out[key] = int(value)

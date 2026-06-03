@@ -77,6 +77,18 @@ function normalizeDevice(value) {
   return AUTO_STRENGTH_DEVICE_CHOICES.includes(v) ? v : "gpu";
 }
 
+function normalizeBoolean(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (value == null) return fallback;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["1", "true", "yes", "on"].includes(normalized)) return true;
+    if (["0", "false", "no", "off", ""].includes(normalized)) return false;
+    return fallback;
+  }
+  return Boolean(value);
+}
+
 function normalizeLoaderGlobals(globalsIn) {
   const src = globalsIn && typeof globalsIn === "object" ? globalsIn : {};
   const out = {};
@@ -93,7 +105,7 @@ function normalizeLoaderGlobals(globalsIn) {
     "zimage_lumina2_compat",
     "auto_strength_enabled",
   ]) {
-    if (Object.prototype.hasOwnProperty.call(src, key)) out[key] = Boolean(src[key]);
+    if (Object.prototype.hasOwnProperty.call(src, key)) out[key] = normalizeBoolean(src[key]);
   }
   for (const key of ["broadcast_scale", "auto_strength_ratio_floor", "auto_strength_ratio_ceiling"]) {
     if (Object.prototype.hasOwnProperty.call(src, key)) out[key] = normalizeNumber(src[key], key === "broadcast_scale" ? 1.0 : 0.0);
@@ -110,7 +122,7 @@ function normalizeLoraRow(row) {
   const strengthModel = normalizeNumber(r.strength_model ?? r.strengthModel ?? r.strength, 1.0);
   const strengthClip = normalizeNumber(r.strength_clip ?? r.strengthClip ?? r.strengthTwo, strengthModel);
   return {
-    enabled: r.enabled !== undefined ? Boolean(r.enabled) : r.on !== undefined ? Boolean(r.on) : true,
+    enabled: r.enabled !== undefined ? normalizeBoolean(r.enabled, true) : r.on !== undefined ? normalizeBoolean(r.on, true) : true,
     name: String(r.name ?? r.lora ?? r.lora_name ?? "None").trim() || "None",
     strength_model: strengthModel,
     strength_clip: strengthClip,
@@ -659,14 +671,19 @@ function installNode(node) {
   if (!node) return;
   node.resizable = true;
 
+  const state = readNodeState(node);
+  const { character, prompt } = ensureSelection(node, state);
+  saveState(node, state, { characterId: character.id, promptId: prompt.id });
+
+  if (typeof node.addDOMWidget !== "function") {
+    console.warn(`[${EXT_NAME}] addDOMWidget is unavailable; falling back to raw JSON widgets.`);
+    return;
+  }
+
   const widgets = getWidgets(node);
   hideWidget(widgets.stateWidget);
   hideWidget(widgets.characterWidget);
   hideWidget(widgets.promptWidget);
-
-  const state = readNodeState(node);
-  const { character, prompt } = ensureSelection(node, state);
-  saveState(node, state, { characterId: character.id, promptId: prompt.id });
 
   if (node.__dsmInstalled) {
     render(node);
@@ -674,23 +691,18 @@ function installNode(node) {
   }
   node.__dsmInstalled = true;
 
-  if (typeof node.addDOMWidget === "function") {
-    const root = document.createElement("div");
-    node.__dsmRoot = root;
-    const widget = node.addDOMWidget(DOM_WIDGET_NAME, DOM_WIDGET_TYPE, root, {
-      getMinHeight: () => MIN_WIDGET_HEIGHT,
-      getHeight: () => "100%",
-      onDraw: (domWidget) => syncDomWidgetSize(node, domWidget),
-      afterResize: (domWidgetNode) => syncDomWidgetSize(domWidgetNode, widget),
-      serialize: false,
-    });
-    widget.serialize = false;
-    node.__dsmWidget = widget;
-    syncDomWidgetSize(node, widget);
-  } else {
-    console.warn(`[${EXT_NAME}] addDOMWidget is unavailable; falling back to raw JSON widgets.`);
-    return;
-  }
+  const root = document.createElement("div");
+  node.__dsmRoot = root;
+  const widget = node.addDOMWidget(DOM_WIDGET_NAME, DOM_WIDGET_TYPE, root, {
+    getMinHeight: () => MIN_WIDGET_HEIGHT,
+    getHeight: () => "100%",
+    onDraw: (domWidget) => syncDomWidgetSize(node, domWidget),
+    afterResize: (domWidgetNode) => syncDomWidgetSize(domWidgetNode, widget),
+    serialize: false,
+  });
+  widget.serialize = false;
+  node.__dsmWidget = widget;
+  syncDomWidgetSize(node, widget);
 
   fetchLoras().then(() => {
     render(node);
