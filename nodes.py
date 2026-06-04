@@ -803,15 +803,18 @@ def _resolve_dora_state_payload(
         if stack_payload is not None:
             loras = stack_payload.get("loras", [])
             stack_globals = stack_payload.get("loader_globals")
-            if isinstance(stack_globals, dict) and stack_globals:
+            if isinstance(stack_globals, dict):
                 loader_globals = stack_globals
         if positive_prompt is not None:
             positive = str(positive_prompt or "")
         if negative_prompt is not None:
             negative = str(negative_prompt or "")
-        parsed_settings = _normalize_manager_settings(settings_json_input)
-        if parsed_settings:
-            settings = parsed_settings
+        if settings_json_input is not None:
+            raw_settings = settings_json_input
+            if not (isinstance(raw_settings, str) and raw_settings.strip() == ""):
+                parsed_settings = _safe_json_load(raw_settings, None)
+                if isinstance(parsed_settings, dict):
+                    settings = parsed_settings
 
     return {
         "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,

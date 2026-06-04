@@ -113,7 +113,8 @@ function normalizeThumbnail(value) {
   const subfolder = String(value.subfolder ?? "").trim();
   const type = String(value.type ?? "input").trim() || "input";
   const url = String(value.url ?? "").trim();
-  if (filename) return { filename, subfolder, type };
+  const cacheKey = String(value.cacheKey ?? value.hash ?? value.etag ?? value.updatedAt ?? value.version ?? "").trim();
+  if (filename) return cacheKey ? { filename, subfolder, type, cacheKey } : { filename, subfolder, type };
   if (url) return { url };
   return {};
 }
@@ -126,7 +127,7 @@ function thumbnailUrl(thumbnail) {
   params.set("filename", t.filename);
   if (t.subfolder) params.set("subfolder", t.subfolder);
   params.set("type", t.type || "input");
-  params.set("rand", String(Date.now()));
+  if (t.cacheKey) params.set("cache_key", t.cacheKey);
   return api.apiURL(`/view?${params.toString()}`);
 }
 
@@ -557,7 +558,6 @@ function makeInput(value, onChange, attrs = {}) {
   const input = document.createElement("input");
   input.value = value ?? "";
   Object.assign(input, attrs);
-  input.addEventListener("input", () => onChange(input.value));
   input.addEventListener("change", () => onChange(input.value));
   return input;
 }
