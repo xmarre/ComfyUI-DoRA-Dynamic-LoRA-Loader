@@ -437,6 +437,7 @@ class FlexibleOptionalInputType(dict):
 _DORA_STATE_MANAGER_SCHEMA_VERSION = 1
 _DORA_STATE_KIND = "dora_state_manager_state"
 _DORA_LORA_STACK_KIND = "dora_lora_stack"
+_DORA_STATE_SETTINGS_KIND = "dora_state_settings"
 _DORA_STATE_LOADER_GLOBAL_KEYS: Set[str] = {
     "stack_enabled",
     "verbose",
@@ -679,7 +680,7 @@ def _normalize_manager_prompt(prompt: Any, index: int) -> Optional[Dict[str, Any
         return None
     prompt_id = _clean_state_id(prompt.get("id"), _state_manager_make_id("prompt", index))
     name = str(prompt.get("name") or f"Prompt {index + 1}").strip() or f"Prompt {index + 1}"
-    settings = _normalize_manager_settings(prompt.get("settings", {}))
+    settings = _normalize_settings_with_canonical_seed(prompt.get("settings", {}))
     return {
         "id": prompt_id,
         "name": name,
@@ -782,39 +783,22 @@ def _resolve_dora_state_payload(
     state_json: Any,
     selected_character_id: Any,
     selected_prompt_id: Any,
-    positive_prompt: Any = None,
-    negative_prompt: Any = None,
-    lora_stack: Any = None,
-    settings_json_input: Any = None,
-    use_runtime_inputs: Any = False,
 ) -> Dict[str, Any]:
+    """Resolve the selected saved state without reading any downstream runtime inputs.
+
+    The state manager is intentionally an execution-time source. Save/load/apply behavior
+    is handled by the frontend as explicit graph editing; runtime execution must stay
+    acyclic.
+    """
     state = _normalize_state_manager_state(state_json)
     character = _pick_state_manager_character(state, selected_character_id)
     prompt = _pick_state_manager_prompt(character, selected_prompt_id)
 
-    settings = _normalize_manager_settings(prompt.get("settings", {}))
+    settings = _normalize_settings_with_canonical_seed(prompt.get("settings", {}))
     loras = character.get("loras", [])
     loader_globals = character.get("loader_globals", {})
     positive = str(prompt.get("positive", "") or "")
     negative = str(prompt.get("negative", "") or "")
-
-    if _state_manager_bool(use_runtime_inputs, default=False):
-        stack_payload = _normalize_runtime_lora_stack(lora_stack)
-        if stack_payload is not None:
-            loras = stack_payload.get("loras", [])
-            stack_globals = stack_payload.get("loader_globals")
-            if isinstance(stack_globals, dict):
-                loader_globals = stack_globals
-        if positive_prompt is not None:
-            positive = str(positive_prompt or "")
-        if negative_prompt is not None:
-            negative = str(negative_prompt or "")
-        if settings_json_input is not None:
-            raw_settings = settings_json_input
-            if not (isinstance(raw_settings, str) and raw_settings.strip() == ""):
-                parsed_settings = _safe_json_load(raw_settings, None)
-                if isinstance(parsed_settings, dict):
-                    settings = parsed_settings
 
     return {
         "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
@@ -835,6 +819,74 @@ def _resolve_dora_state_payload(
         "negative_prompt": negative,
     }
 
+
+def _build_state_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    settings = _normalize_settings_with_canonical_seed(payload.get("settings", {}))
+    seed = _extract_seed_from_settings(settings)
+    return {
+        "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
+        "kind": _DORA_STATE_SETTINGS_KIND,
+        "character": payload.get("character") if isinstance(payload.get("character"), dict) else {},
+        "prompt": payload.get("prompt") if isinstance(payload.get("prompt"), dict) else {},
+        "settings": settings,
+        "seed": seed,
+    }
+
+
+def _extract_seed_from_settings(settings: Any, fallback: int = 0) -> int:
+    settings_dict = _normalize_manager_settings(settings)
+
+    def _coerce(value: Any) -> Optional[int]:
+        try:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            if isinstance(value, str) and not value.strip():
+                return None
+            n = int(float(value))
+            return max(0, min(0xFFFFFFFFFFFFFFFF, n))
+        except Exception:
+            return None
+
+    for key in ("seed", "noise_seed", "rgthree_seed"):
+        value = settings_dict.get(key)
+        if isinstance(value, dict):
+            for nested_key in ("seed", "value", "noise_seed"):
+                coerced = _coerce(value.get(nested_key))
+                if coerced is not None:
+                    return coerced
+            widgets = value.get("widgets")
+            if isinstance(widgets, dict):
+                for nested_key in ("seed", "noise_seed", "value"):
+                    coerced = _coerce(widgets.get(nested_key))
+                    if coerced is not None:
+                        return coerced
+        else:
+            coerced = _coerce(value)
+            if coerced is not None:
+                return coerced
+
+    nodes = settings_dict.get("nodes")
+    if isinstance(nodes, list):
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            widgets = node.get("widgets")
+            if not isinstance(widgets, dict):
+                continue
+            for key in ("seed", "noise_seed", "value"):
+                coerced = _coerce(widgets.get(key))
+                if coerced is not None:
+                    return coerced
+
+    return max(0, min(0xFFFFFFFFFFFFFFFF, int(fallback)))
+
+
+def _normalize_settings_with_canonical_seed(settings: Any) -> Dict[str, Any]:
+    settings_dict = dict(_normalize_manager_settings(settings))
+    settings_dict["seed"] = _extract_seed_from_settings(settings_dict)
+    return settings_dict
 
 def _normalize_runtime_dora_state_payload(raw: Any) -> Optional[Dict[str, Any]]:
     payload = _safe_json_load(raw, None)
@@ -3663,11 +3715,9 @@ def _build_auto_strength_stack_text_report(stack_report: Dict[str, Any]) -> str:
 
 class DoraStateManager:
     """
-    Workflow-serialized state manager for character LoRA stacks and prompt/settings presets.
-
-    Output `dora_state` can be connected to DoRA Power LoRA Loader's optional `dora_state`
-    input. When connected, the loader uses the selected character's LoRA stack and any saved
-    loader-global overrides from this manager instead of its local row widgets.
+    Workflow-serialized preset manager for character LoRA stacks, prompt templates,
+    settings, and seed state. Runtime execution is source-only and acyclic: capture/load
+    actions are explicit frontend graph edits, not execution-time input feedback.
     """
 
     @classmethod
@@ -3690,18 +3740,19 @@ class DoraStateManager:
                 ),
                 "selected_character_id": ("STRING", {"default": "default_character", "multiline": False}),
                 "selected_prompt_id": ("STRING", {"default": "default_prompt", "multiline": False}),
-                "use_runtime_inputs": ("BOOLEAN", {"default": False}),
-            },
-            "optional": {
-                "positive_prompt": ("STRING", {"forceInput": True, "multiline": True, "default": ""}),
-                "negative_prompt": ("STRING", {"forceInput": True, "multiline": True, "default": ""}),
-                "settings_json_input": ("STRING", {"forceInput": True, "multiline": True, "default": ""}),
-                "lora_stack": ("DORA_LORA_STACK",),
-            },
+            }
         }
 
-    RETURN_TYPES = ("DORA_STATE", "STRING", "STRING", "STRING", "DORA_LORA_STACK")
-    RETURN_NAMES = ("dora_state", "positive_prompt", "negative_prompt", "settings_json", "selected_lora_stack")
+    RETURN_TYPES = ("DORA_STATE", "STRING", "STRING", "STRING", "DORA_LORA_STACK", "DORA_STATE_SETTINGS", "INT")
+    RETURN_NAMES = (
+        "dora_state",
+        "positive_prompt_template",
+        "negative_prompt_template",
+        "settings_json",
+        "selected_lora_stack",
+        "state_settings",
+        "seed",
+    )
     FUNCTION = "resolve_state"
     CATEGORY = "state managers"
 
@@ -3712,26 +3763,13 @@ class DoraStateManager:
         ui_state_json: Any = "",
         selected_character_id: Any = "",
         selected_prompt_id: Any = "",
-        use_runtime_inputs: Any = False,
-        positive_prompt: Any = None,
-        negative_prompt: Any = None,
-        settings_json_input: Any = None,
-        lora_stack: Any = None,
     ):
         payload = {
             "state_json": state_json,
             "ui_state_json": ui_state_json,
             "selected_character_id": selected_character_id,
             "selected_prompt_id": selected_prompt_id,
-            "use_runtime_inputs": use_runtime_inputs,
         }
-        if _state_manager_bool(use_runtime_inputs, default=False):
-            payload.update({
-                "positive_prompt": positive_prompt,
-                "negative_prompt": negative_prompt,
-                "settings_json_input": settings_json_input,
-                "lora_stack": lora_stack,
-            })
         return json.dumps(payload, sort_keys=True, default=str)
 
     @classmethod
@@ -3741,13 +3779,8 @@ class DoraStateManager:
         ui_state_json: Any = "",
         selected_character_id: Any = "",
         selected_prompt_id: Any = "",
-        use_runtime_inputs: Any = False,
-        positive_prompt: Any = None,
-        negative_prompt: Any = None,
-        settings_json_input: Any = None,
-        lora_stack: Any = None,
     ):
-        del ui_state_json, use_runtime_inputs, positive_prompt, negative_prompt, settings_json_input, lora_stack
+        del ui_state_json
         state = _normalize_state_manager_state(state_json)
         character = _pick_state_manager_character(state, selected_character_id)
         prompt = _pick_state_manager_prompt(character, selected_prompt_id)
@@ -3763,34 +3796,29 @@ class DoraStateManager:
         ui_state_json: Any = "",
         selected_character_id: Any = "",
         selected_prompt_id: Any = "",
-        use_runtime_inputs: Any = False,
-        positive_prompt: Any = None,
-        negative_prompt: Any = None,
-        settings_json_input: Any = None,
-        lora_stack: Any = None,
     ):
         del ui_state_json
         payload = _resolve_dora_state_payload(
             state_json,
             selected_character_id,
             selected_prompt_id,
-            positive_prompt=positive_prompt,
-            negative_prompt=negative_prompt,
-            lora_stack=lora_stack,
-            settings_json_input=settings_json_input,
-            use_runtime_inputs=use_runtime_inputs,
         )
-        settings_json = json.dumps(payload.get("settings", {}), ensure_ascii=False, sort_keys=True, indent=2)
+        settings = _normalize_settings_with_canonical_seed(payload.get("settings", {}))
+        settings_json = json.dumps(settings, ensure_ascii=False, sort_keys=True, indent=2)
         lora_stack_payload = _build_lora_stack_payload(
             _manager_rows_to_lora_entries(payload.get("loras", [])),
             payload.get("loader_globals", {}),
         )
+        state_settings_payload = _build_state_settings_payload(payload)
+        seed = _extract_seed_from_settings(settings)
         return (
             payload,
             payload.get("positive_prompt", ""),
             payload.get("negative_prompt", ""),
             settings_json,
             lora_stack_payload,
+            state_settings_payload,
+            seed,
         )
 
 

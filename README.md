@@ -507,35 +507,90 @@ This repo is meant for cases where plain ComfyUI LoRA loading is not enough, esp
 
 This build adds a **DoRA State Manager** node for workflow-serialized character states.
 
+The manager separates **saved state** from **runtime execution**:
+
+- execution outputs are source-only and acyclic
+- save/load/apply actions are explicit frontend graph edits
+- no prompt, LoRA stack, settings, or seed value is captured through runtime feedback inputs
+
 Use it to save:
 
 - character / LoRA combinations
-- per-character loader settings such as auto-strength and DoRA compatibility toggles
-- multiple positive / negative prompt presets per character
-- arbitrary JSON settings for future downstream nodes
+- per-character DoRA loader settings such as auto-strength and compatibility toggles
+- multiple positive / negative prompt **templates** per character
+- arbitrary downstream node widget snapshots
+- seed state, including rgthree-style seed nodes
 
 ### Basic wiring
 
-1. Configure a normal **DoRA Power LoRA Loader** and prompt nodes as usual.
-2. Add **DoRA State Manager**.
-3. Select a character tile or create a new one.
-4. Use **Capture selected nodes** after selecting an existing **DoRA Power LoRA Loader** and prompt text nodes, or connect the manager inputs and use **Capture connected**.
-5. Connect `dora_state` from the manager to the loader's optional `dora_state` input.
-6. Connect `positive_prompt` / `negative_prompt` outputs to your text encode path as needed.
+Recommended one-way wiring:
 
-When `dora_state` is connected, the loader uses the selected character's saved LoRA stack. If it is not connected, the loader keeps its normal local row-widget behavior.
+1. Add **DoRA State Manager**.
+2. Add **DoRA Power LoRA Loader**.
+3. Connect `dora_state` from the manager to the loader's optional `dora_state` input.
+4. Connect `positive_prompt_template` and `negative_prompt_template` into the prompt/wildcard path.
+5. Connect `settings_json`, `state_settings`, or `seed` only to downstream nodes that explicitly consume them.
 
-The manager has optional input ports for `positive_prompt`, `negative_prompt`, `settings_json_input`, and `lora_stack`. The loader appends a `lora_stack` output so an existing stack can be routed into the manager without manually recreating rows. Existing loader outputs keep their original indexes; `lora_stack` is appended after `analysis_report`.
+The manager should not receive the processed wildcard prompt. Store the wildcard/template prompt in the manager, then let your wildcard node expand it downstream.
 
-The UI uses a resizable DOM widget, character thumbnail tiles, and a selected-character submenu for prompts, LoRA stack capture/editing, and future settings JSON.
+Correct shape:
+
+```text
+DoRA State Manager positive_prompt_template
+  -> Wildcards Processor
+      -> CLIP Text Encode
+```
+
+Avoid feedback shapes such as:
+
+```text
+Wildcards Processor output
+  -> State Manager input
+  -> Wildcards Processor input
+```
+
+The state manager no longer exposes runtime capture inputs, so this cycle is not part of the node design.
+
+### Save / load / apply workflow
+
+The UI has four graph-editing actions:
+
+- **Save connected** — captures state from nodes connected downstream of the manager outputs.
+- **Load connected** — pushes the selected character/preset into connected downstream nodes.
+- **Save selected** — captures state from selected graph nodes.
+- **Apply selected** — pushes the selected character/preset into selected graph nodes.
+
+Selecting a character tile or prompt preset only changes the manager selection. It does not mutate other nodes until **Load connected** or **Apply selected** is clicked.
+
+### Pattern 1: deterministic downstream settings
+
+The manager outputs:
+
+- `settings_json` — selected prompt preset settings as JSON text
+- `state_settings` — typed `DORA_STATE_SETTINGS` payload
+- `seed` — integer seed extracted from saved settings / rgthree seed snapshots
+
+Future or external nodes can add optional inputs for one of these outputs to consume saved state deterministically during execution.
+
+### Pattern 2: frontend apply/capture
+
+For existing nodes that do not have settings inputs, use the UI actions:
+
+- save selected/connected AutoGuidance or Scale-Locked Guidance nodes into the prompt preset
+- save selected/connected rgthree seed nodes into the prompt preset
+- load/apply the preset back into those graph nodes later
+
+The settings snapshot stores widget values by node identity and class/title fallback. This is intended for controlled workflows where the same downstream nodes remain in the graph.
 
 ### Outputs
 
 - `dora_state` — typed `DORA_STATE` payload for **DoRA Power LoRA Loader**
-- `positive_prompt` — selected prompt preset's positive text
-- `negative_prompt` — selected prompt preset's negative text
-- `settings_json` — selected prompt preset's arbitrary settings object serialized as JSON
+- `positive_prompt_template` — selected prompt preset's positive template text
+- `negative_prompt_template` — selected prompt preset's negative template text
+- `settings_json` — selected prompt preset settings serialized as JSON
 - `selected_lora_stack` — selected character's LoRA stack as a typed `DORA_LORA_STACK` payload
+- `state_settings` — typed `DORA_STATE_SETTINGS` payload for future compatible nodes
+- `seed` — integer seed extracted from saved settings / rgthree seed snapshots
 
 ### Persistence and payload behavior
 
@@ -545,8 +600,5 @@ The manager state is stored in the workflow through hidden backend widgets:
 - `ui_state_json`
 - `selected_character_id`
 - `selected_prompt_id`
-- `use_runtime_inputs`
 
-No external preset database is required for this first version.
-
-The `DORA_STATE` payload contains the selected character identity, selected prompt identity, saved LoRA rows, saved loader-global overrides, prompt text, and prompt settings. The loader accepts only this typed payload shape; invalid or missing `dora_state` data falls back to the loader's existing local row-widget parsing.
+The `DORA_STATE` payload contains the selected character identity, selected prompt identity, saved LoRA rows, saved loader-global overrides, prompt templates, and prompt settings. The DoRA loader accepts this typed payload; invalid or missing `dora_state` data falls back to the loader's existing local row-widget parsing.
