@@ -612,7 +612,13 @@ function extractLoraStackFromNode(sourceNode, fallbackIndex = 0) {
 function applyLoraStackToNode(targetNode, character) {
   if (!targetNode || !isDoraLoaderNode(targetNode)) return false;
   const slot = getDoraLoaderSlot(targetNode);
-  const stack = findCharacterLoaderStack(character, slot, { allowFallback: true });
+  let stack = findCharacterLoaderStack(character, slot, { allowFallback: false });
+  if (!stack) {
+    const stacks = getCharacterLoaderStacks(character);
+    const legacyDefault = stacks.length === 1 && normalizeLoaderSlot(stacks[0]?.slot, "default") === "default";
+    if (!legacyDefault) return false;
+    stack = stacks[0];
+  }
   if (!stack) return false;
   const payload = {
     slot,

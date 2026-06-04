@@ -1101,7 +1101,11 @@ def _select_state_loader_stack(state_payload: Optional[Dict[str, Any]], state_sl
         return None
     stacks = state_payload.get("loader_stacks")
     if isinstance(stacks, list) and stacks:
-        return _pick_loader_stack(stacks, state_slot)
+        wanted = _clean_loader_slot(state_slot, "default")
+        for stack in stacks:
+            if isinstance(stack, dict) and _clean_loader_slot(stack.get("slot", ""), "default") == wanted:
+                return stack
+        return None
     if isinstance(state_payload.get("loras"), list):
         return {
             "slot": "default",

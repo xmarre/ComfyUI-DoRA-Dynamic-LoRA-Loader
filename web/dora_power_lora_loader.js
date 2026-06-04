@@ -652,7 +652,9 @@ function installGlobalStateApi() {
     setState(node, externalState) {
       if (!node) return false;
       const next = normalizeExternalDoraState(externalState);
-      if (externalState?.slot) setStateSlot(node, externalState.slot);
+      if (externalState && Object.prototype.hasOwnProperty.call(externalState, "slot")) {
+        setStateSlot(node, externalState.slot);
+      }
       setState(node, next);
       node._doraRows = next.rows;
       node._doraGlobals = next.globals;
@@ -1458,7 +1460,7 @@ function buildUI(node, state, loraValues) {
   wRefresh.serialize = false;
 
   const wStateSlot = node.addWidget("text", "state_slot", getStateSlot(node), (v) => {
-    setStateSlot(node, v);
+    wStateSlot.value = setStateSlot(node, v);
     node.setDirtyCanvas?.(true, true);
     node.graph?.change?.();
   });
