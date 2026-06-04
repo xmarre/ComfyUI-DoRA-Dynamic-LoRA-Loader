@@ -288,6 +288,10 @@ function normalizeSeedInteger(value, fallback = 0) {
   return Math.max(STATE_SEED_MIN, Math.min(STATE_SEED_MAX, Math.floor(n)));
 }
 
+function isStateSeedSpecial(value) {
+  return STATE_SEED_SPECIALS.includes(normalizeSeedInteger(value, 0));
+}
+
 function normalizeBoolean(value, fallback = false) {
   if (typeof value === "boolean") return value;
   if (value == null) return fallback;
@@ -1181,7 +1185,9 @@ function mergeCapturedSettings(prompt, nodes, { replaceNodes = true } = {}) {
 
   const seedSnapshot = snapshots.find((snap) => snap.is_seed_node || snap.seed != null || Object.keys(snap.seed_widgets || {}).length);
   if (seedSnapshot) {
-    settings.seed = normalizeSeedInteger(seedSnapshot.seed ?? normalizeSeedFromWidgets(seedSnapshot.widgets, 0), 0);
+    const seed = normalizeSeedInteger(seedSnapshot.seed ?? normalizeSeedFromWidgets(seedSnapshot.widgets, 0), 0);
+    if (isStateSeedSpecial(seed)) delete settings.seed;
+    else settings.seed = seed;
     settings.rgthree_seed = seedSnapshot;
   }
   prompt.settings = settings;
@@ -1222,14 +1228,20 @@ function applySnapshotToNode(node, snapshot) {
 
 function extractSeedFromSettings(settings) {
   const normalized = normalizeSettings(settings);
-  if (normalized.seed != null) return normalizeSeedInteger(normalized.seed, 0);
-  if (normalized.rgthree_seed?.seed != null) return normalizeSeedInteger(normalized.rgthree_seed.seed, 0);
+  if (normalized.seed != null) {
+    const seed = normalizeSeedInteger(normalized.seed, 0);
+    if (!isStateSeedSpecial(seed)) return seed;
+  }
+  if (normalized.rgthree_seed?.seed != null) {
+    const seed = normalizeSeedInteger(normalized.rgthree_seed.seed, 0);
+    if (!isStateSeedSpecial(seed)) return seed;
+  }
   const widgets = normalized.rgthree_seed?.widgets;
   const fromWidgets = normalizeSeedFromWidgets(widgets, null);
-  if (fromWidgets != null) return fromWidgets;
+  if (fromWidgets != null && !isStateSeedSpecial(fromWidgets)) return fromWidgets;
   for (const snap of normalizeNodeSnapshots(normalized.nodes)) {
     const seed = normalizeSeedFromWidgets(snap.widgets, null);
-    if (seed != null) return seed;
+    if (seed != null && !isStateSeedSpecial(seed)) return seed;
   }
   return null;
 }
@@ -2423,11 +2435,11 @@ function mutatePromptForStateSeedNode(promptPayload, node) {
     if (key === String(node.id ?? "") || key.endsWith(`:${node.id}`)) idCandidates.push(key);
   }
   let changed = false;
+  const seedToUse = getStateSeedToUse(node);
   for (const promptId of [...new Set(idCandidates)]) {
     const outputNode = promptPayload.output?.[promptId];
     const outputInputs = outputNode?.inputs;
     if (!outputInputs || !Object.prototype.hasOwnProperty.call(outputInputs, "seed")) continue;
-    const seedToUse = getStateSeedToUse(node);
     outputInputs.seed = seedToUse;
 
     const workflowNode = findWorkflowNodeForStateSeed(promptPayload, node, promptId);
@@ -2437,9 +2449,11 @@ function mutatePromptForStateSeedNode(promptPayload, node) {
       workflowNode.widgets_values[seedWidgetIndex] = seedToUse;
     }
 
+    changed = true;
+  }
+  if (changed) {
     node.__dsmLastSeed = seedToUse;
     updateStateSeedLastButton(node, seedToUse);
-    changed = true;
   }
   return changed;
 }
