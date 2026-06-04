@@ -1132,6 +1132,9 @@ def _state_payload_get_loader_global(state_payload: Optional[Dict[str, Any]], ke
         globals_in = stack.get("loader_globals")
         if isinstance(globals_in, dict) and key in globals_in:
             return globals_in[key]
+    stacks = state_payload.get("loader_stacks") if isinstance(state_payload, dict) else None
+    if isinstance(stacks, list) and stacks:
+        return fallback
     if isinstance(state_payload, dict):
         globals_in = state_payload.get("loader_globals")
         if isinstance(globals_in, dict) and key in globals_in:
