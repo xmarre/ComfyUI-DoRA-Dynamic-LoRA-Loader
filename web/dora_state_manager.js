@@ -41,6 +41,14 @@ const POSITIVE_HINT_RE = /positive|pos|prompt/i;
 const NEGATIVE_HINT_RE = /negative|neg/i;
 const SEED_HINT_RE = /seed|noise_seed|rgthree|control_after_generate|randomize|variation|subseed/i;
 const SKIP_SETTING_NODE_RE = /clip text encode|conditioning|preview|reroute/i;
+const STATE_SEED_MIN = -1125899906842624;
+const STATE_SEED_MAX = 1125899906842624;
+const STATE_SEED_RANDOM = -1;
+const STATE_SEED_INCREMENT = -2;
+const STATE_SEED_DECREMENT = -3;
+const STATE_SEED_SPECIALS = [STATE_SEED_RANDOM, STATE_SEED_INCREMENT, STATE_SEED_DECREMENT];
+const LAST_SEED_BUTTON_LABEL = "♻️ (Use Last Queued Seed)";
+
 
 function structuredCloneCompat(value) {
   if (typeof structuredClone === "function") return structuredClone(value);
@@ -271,6 +279,13 @@ function normalizeInteger(value, fallback = 0) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.floor(n)));
+}
+
+function normalizeSeedInteger(value, fallback = 0) {
+  if (typeof value === "boolean") return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(STATE_SEED_MIN, Math.min(STATE_SEED_MAX, Math.floor(n)));
 }
 
 function normalizeBoolean(value, fallback = false) {
@@ -692,6 +707,10 @@ function isTargetNode(nodeData, nodeType) {
 
 function isStateTextNodeDef(nodeData, nodeType) {
   return isNodeDefForClass(nodeData, nodeType, [STATE_TEXT_CLASS, STATE_TEXT_DISPLAY_CLASS]);
+}
+
+function isStateSeedNodeDef(nodeData, nodeType) {
+  return isNodeDefForClass(nodeData, nodeType, [STATE_SEED_CLASS, STATE_SEED_DISPLAY_CLASS]);
 }
 
 function nodeNameText(node) {
@@ -1134,10 +1153,10 @@ function captureNodeSnapshot(node) {
 function normalizeSeedFromWidgets(widgets, fallback = null) {
   if (!widgets || typeof widgets !== "object") return fallback;
   for (const key of ["seed", "noise_seed", "value"]) {
-    if (Object.prototype.hasOwnProperty.call(widgets, key)) return normalizeInteger(widgets[key], fallback ?? 0);
+    if (Object.prototype.hasOwnProperty.call(widgets, key)) return normalizeSeedInteger(widgets[key], fallback ?? 0);
   }
   for (const [key, value] of Object.entries(widgets)) {
-    if (/seed/i.test(key)) return normalizeInteger(value, fallback ?? 0);
+    if (/seed/i.test(key)) return normalizeSeedInteger(value, fallback ?? 0);
   }
   return fallback;
 }
@@ -1162,7 +1181,7 @@ function mergeCapturedSettings(prompt, nodes, { replaceNodes = true } = {}) {
 
   const seedSnapshot = snapshots.find((snap) => snap.is_seed_node || snap.seed != null || Object.keys(snap.seed_widgets || {}).length);
   if (seedSnapshot) {
-    settings.seed = normalizeInteger(seedSnapshot.seed ?? normalizeSeedFromWidgets(seedSnapshot.widgets, 0), 0);
+    settings.seed = normalizeSeedInteger(seedSnapshot.seed ?? normalizeSeedFromWidgets(seedSnapshot.widgets, 0), 0);
     settings.rgthree_seed = seedSnapshot;
   }
   prompt.settings = settings;
@@ -1203,8 +1222,8 @@ function applySnapshotToNode(node, snapshot) {
 
 function extractSeedFromSettings(settings) {
   const normalized = normalizeSettings(settings);
-  if (normalized.seed != null) return normalizeInteger(normalized.seed, 0);
-  if (normalized.rgthree_seed?.seed != null) return normalizeInteger(normalized.rgthree_seed.seed, 0);
+  if (normalized.seed != null) return normalizeSeedInteger(normalized.seed, 0);
+  if (normalized.rgthree_seed?.seed != null) return normalizeSeedInteger(normalized.rgthree_seed.seed, 0);
   const widgets = normalized.rgthree_seed?.widgets;
   const fromWidgets = normalizeSeedFromWidgets(widgets, null);
   if (fromWidgets != null) return fromWidgets;
@@ -2146,13 +2165,13 @@ function renderSettingsPanelContent(section, node, state, uiState, character, pr
   const seedValue = extractSeedFromSettings(prompt.settings) ?? 0;
   const seedInput = makeInput(seedValue, (value) => {
     const settings = normalizeSettings(prompt.settings);
-    settings.seed = normalizeInteger(value, 0);
+    settings.seed = normalizeSeedInteger(value, -1);
     if (settings.rgthree_seed?.widgets) settings.rgthree_seed.widgets.seed = settings.seed;
     if (settings.rgthree_seed) settings.rgthree_seed.seed = settings.seed;
     prompt.settings = settings;
     syncLegacyLoaderMirror(character);
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
-  }, { type: "number", step: "1", min: "0" });
+  }, { type: "number", step: "1", min: String(STATE_SEED_MIN), max: String(STATE_SEED_MAX) });
 
   const settingsJson = makeTextarea(JSON.stringify(prompt.settings || {}, null, 2), (value) => {
     const parsed = safeJsonParse(value, null);
@@ -2327,6 +2346,193 @@ function initializeNode(node, widget) {
 }
 
 
+function getStateSeedWidget(node) {
+  return widgetByExactName(node, "seed") || (node?.widgets || []).find((widget) => /seed/i.test(`${widget?.name ?? ""} ${widget?.label ?? ""}`)) || null;
+}
+
+function setStateSeedWidgetValue(node, value) {
+  const widget = getStateSeedWidget(node);
+  if (!widget) return false;
+  return setNodeWidget(node, widget, normalizeSeedInteger(value, STATE_SEED_RANDOM));
+}
+
+function ensureStateSeedRandomRange(node) {
+  node.properties = node.properties || {};
+  const max = normalizeSeedInteger(node.properties.dora_state_seed_random_max ?? STATE_SEED_MAX, STATE_SEED_MAX);
+  const min = normalizeSeedInteger(node.properties.dora_state_seed_random_min ?? 0, 0);
+  node.properties.dora_state_seed_random_max = Math.max(min + 1, Math.min(STATE_SEED_MAX, max));
+  node.properties.dora_state_seed_random_min = Math.max(0, Math.min(node.properties.dora_state_seed_random_max - 1, min));
+}
+
+function generateStateSeedRandom(node) {
+  const seedWidget = getStateSeedWidget(node);
+  ensureStateSeedRandomRange(node);
+  const step = Math.max(1, Number(seedWidget?.options?.step || 1));
+  const randomMin = Number(node.properties.dora_state_seed_random_min ?? 0);
+  const randomMax = Number(node.properties.dora_state_seed_random_max ?? STATE_SEED_MAX);
+  const randomRange = Math.max(1, (randomMax - randomMin) / (step / 10));
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const seed = normalizeSeedInteger(Math.floor(Math.random() * randomRange) * (step / 10) + randomMin, 0);
+    if (!STATE_SEED_SPECIALS.includes(seed)) return seed;
+  }
+  return 0;
+}
+
+function getStateSeedToUse(node) {
+  const seedWidget = getStateSeedWidget(node);
+  const inputSeed = normalizeSeedInteger(seedWidget?.value, STATE_SEED_RANDOM);
+  let seedToUse = null;
+  if (STATE_SEED_SPECIALS.includes(inputSeed)) {
+    if (typeof node.__dsmLastSeed === "number" && !STATE_SEED_SPECIALS.includes(node.__dsmLastSeed)) {
+      if (inputSeed === STATE_SEED_INCREMENT) seedToUse = node.__dsmLastSeed + 1;
+      else if (inputSeed === STATE_SEED_DECREMENT) seedToUse = node.__dsmLastSeed - 1;
+    }
+    if (seedToUse == null || STATE_SEED_SPECIALS.includes(seedToUse)) seedToUse = generateStateSeedRandom(node);
+  }
+  return normalizeSeedInteger(seedToUse ?? inputSeed, STATE_SEED_RANDOM);
+}
+
+function updateStateSeedLastButton(node, seedToUse) {
+  const seedWidget = getStateSeedWidget(node);
+  const button = node.__dsmLastSeedButton;
+  if (!button) return;
+  if (seedToUse !== normalizeSeedInteger(seedWidget?.value, STATE_SEED_RANDOM)) {
+    button.name = `♻️ ${seedToUse}`;
+    button.label = button.name;
+    button.disabled = false;
+  } else {
+    button.name = LAST_SEED_BUTTON_LABEL;
+    button.label = LAST_SEED_BUTTON_LABEL;
+    button.disabled = true;
+  }
+}
+
+function findWorkflowNodeForStateSeed(promptPayload, node, promptId) {
+  const workflowNodes = promptPayload?.workflow?.nodes;
+  if (!Array.isArray(workflowNodes)) return null;
+  const idText = String(promptId ?? node?.id ?? "");
+  return workflowNodes.find((item) => String(item?.id) === idText)
+    || workflowNodes.find((item) => String(item?.id) === String(node?.id ?? "") && hasAnyNodeClassOrTitle(node, [STATE_SEED_CLASS, STATE_SEED_DISPLAY_CLASS]))
+    || null;
+}
+
+function mutatePromptForStateSeedNode(promptPayload, node) {
+  if (!promptPayload || !node || !isStateSeedNode(node)) return false;
+  const idCandidates = [String(node.id ?? "")];
+  for (const key of Object.keys(promptPayload.output || {})) {
+    if (key === String(node.id ?? "") || key.endsWith(`:${node.id}`)) idCandidates.push(key);
+  }
+  let changed = false;
+  for (const promptId of [...new Set(idCandidates)]) {
+    const outputNode = promptPayload.output?.[promptId];
+    const outputInputs = outputNode?.inputs;
+    if (!outputInputs || !Object.prototype.hasOwnProperty.call(outputInputs, "seed")) continue;
+    const seedToUse = getStateSeedToUse(node);
+    outputInputs.seed = seedToUse;
+
+    const workflowNode = findWorkflowNodeForStateSeed(promptPayload, node, promptId);
+    const seedWidget = getStateSeedWidget(node);
+    const seedWidgetIndex = seedWidget ? (node.widgets || []).indexOf(seedWidget) : 0;
+    if (workflowNode && Array.isArray(workflowNode.widgets_values) && seedWidgetIndex >= 0) {
+      workflowNode.widgets_values[seedWidgetIndex] = seedToUse;
+    }
+
+    node.__dsmLastSeed = seedToUse;
+    updateStateSeedLastButton(node, seedToUse);
+    changed = true;
+  }
+  return changed;
+}
+
+function mutatePromptForStateSeeds(promptPayload) {
+  if (!promptPayload?.output) return 0;
+  let changed = 0;
+  const graphNodes = app?.graph?._nodes || [];
+  for (const node of graphNodes) {
+    if (mutatePromptForStateSeedNode(promptPayload, node)) changed += 1;
+  }
+  return changed;
+}
+
+function initializeStateSeedNode(node) {
+  if (node.__dsmStateSeedInitialized) return;
+  node.__dsmStateSeedInitialized = true;
+  node.serialize_widgets = true;
+  ensureStateSeedRandomRange(node);
+
+  const seedWidget = getStateSeedWidget(node);
+  if (seedWidget) {
+    seedWidget.options = seedWidget.options || {};
+    seedWidget.options.min = STATE_SEED_MIN;
+    seedWidget.options.max = STATE_SEED_MAX;
+    seedWidget.options.step = seedWidget.options.step || 1;
+    if (seedWidget.value == null) seedWidget.value = STATE_SEED_RANDOM;
+  }
+
+  for (let i = (node.widgets || []).length - 1; i >= 0; i--) {
+    if (String(node.widgets[i]?.name ?? "") === "control_after_generate") node.widgets.splice(i, 1);
+  }
+
+  if (!node.__dsmStateSeedButtonsAdded) {
+    node.__dsmStateSeedButtonsAdded = true;
+    node.addWidget?.("button", "🎲 Randomize Each Time", "", () => {
+      setStateSeedWidgetValue(node, STATE_SEED_RANDOM);
+    }, { serialize: false });
+    node.addWidget?.("button", "🎲 New Fixed Random", "", () => {
+      setStateSeedWidgetValue(node, generateStateSeedRandom(node));
+    }, { serialize: false });
+    node.__dsmLastSeedButton = node.addWidget?.("button", LAST_SEED_BUTTON_LABEL, "", () => {
+      if (typeof node.__dsmLastSeed === "number") setStateSeedWidgetValue(node, node.__dsmLastSeed);
+      if (node.__dsmLastSeedButton) {
+        node.__dsmLastSeedButton.name = LAST_SEED_BUTTON_LABEL;
+        node.__dsmLastSeedButton.label = LAST_SEED_BUTTON_LABEL;
+        node.__dsmLastSeedButton.disabled = true;
+      }
+    }, { width: 50, serialize: false });
+    if (node.__dsmLastSeedButton) node.__dsmLastSeedButton.disabled = true;
+  }
+
+  chainNodeCallback(node, "onPropertyChanged", function (property, value) {
+    if (property === "dora_state_seed_random_min" || property === "dora_state_seed_random_max") ensureStateSeedRandomRange(node);
+    return true;
+  });
+}
+
+function patchStateSeedNodeDef(nodeType) {
+  if (nodeType.prototype.__dsmStateSeedPatched) return;
+  nodeType.prototype.__dsmStateSeedPatched = true;
+  nodeType["@dora_state_seed_random_min"] = { type: "number" };
+  nodeType["@dora_state_seed_random_max"] = { type: "number" };
+
+  const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
+  nodeType.prototype.onNodeCreated = function () {
+    const result = originalOnNodeCreated?.apply(this, arguments);
+    initializeStateSeedNode(this);
+    return result;
+  };
+
+  const originalOnConfigure = nodeType.prototype.onConfigure;
+  nodeType.prototype.onConfigure = function () {
+    const result = originalOnConfigure?.apply(this, arguments);
+    initializeStateSeedNode(this);
+    return result;
+  };
+}
+
+function installStateSeedQueuePatch() {
+  if (api.__dsmStateSeedQueuePatchInstalled || typeof api.queuePrompt !== "function") return;
+  api.__dsmStateSeedQueuePatchInstalled = true;
+  const originalQueuePrompt = api.queuePrompt;
+  api.queuePrompt = async function (index, promptPayload, ...args) {
+    try {
+      mutatePromptForStateSeeds(promptPayload);
+    } catch (err) {
+      console.warn(`[${EXT_NAME}] failed to resolve State Manager Seed values before queue`, err);
+    }
+    return originalQueuePrompt.apply(this, [index, promptPayload, ...args]);
+  };
+}
+
 function initializeStateTextNode(node) {
   if (node.__dsmStateTextInitialized) return;
   node.__dsmStateTextInitialized = true;
@@ -2417,8 +2623,10 @@ app.registerExtension({
   },
 
   async beforeRegisterNodeDef(nodeType, nodeData) {
+    installStateSeedQueuePatch();
     maybeInjectWidgetInput(nodeData);
     if (isStateTextNodeDef(nodeData, nodeType)) patchStateTextNodeDef(nodeType);
+    if (isStateSeedNodeDef(nodeData, nodeType)) patchStateSeedNodeDef(nodeType);
     if (!isTargetNode(nodeData, nodeType)) return;
     const originalOnSerialize = nodeType.prototype.onSerialize;
     nodeType.prototype.onSerialize = function (o) {

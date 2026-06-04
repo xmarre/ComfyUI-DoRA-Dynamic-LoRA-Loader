@@ -1,6 +1,7 @@
 import logging
 import json
 import math
+import random
 import os
 import inspect
 import re
@@ -16,6 +17,32 @@ import folder_paths
 import torch
 
 _LOG = logging.getLogger(__name__)
+
+
+_STATE_SEED_MIN = -1125899906842624
+_STATE_SEED_MAX = 1125899906842624
+_STATE_SEED_SPECIALS = {-1, -2, -3}
+
+
+def _state_manager_new_random_seed() -> int:
+    return random.SystemRandom().randint(1, _STATE_SEED_MAX)
+
+
+def _coerce_state_manager_seed(value: Any, fallback: int = 0) -> int:
+    try:
+        if isinstance(value, bool):
+            raise TypeError("boolean is not a seed")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise TypeError("non-finite float is not a seed")
+        if isinstance(value, str) and not value.strip():
+            raise TypeError("blank string is not a seed")
+        n = int(float(value))
+    except Exception:
+        try:
+            n = int(fallback)
+        except Exception:
+            n = 0
+    return max(_STATE_SEED_MIN, min(_STATE_SEED_MAX, n))
 
 # --------------------------------------------------------------------------------------
 # DoRA decompose debug config (set per-node run via kwargs)
@@ -1163,8 +1190,7 @@ def _extract_seed_from_settings(settings: Any, fallback: int = 0) -> int:
                 return None
             if isinstance(value, str) and not value.strip():
                 return None
-            n = int(float(value))
-            return max(0, min(0xFFFFFFFFFFFFFFFF, n))
+            return _coerce_state_manager_seed(value, fallback)
         except Exception:
             return None
 
@@ -1199,7 +1225,7 @@ def _extract_seed_from_settings(settings: Any, fallback: int = 0) -> int:
                 if coerced is not None:
                     return coerced
 
-    return max(0, min(0xFFFFFFFFFFFFFFFF, int(fallback)))
+    return _coerce_state_manager_seed(fallback, 0)
 
 
 def _normalize_settings_with_canonical_seed(settings: Any) -> Dict[str, Any]:
@@ -4218,35 +4244,108 @@ class StateManagerTextBox:
 class StateManagerSeed:
     """Editable seed node controlled by State Manager save/load actions.
 
-    Widget names mirror common ComfyUI/rgthree seed widgets so the frontend can
-    capture/apply seed and control-after-generate state consistently.
+    The frontend resolves rgthree-style special seed values before queueing from
+    the graph UI. The backend keeps the same special values working for API or
+    partial-queue paths that send them through unchanged.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1}),
-                "control_after_generate": (["fixed", "increment", "decrement", "randomize"], {"default": "fixed"}),
+                "seed": (
+                    "INT",
+                    {
+                        "default": -1,
+                        "min": _STATE_SEED_MIN,
+                        "max": _STATE_SEED_MAX,
+                        "step": 1,
+                    },
+                ),
             },
             "optional": {
                 "state_control": ("STATE_MANAGER_CONTROL",),
             },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
     RETURN_TYPES = ("INT",)
-    RETURN_NAMES = ("seed",)
+    RETURN_NAMES = ("SEED",)
     FUNCTION = "emit"
     CATEGORY = "state managers"
 
     @classmethod
-    def IS_CHANGED(cls, seed: Any, control_after_generate: Any = "fixed", state_control: Any = None):
-        del state_control
-        return json.dumps({"seed": int(seed), "control_after_generate": str(control_after_generate)}, sort_keys=True)
+    def IS_CHANGED(
+        cls,
+        seed: Any,
+        state_control: Any = None,
+        prompt: Any = None,
+        extra_pnginfo: Any = None,
+        unique_id: Any = None,
+        control_after_generate: Any = None,
+    ):
+        del state_control, prompt, extra_pnginfo, unique_id, control_after_generate
+        seed_i = _coerce_state_manager_seed(seed, -1)
+        if seed_i in _STATE_SEED_SPECIALS:
+            return _state_manager_new_random_seed()
+        return seed_i
 
-    def emit(self, seed: Any, control_after_generate: Any = "fixed", state_control: Any = None):
-        del control_after_generate, state_control
-        return (int(seed),)
+    def emit(
+        self,
+        seed: Any,
+        state_control: Any = None,
+        prompt: Any = None,
+        extra_pnginfo: Any = None,
+        unique_id: Any = None,
+        control_after_generate: Any = None,
+    ):
+        del state_control, control_after_generate
+        original_seed = _coerce_state_manager_seed(seed, -1)
+        seed_i = original_seed
+        if seed_i in _STATE_SEED_SPECIALS:
+            if seed_i in (-2, -3):
+                _LOG.warning(
+                    "[State Manager Seed] cannot %s the last seed server-side; using a new random seed.",
+                    "increment" if seed_i == -2 else "decrement",
+                )
+            seed_i = _state_manager_new_random_seed()
+            self._update_metadata_seed(original_seed, seed_i, prompt, extra_pnginfo, unique_id)
+        return (seed_i,)
+
+    @staticmethod
+    def _update_metadata_seed(original_seed: int, seed: int, prompt: Any, extra_pnginfo: Any, unique_id: Any) -> None:
+        if unique_id is None:
+            return
+        uid = str(unique_id)
+
+        try:
+            prompt_node = prompt.get(uid) if isinstance(prompt, dict) else None
+            inputs = prompt_node.get("inputs") if isinstance(prompt_node, dict) else None
+            if isinstance(inputs, dict) and inputs.get("seed") == original_seed:
+                inputs["seed"] = seed
+        except Exception:
+            pass
+
+        try:
+            workflow = extra_pnginfo.get("workflow") if isinstance(extra_pnginfo, dict) else None
+            nodes = workflow.get("nodes") if isinstance(workflow, dict) else None
+            if not isinstance(nodes, list):
+                return
+            for node in nodes:
+                if not isinstance(node, dict) or str(node.get("id")) != uid:
+                    continue
+                values = node.get("widgets_values")
+                if isinstance(values, list):
+                    for index, value in enumerate(values):
+                        if value == original_seed:
+                            values[index] = seed
+                break
+        except Exception:
+            pass
 
 
 # Backward-compatible class alias for workflows created with the earlier name.
