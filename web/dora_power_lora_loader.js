@@ -594,6 +594,58 @@ function persistNodeState(node) {
   clearExecutionReport(node);
 }
 
+
+function normalizeExternalDoraRows(rowsIn) {
+  const rows = Array.isArray(rowsIn) ? rowsIn : [];
+  const out = rows.map((row) => {
+    const r = row && typeof row === "object" ? row : {};
+    const strengthModel = Number.isFinite(+r.strengthModel)
+      ? +r.strengthModel
+      : (Number.isFinite(+r.strength_model) ? +r.strength_model : (Number.isFinite(+r.strength) ? +r.strength : 1.0));
+    const strengthClip = Number.isFinite(+r.strengthClip)
+      ? +r.strengthClip
+      : (Number.isFinite(+r.strength_clip) ? +r.strength_clip : strengthModel);
+    return {
+      enabled: r.enabled !== undefined ? !!r.enabled : (r.on !== undefined ? !!r.on : true),
+      name: String(r.name ?? r.lora ?? r.lora_name ?? "None").trim() || "None",
+      strengthModel,
+      strengthClip,
+    };
+  });
+  return out.length ? out : [makeRowDefaults()];
+}
+
+function normalizeExternalDoraState(external) {
+  const src = external && typeof external === "object" ? external : {};
+  const rows = normalizeExternalDoraRows(src.rows ?? src.loras);
+  const globals = src.globals ?? src.loader_globals ?? {};
+  return sanitizeState({ rows, globals });
+}
+
+function installGlobalStateApi() {
+  globalThis.__doraPowerLoraLoaderApi = {
+    getState(node) {
+      return getState(node);
+    },
+    setState(node, externalState) {
+      if (!node) return false;
+      const next = normalizeExternalDoraState(externalState);
+      setState(node, next);
+      node._doraRows = next.rows;
+      node._doraGlobals = next.globals;
+      clearExecutionReport(node);
+      try {
+        rebuild(node);
+      } catch (_) {
+        try { buildUI(node, next, _cachedLoras || ["None"]); } catch (_) {}
+      }
+      node.setDirtyCanvas?.(true, true);
+      node.graph?.change?.();
+      return true;
+    },
+  };
+}
+
 function setButtonCallback(widget, cb) {
   if (!widget) return;
   widget.callback = cb;
@@ -1596,6 +1648,8 @@ function buildUI(node, state, loraValues) {
   node.size[0] = Math.max(node.size[0], size[0], minWidth);
   syncNodeHeightToContent(node);
 }
+
+installGlobalStateApi();
 
 app.registerExtension({
   name: EXT_NAME,
