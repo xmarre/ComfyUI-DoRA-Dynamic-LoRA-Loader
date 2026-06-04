@@ -503,15 +503,16 @@ This repo is meant for cases where plain ComfyUI LoRA loading is not enough, esp
 
 ---
 
-## DoRA State Manager
+## State Manager
 
-This build adds a **DoRA State Manager** node for workflow-serialized character states.
+This build adds a **State Manager** node for workflow-serialized character states. Workflows made with the older **DoRA State Manager** node name remain supported through a legacy alias.
 
 The manager separates **saved state** from **runtime execution**:
 
 - execution outputs are source-only and acyclic
 - save/load/apply actions are explicit frontend graph edits
-- no prompt, LoRA stack, settings, or seed value is captured through runtime feedback inputs
+- `state_control` links are editor/control-only and do not replace prompt text, seed values, or LoRA rows during execution
+- no prompt, LoRA stack, settings, or seed value is captured through runtime feedback inputs or wildcard feedback loops
 
 Use it to save:
 
@@ -523,20 +524,26 @@ Use it to save:
 
 ### Basic wiring
 
-Recommended one-way wiring:
+Recommended connected save/load wiring:
 
-1. Add **DoRA State Manager**.
-2. Add **DoRA Power LoRA Loader**.
-3. Connect `dora_state` from the manager to the loader's optional `dora_state` input.
-4. Connect `positive_prompt_template` and `negative_prompt_template` into the prompt/wildcard path.
-5. Connect `settings_json`, `state_settings`, or `seed` only to downstream nodes that explicitly consume them.
+1. Add **State Manager**.
+2. Add **State Text Box** nodes for editable positive and negative prompt templates.
+3. Add **State Seed** for an editable seed value.
+4. Add **DoRA Power LoRA Loader**.
+5. Connect `state_control` from the manager to each helper node's optional `state_control` input.
+6. Connect `text` from each State Text Box into the prompt/wildcard path.
+7. Connect `seed` from State Seed only to the sampler seed input.
+8. Configure LoRA rows on the DoRA Power LoRA Loader as usual.
 
-The manager should not receive the processed wildcard prompt. Store the wildcard/template prompt in the manager, then let your wildcard node expand it downstream.
+The manager should not receive processed wildcard, prompt-generation, or other runtime text outputs. Store the wildcard/template prompt in State Text Box, then let your wildcard node expand it downstream.
 
 Correct shape:
 
 ```text
-DoRA State Manager positive_prompt_template
+State Manager.state_control
+  -> State Text Box.state_control
+
+State Text Box.text
   -> Wildcards Processor
       -> CLIP Text Encode
 ```
@@ -549,18 +556,30 @@ Wildcards Processor output
   -> Wildcards Processor input
 ```
 
-The state manager no longer exposes runtime capture inputs, so this cycle is not part of the node design.
+The state manager no longer exposes runtime capture inputs, so this cycle is not part of the node design. Do not wire wildcard or prompt-processing output back into State Manager.
+
+The older runtime-output path is still available for workflows that intentionally want the manager to drive execution:
+
+```text
+State Manager.dora_state -> DoRA Power LoRA Loader.dora_state
+State Manager.positive_prompt_template -> prompt/wildcard path
+State Manager.negative_prompt_template -> prompt/wildcard path
+```
+
+Do not use that runtime path as the replacement for connected save/load. For editable prompt and seed values that survive normal execution, use `state_control` plus State Text Box / State Seed.
 
 ### Save / load / apply workflow
 
 The UI has four graph-editing actions:
 
-- **Save connected** — captures state from nodes connected downstream of the manager outputs.
-- **Load connected** — pushes the selected character/preset into connected downstream nodes.
+- **Save connected** — captures state from nodes connected downstream of `state_control`.
+- **Load connected** — pushes the selected character/preset into nodes connected downstream of `state_control`.
 - **Save selected** — captures state from selected graph nodes.
 - **Apply selected** — pushes the selected character/preset into selected graph nodes.
 
 Selecting a character tile or prompt preset only changes the manager selection. It does not mutate other nodes until **Load connected** or **Apply selected** is clicked.
+
+For older workflows that do not have `state_control` links, the frontend keeps a compatibility fallback that can inspect legacy runtime output links. Treat that as migration support, not the canonical wiring for new graphs.
 
 ### Pattern 1: deterministic downstream settings
 
@@ -569,8 +588,9 @@ The manager outputs:
 - `settings_json` — selected prompt preset settings as JSON text
 - `state_settings` — typed `DORA_STATE_SETTINGS` payload
 - `seed` — integer seed extracted from saved settings / rgthree seed snapshots
+- `state_control` — typed `STATE_MANAGER_CONTROL` payload used only by the frontend to discover connected nodes for Save connected / Load connected
 
-Future or external nodes can add optional inputs for one of these outputs to consume saved state deterministically during execution.
+Future or external nodes can add optional inputs for `settings_json`, `state_settings`, or `seed` to consume saved state deterministically during execution. `state_control` is reserved for editor save/load association.
 
 ### Pattern 2: frontend apply/capture
 
@@ -591,6 +611,7 @@ The settings snapshot stores widget values by node identity and class/title fall
 - `selected_lora_stack` — selected character's LoRA stack as a typed `DORA_LORA_STACK` payload
 - `state_settings` — typed `DORA_STATE_SETTINGS` payload for future compatible nodes
 - `seed` — integer seed extracted from saved settings / rgthree seed snapshots
+- `state_control` — typed `STATE_MANAGER_CONTROL` payload for editor/control-only save/load association
 
 ### Persistence and payload behavior
 

@@ -438,6 +438,7 @@ _DORA_STATE_MANAGER_SCHEMA_VERSION = 1
 _DORA_STATE_KIND = "dora_state_manager_state"
 _DORA_LORA_STACK_KIND = "dora_lora_stack"
 _DORA_STATE_SETTINGS_KIND = "dora_state_settings"
+_STATE_MANAGER_CONTROL_KIND = "state_manager_control"
 _DORA_STATE_LOADER_GLOBAL_KEYS: Set[str] = {
     "stack_enabled",
     "verbose",
@@ -830,6 +831,22 @@ def _build_state_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "prompt": payload.get("prompt") if isinstance(payload.get("prompt"), dict) else {},
         "settings": settings,
         "seed": seed,
+    }
+
+
+def _build_state_control_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Editor/control token only. The State Manager frontend uses a connected
+    # STATE_MANAGER_CONTROL edge as a safe save/load relationship. It is not a
+    # prompt, seed, or LoRA runtime override.
+    character = payload.get("character") if isinstance(payload.get("character"), dict) else {}
+    prompt = payload.get("prompt") if isinstance(payload.get("prompt"), dict) else {}
+    return {
+        "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
+        "kind": _STATE_MANAGER_CONTROL_KIND,
+        "character": character,
+        "prompt": prompt,
+        "selected_character_id": character.get("id", ""),
+        "selected_prompt_id": prompt.get("id", ""),
     }
 
 
@@ -3713,7 +3730,7 @@ def _build_auto_strength_stack_text_report(stack_report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-class DoraStateManager:
+class StateManager:
     """
     Workflow-serialized preset manager for character LoRA stacks, prompt templates,
     settings, and seed state. Runtime execution is source-only and acyclic: capture/load
@@ -3743,7 +3760,7 @@ class DoraStateManager:
             }
         }
 
-    RETURN_TYPES = ("DORA_STATE", "STRING", "STRING", "STRING", "DORA_LORA_STACK", "DORA_STATE_SETTINGS", "INT")
+    RETURN_TYPES = ("DORA_STATE", "STRING", "STRING", "STRING", "DORA_LORA_STACK", "DORA_STATE_SETTINGS", "INT", "STATE_MANAGER_CONTROL")
     RETURN_NAMES = (
         "dora_state",
         "positive_prompt_template",
@@ -3752,6 +3769,7 @@ class DoraStateManager:
         "selected_lora_stack",
         "state_settings",
         "seed",
+        "state_control",
     )
     FUNCTION = "resolve_state"
     CATEGORY = "state managers"
@@ -3785,9 +3803,9 @@ class DoraStateManager:
         character = _pick_state_manager_character(state, selected_character_id)
         prompt = _pick_state_manager_prompt(character, selected_prompt_id)
         if not character:
-            return "DoRA State Manager: no character states are available."
+            return "State Manager: no character states are available."
         if not prompt:
-            return "DoRA State Manager: no prompt states are available for the selected character."
+            return "State Manager: no prompt states are available for the selected character."
         return True
 
     def resolve_state(
@@ -3810,6 +3828,7 @@ class DoraStateManager:
             payload.get("loader_globals", {}),
         )
         state_settings_payload = _build_state_settings_payload(payload)
+        state_control_payload = _build_state_control_payload(payload)
         seed = _extract_seed_from_settings(settings)
         return (
             payload,
@@ -3819,7 +3838,81 @@ class DoraStateManager:
             lora_stack_payload,
             state_settings_payload,
             seed,
+            state_control_payload,
         )
+
+
+class StateManagerTextBox:
+    """Editable prompt/text node controlled by State Manager save/load actions.
+
+    The state_control input is intentionally ignored during execution. It gives
+    the State Manager frontend a safe non-STRING edge to discover this node for
+    Save connected / Load connected without replacing the editable text widget.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "role": (["positive", "negative", "generic"], {"default": "positive"}),
+                "text": ("STRING", {"default": "", "multiline": True}),
+            },
+            "optional": {
+                "state_control": ("STATE_MANAGER_CONTROL",),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    FUNCTION = "emit"
+    CATEGORY = "state managers"
+
+    @classmethod
+    def IS_CHANGED(cls, role: Any, text: Any, state_control: Any = None):
+        del state_control
+        return json.dumps({"role": str(role), "text": str(text)}, ensure_ascii=False, sort_keys=True)
+
+    def emit(self, role: Any, text: Any, state_control: Any = None):
+        del role, state_control
+        return (str(text or ""),)
+
+
+class StateManagerSeed:
+    """Editable seed node controlled by State Manager save/load actions.
+
+    Widget names mirror common ComfyUI/rgthree seed widgets so the frontend can
+    capture/apply seed and control-after-generate state consistently.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "step": 1}),
+                "control_after_generate": (["fixed", "increment", "decrement", "randomize"], {"default": "fixed"}),
+            },
+            "optional": {
+                "state_control": ("STATE_MANAGER_CONTROL",),
+            },
+        }
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("seed",)
+    FUNCTION = "emit"
+    CATEGORY = "state managers"
+
+    @classmethod
+    def IS_CHANGED(cls, seed: Any, control_after_generate: Any = "fixed", state_control: Any = None):
+        del state_control
+        return json.dumps({"seed": int(seed), "control_after_generate": str(control_after_generate)}, sort_keys=True)
+
+    def emit(self, seed: Any, control_after_generate: Any = "fixed", state_control: Any = None):
+        del control_after_generate, state_control
+        return (int(seed),)
+
+
+# Backward-compatible class alias for workflows created with the earlier name.
+DoraStateManager = StateManager
 
 
 class DoraPowerLoraLoader:
@@ -3842,9 +3935,14 @@ class DoraPowerLoraLoader:
             "optional": FlexibleOptionalInputType(
                 any_type,
                 data={
-                    # Optional state-manager input. When connected, this overrides local LoRA rows
+                    # Optional runtime state-manager input. When connected, this overrides local LoRA rows
                     # and any saved loader-global settings in the manager payload.
+                    # Prefer state_control for save/load-only graph-editor workflows.
                     "dora_state": ("DORA_STATE",),
+
+                    # Editor-only relationship used by State Manager Save/Load connected.
+                    # Ignored by backend execution.
+                    "state_control": ("STATE_MANAGER_CONTROL",),
 
                     # Flux2 modulation handling
                     "broadcast_modulations": ("BOOLEAN", {"default": True}),
@@ -4134,6 +4232,9 @@ class DoraPowerLoraLoader:
         return model, clip, auto_strength_report
 
     def load_loras(self, model, clip, **kwargs):
+        # Editor-only relationship token for State Manager save/load discovery.
+        # It must not participate in runtime LoRA row or settings resolution.
+        kwargs.pop("state_control", None)
         state_payload = _normalize_runtime_dora_state_payload(kwargs.get("dora_state"))
 
         # Global controls (provided by JS UI; optionally overridden by DoRA State Manager)

@@ -3,8 +3,13 @@ import { api } from "../../scripts/api.js";
 import "../../scripts/domWidget.js";
 
 const EXT_NAME = "comfyui_dora_dynamic_lora.state_manager";
-const NODE_CLASS = "DoRA State Manager";
+const NODE_CLASS = "State Manager";
+const LEGACY_NODE_CLASS = "DoRA State Manager";
 const DORA_LOADER_CLASS = "DoRA Power LoRA Loader";
+const STATE_TEXT_CLASS = "State Manager Text Box";
+const STATE_TEXT_DISPLAY_CLASS = "State Text Box";
+const STATE_SEED_CLASS = "State Manager Seed";
+const STATE_SEED_DISPLAY_CLASS = "State Seed";
 const CUSTOM_WIDGET_INPUT = "state_manager_ui";
 const CUSTOM_WIDGET_TYPE = "DORA_STATE_MANAGER_UI";
 const STATE_WIDGET = "state_json";
@@ -18,6 +23,10 @@ const MIN_NODE_HEIGHT = 680;
 const THUMBNAIL_SUBFOLDER = "dora_state_manager";
 const AUTO_STRENGTH_DEVICE_CHOICES = ["auto", "cpu", "gpu"];
 const OUTPUT_NAMES = {
+  control: ["state_control"],
+  // Legacy/runtime outputs remain readable for compatibility, but Save/Load connected
+  // should primarily use the control edge so editable prompt/seed widgets are not
+  // replaced by linked runtime values.
   lora: ["dora_state", "selected_lora_stack"],
   positive: ["positive_prompt_template", "positive_prompt"],
   negative: ["negative_prompt_template", "negative_prompt"],
@@ -392,7 +401,7 @@ function isTargetNode(nodeData, nodeType) {
   const nodeName = nodeData?.name ?? "";
   const displayName = nodeData?.display_name ?? "";
   const comfyClass = nodeType?.comfyClass ?? "";
-  return nodeName === NODE_CLASS || displayName === NODE_CLASS || comfyClass === NODE_CLASS;
+  return [nodeName, displayName, comfyClass].some((name) => name === NODE_CLASS || name === LEGACY_NODE_CLASS);
 }
 
 function nodeNameText(node) {
@@ -401,6 +410,49 @@ function nodeNameText(node) {
 
 function isDoraLoaderNode(node) {
   return nodeNameText(node).includes(DORA_LOADER_CLASS);
+}
+
+function hasExactNodeClass(node, className) {
+  return [node?.comfyClass, node?.type, node?.constructor?.title]
+    .map((value) => String(value ?? ""))
+    .some((value) => value === className);
+}
+
+function hasAnyNodeClassOrTitle(node, classNames) {
+  const values = [node?.comfyClass, node?.type, node?.title, node?.constructor?.title].map((value) => String(value ?? ""));
+  return classNames.some((className) => values.includes(className));
+}
+
+function isStateManagerNode(node) {
+  return hasExactNodeClass(node, NODE_CLASS) || hasExactNodeClass(node, LEGACY_NODE_CLASS);
+}
+
+function isStateTextNode(node) {
+  return hasAnyNodeClassOrTitle(node, [STATE_TEXT_CLASS, STATE_TEXT_DISPLAY_CLASS]);
+}
+
+function isStateSeedNode(node) {
+  return hasAnyNodeClassOrTitle(node, [STATE_SEED_CLASS, STATE_SEED_DISPLAY_CLASS]);
+}
+
+function getRoleWidget(node) {
+  const map = getWidgetMap(node);
+  return map.get("role") || null;
+}
+
+function getStateTextRole(node, fallback = "generic") {
+  const role = String(getRoleWidget(node)?.value ?? fallback).toLowerCase();
+  if (role.includes("positive")) return "positive";
+  if (role.includes("negative")) return "negative";
+  return "generic";
+}
+
+function getControlledTargets(node) {
+  return getOutputTargets(node, OUTPUT_NAMES.control);
+}
+
+function getControlledNodes(node) {
+  return uniqueNodes(getControlledTargets(node));
 }
 
 function normalizeDoraLoaderState(state) {
@@ -583,13 +635,14 @@ function isSeedNode(node) {
 }
 
 function isPromptLikeNode(node) {
+  if (isStateTextNode(node)) return true;
   const text = nodeNameText(node);
   if (SKIP_SETTING_NODE_RE.test(text)) return true;
   return (node?.widgets || []).some((widget) => isTextWidget(widget) && /prompt|text|positive|negative/i.test(`${widget.name ?? ""} ${widget.label ?? ""}`));
 }
 
 function captureNodeSnapshot(node) {
-  if (!node || node.comfyClass === NODE_CLASS || isDoraLoaderNode(node)) return null;
+  if (!node || isStateManagerNode(node) || isDoraLoaderNode(node)) return null;
   const widgets = {};
   const seedWidgets = {};
   for (const widget of node.widgets || []) {
@@ -734,7 +787,12 @@ function applySettingsToNodes(nodes, settings) {
 
 function saveConnectedState(targetNode, character, prompt) {
   const changes = [];
-  const loaderTargets = uniqueNodes([...getOutputTargets(targetNode, OUTPUT_NAMES.lora)]).filter(isDoraLoaderNode);
+  const controlledNodes = getControlledNodes(targetNode).filter((node) => node && node !== targetNode);
+
+  // Preferred save/load-only path: manager.state_control -> target.state_control.
+  const controlledLoaderTargets = controlledNodes.filter(isDoraLoaderNode);
+  const legacyLoaderTargets = controlledLoaderTargets.length ? [] : uniqueNodes([...getOutputTargets(targetNode, OUTPUT_NAMES.lora)]).filter(isDoraLoaderNode);
+  const loaderTargets = controlledLoaderTargets.length ? controlledLoaderTargets : legacyLoaderTargets;
   const loaderStack = loaderTargets.map(extractLoraStackFromNode).find(Boolean);
   if (loaderStack) {
     character.loras = loaderStack.loras || [];
@@ -742,30 +800,54 @@ function saveConnectedState(targetNode, character, prompt) {
     changes.push("LoRA stack");
   }
 
-  const positiveTargets = getOutputTargets(targetNode, OUTPUT_NAMES.positive);
-  for (const target of positiveTargets) {
-    const widget = findTextWidget(target.node, "positive", target.inputName);
-    if (widget) {
-      prompt.positive = typeof widget.value === "string" ? widget.value : "";
-      changes.push("positive prompt template");
-      break;
+  const controlledTextNodes = controlledNodes.filter(isStateTextNode);
+  let savedPositive = false;
+  let savedNegative = false;
+  for (const textNode of controlledTextNodes) {
+    const role = getStateTextRole(textNode);
+    const value = extractTextFromNode(textNode, role);
+    if (role === "positive") {
+      prompt.positive = value;
+      savedPositive = true;
+    } else if (role === "negative") {
+      prompt.negative = value;
+      savedNegative = true;
+    }
+  }
+  if (savedPositive) changes.push("positive prompt template");
+  if (savedNegative) changes.push("negative prompt template");
+
+  // Compatibility fallback for old graphs. Avoid depending on this for normal use;
+  // it can make editable widgets link-controlled if users connect STRING outputs.
+  if (!savedPositive) {
+    for (const target of getOutputTargets(targetNode, OUTPUT_NAMES.positive)) {
+      const widget = findTextWidget(target.node, "positive", target.inputName);
+      if (widget) {
+        prompt.positive = typeof widget.value === "string" ? widget.value : "";
+        changes.push("positive prompt template");
+        break;
+      }
+    }
+  }
+  if (!savedNegative) {
+    for (const target of getOutputTargets(targetNode, OUTPUT_NAMES.negative)) {
+      const widget = findTextWidget(target.node, "negative", target.inputName);
+      if (widget) {
+        prompt.negative = typeof widget.value === "string" ? widget.value : "";
+        changes.push("negative prompt template");
+        break;
+      }
     }
   }
 
-  const negativeTargets = getOutputTargets(targetNode, OUTPUT_NAMES.negative);
-  for (const target of negativeTargets) {
-    const widget = findTextWidget(target.node, "negative", target.inputName);
-    if (widget) {
-      prompt.negative = typeof widget.value === "string" ? widget.value : "";
-      changes.push("negative prompt template");
-      break;
-    }
-  }
-
-  const settingTargets = uniqueNodes([
+  const controlledSettingTargets = controlledNodes.filter((node) =>
+    node !== targetNode && !isDoraLoaderNode(node) && !isStateTextNode(node)
+  );
+  const legacySettingTargets = controlledSettingTargets.length ? [] : uniqueNodes([
     ...getOutputTargets(targetNode, OUTPUT_NAMES.settings),
     ...getOutputTargets(targetNode, OUTPUT_NAMES.seed),
-  ]).filter((node) => node !== targetNode && !isDoraLoaderNode(node));
+  ]).filter((node) => node !== targetNode && !isDoraLoaderNode(node) && !isStateTextNode(node));
+  const settingTargets = controlledSettingTargets.length ? controlledSettingTargets : legacySettingTargets;
   const snapshots = mergeCapturedSettings(prompt, settingTargets, { replaceNodes: true });
   if (snapshots.length) changes.push(`settings from ${snapshots.length} node${snapshots.length === 1 ? "" : "s"}`);
   if (prompt.settings?.seed != null) changes.push("seed");
@@ -774,27 +856,37 @@ function saveConnectedState(targetNode, character, prompt) {
 
 function applyConnectedState(targetNode, character, prompt) {
   const changes = [];
-  const loaderTargets = uniqueNodes([...getOutputTargets(targetNode, OUTPUT_NAMES.lora)]).filter(isDoraLoaderNode);
+  const controlledNodes = getControlledNodes(targetNode).filter((node) => node && node !== targetNode);
+
+  const controlledLoaderTargets = controlledNodes.filter(isDoraLoaderNode);
+  const legacyLoaderTargets = controlledLoaderTargets.length ? [] : uniqueNodes([...getOutputTargets(targetNode, OUTPUT_NAMES.lora)]).filter(isDoraLoaderNode);
+  const loaderTargets = controlledLoaderTargets.length ? controlledLoaderTargets : legacyLoaderTargets;
   let loaderChanged = 0;
   for (const loader of loaderTargets) if (applyLoraStackToNode(loader, character)) loaderChanged += 1;
   if (loaderChanged) changes.push(`LoRA stack to ${loaderChanged} loader${loaderChanged === 1 ? "" : "s"}`);
 
+  const controlledTextNodes = controlledNodes.filter(isStateTextNode);
   let posChanged = 0;
-  for (const target of getOutputTargets(targetNode, OUTPUT_NAMES.positive)) {
-    if (applyTextToNode(target.node, prompt.positive, "positive", target.inputName)) posChanged += 1;
+  let negChanged = 0;
+  for (const textNode of controlledTextNodes) {
+    const role = getStateTextRole(textNode);
+    if (role === "positive") {
+      if (applyTextToNode(textNode, prompt.positive, "positive")) posChanged += 1;
+    } else if (role === "negative") {
+      if (applyTextToNode(textNode, prompt.negative, "negative")) negChanged += 1;
+    }
   }
   if (posChanged) changes.push(`positive template to ${posChanged} node${posChanged === 1 ? "" : "s"}`);
-
-  let negChanged = 0;
-  for (const target of getOutputTargets(targetNode, OUTPUT_NAMES.negative)) {
-    if (applyTextToNode(target.node, prompt.negative, "negative", target.inputName)) negChanged += 1;
-  }
   if (negChanged) changes.push(`negative template to ${negChanged} node${negChanged === 1 ? "" : "s"}`);
 
-  const settingTargets = uniqueNodes([
+  const controlledSettingTargets = controlledNodes.filter((node) =>
+    node !== targetNode && !isDoraLoaderNode(node) && !isStateTextNode(node)
+  );
+  const legacySettingTargets = controlledSettingTargets.length ? [] : uniqueNodes([
     ...getOutputTargets(targetNode, OUTPUT_NAMES.settings),
     ...getOutputTargets(targetNode, OUTPUT_NAMES.seed),
-  ]).filter((node) => node !== targetNode && !isDoraLoaderNode(node));
+  ]).filter((node) => node !== targetNode && !isDoraLoaderNode(node) && !isStateTextNode(node));
+  const settingTargets = controlledSettingTargets.length ? controlledSettingTargets : legacySettingTargets;
   const settingsChanged = applySettingsToNodes(settingTargets, prompt.settings);
   if (settingsChanged) changes.push(`settings/seed to ${settingsChanged} node${settingsChanged === 1 ? "" : "s"}`);
   return changes;
@@ -802,10 +894,15 @@ function applyConnectedState(targetNode, character, prompt) {
 
 function classifySelectedTextNodes(nodes) {
   const textNodes = nodes
-    .map((node) => ({ node, text: extractTextFromNode(node), name: nodeNameText(node) }))
+    .map((node) => ({
+      node,
+      text: extractTextFromNode(node, isStateTextNode(node) ? getStateTextRole(node) : ""),
+      name: nodeNameText(node),
+      role: isStateTextNode(node) ? getStateTextRole(node) : "",
+    }))
     .filter((item) => item.text || findTextWidget(item.node));
-  const negative = textNodes.find((item) => NEGATIVE_HINT_RE.test(item.name));
-  const positive = textNodes.find((item) => item !== negative && POSITIVE_HINT_RE.test(item.name)) || textNodes.find((item) => item !== negative);
+  const negative = textNodes.find((item) => item.role === "negative") || textNodes.find((item) => NEGATIVE_HINT_RE.test(item.name));
+  const positive = textNodes.find((item) => item.role === "positive") || textNodes.find((item) => item !== negative && POSITIVE_HINT_RE.test(item.name)) || textNodes.find((item) => item !== negative);
   const fallbackNegative = negative || (textNodes.length >= 2 ? textNodes.find((item) => item !== positive) : null);
   return { positive, negative: fallbackNegative, used: [positive?.node, fallbackNegative?.node].filter(Boolean) };
 }
@@ -821,7 +918,7 @@ function saveSelectedState(targetNode, character, prompt) {
     changes.push("LoRA stack");
   }
 
-  const classified = classifySelectedTextNodes(selected.filter((node) => node !== loader));
+  const classified = classifySelectedTextNodes(selected.filter((node) => node !== loader && !isSeedNode(node)));
   if (classified.positive) {
     prompt.positive = classified.positive.text;
     changes.push("positive prompt template");
@@ -847,7 +944,7 @@ function applySelectedState(targetNode, character, prompt) {
   for (const loader of loaderTargets) if (applyLoraStackToNode(loader, character)) loaderChanged += 1;
   if (loaderChanged) changes.push(`LoRA stack to ${loaderChanged} loader${loaderChanged === 1 ? "" : "s"}`);
 
-  const classified = classifySelectedTextNodes(selected.filter((node) => !isDoraLoaderNode(node)));
+  const classified = classifySelectedTextNodes(selected.filter((node) => !isDoraLoaderNode(node) && !isSeedNode(node)));
   if (classified.positive && applyTextToNode(classified.positive.node, prompt.positive, "positive")) changes.push("positive template");
   if (classified.negative && applyTextToNode(classified.negative.node, prompt.negative, "negative")) changes.push("negative template");
 
@@ -977,7 +1074,7 @@ function renderHeader(node, state, uiState, character, prompt) {
   toolbar.className = "dsm-toolbar";
   const title = document.createElement("div");
   title.className = "dsm-title";
-  title.textContent = "DoRA State Manager";
+  title.textContent = "State Manager";
 
   toolbar.append(
     title,
@@ -1220,7 +1317,8 @@ function renderLoraPanelContent(section, node, state, uiState, character, prompt
   header.className = "dsm-toolbar";
   header.append(
     makeButton("Save connected loader", () => {
-      const loaders = uniqueNodes(getOutputTargets(node, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
+      const controlledLoaders = getControlledNodes(node).filter(isDoraLoaderNode);
+      const loaders = controlledLoaders.length ? controlledLoaders : uniqueNodes(getOutputTargets(node, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
       const stack = loaders.map(extractLoraStackFromNode).find(Boolean);
       if (stack) {
         character.loras = stack.loras;
@@ -1229,7 +1327,8 @@ function renderLoraPanelContent(section, node, state, uiState, character, prompt
       updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: stack ? "Saved LoRA stack from connected loader." : "No connected DoRA loader found." });
     }),
     makeButton("Apply connected loader", () => {
-      const loaders = uniqueNodes(getOutputTargets(node, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
+      const controlledLoaders = getControlledNodes(node).filter(isDoraLoaderNode);
+      const loaders = controlledLoaders.length ? controlledLoaders : uniqueNodes(getOutputTargets(node, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
       let count = 0;
       for (const loader of loaders) if (applyLoraStackToNode(loader, character)) count += 1;
       updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: count ? `Applied LoRA stack to ${count} connected loader${count === 1 ? "" : "s"}.` : "No connected DoRA loader accepted the stack." });
@@ -1504,7 +1603,9 @@ function initializeNode(node, widget) {
 }
 
 function maybeInjectWidgetInput(nodeData) {
-  if (nodeData?.name !== NODE_CLASS && nodeData?.display_name !== NODE_CLASS) return;
+  const name = nodeData?.name ?? "";
+  const displayName = nodeData?.display_name ?? "";
+  if (![name, displayName].some((value) => value === NODE_CLASS || value === LEGACY_NODE_CLASS)) return;
   const required = nodeData?.input?.required;
   if (!required || required[CUSTOM_WIDGET_INPUT]) return;
   nodeData.input.required = { ...required, [CUSTOM_WIDGET_INPUT]: [CUSTOM_WIDGET_TYPE, {}] };
