@@ -579,6 +579,10 @@ def _normalize_manager_text_role(value: Any, fallback: str = "generic") -> str:
     return fallback
 
 
+def _is_manager_text_role_key(value: Any) -> bool:
+    return _normalize_manager_text_role(value, "") in {"positive", "negative", "generic"}
+
+
 def _clean_text_slot(value: Any, fallback: str = "default") -> str:
     return _clean_state_id(value, fallback)
 
@@ -604,13 +608,20 @@ def _raw_manager_text_boxes(prompt: Dict[str, Any]) -> List[Any]:
         return list(raw)
     if isinstance(raw, dict):
         out: List[Any] = []
-        for slot, value in raw.items():
+        for key, value in raw.items():
+            is_role_key = _is_manager_text_role_key(key)
             if isinstance(value, dict):
                 merged = dict(value)
-                merged.setdefault("slot", slot)
+                if is_role_key and "role" not in merged:
+                    merged["role"] = key
+                elif not is_role_key:
+                    merged.setdefault("slot", key)
                 out.append(merged)
             else:
-                out.append({"slot": slot, "text": value})
+                if is_role_key:
+                    out.append({"role": key, "text": value})
+                else:
+                    out.append({"slot": key, "text": value})
         return out
     return []
 

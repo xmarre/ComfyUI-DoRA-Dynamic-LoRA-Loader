@@ -91,6 +91,10 @@ function normalizeTextRole(value, fallback = "generic") {
   return TEXT_BOX_ROLE_CHOICES.includes(text) ? text : fallback;
 }
 
+function isTextRoleKey(value) {
+  return TEXT_BOX_ROLE_CHOICES.includes(normalizeTextRole(value, ""));
+}
+
 function normalizeTextSlot(value, fallback = "default") {
   return cleanId(value, fallback);
 }
@@ -131,11 +135,15 @@ function rawTextBoxesFromPrompt(prompt) {
   if (Array.isArray(raw)) {
     out.push(...raw);
   } else if (raw && typeof raw === "object") {
-    for (const [slot, value] of Object.entries(raw)) {
+    for (const [key, value] of Object.entries(raw)) {
+      const roleKey = isTextRoleKey(key);
       if (value && typeof value === "object" && !Array.isArray(value)) {
-        out.push({ ...value, slot: value.slot ?? slot });
+        const merged = { ...value };
+        if (roleKey && merged.role == null) merged.role = key;
+        else if (!roleKey && merged.slot == null) merged.slot = key;
+        out.push(merged);
       } else {
-        out.push({ slot, text: value });
+        out.push(roleKey ? { role: key, text: value } : { slot: key, text: value });
       }
     }
   }
@@ -1216,6 +1224,22 @@ function applyConnectedState(targetNode, character, prompt) {
       else genericChanged += 1;
     }
   }
+
+  if (!controlledTextNodes.length) {
+    for (const target of getOutputTargets(targetNode, OUTPUT_NAMES.positive)) {
+      if (applyTextToNode(target.node, getPromptText(prompt, "positive", "default"), "positive", target.inputName)) {
+        posChanged += 1;
+        break;
+      }
+    }
+    for (const target of getOutputTargets(targetNode, OUTPUT_NAMES.negative)) {
+      if (applyTextToNode(target.node, getPromptText(prompt, "negative", "default"), "negative", target.inputName)) {
+        negChanged += 1;
+        break;
+      }
+    }
+  }
+
   if (posChanged) changes.push(`positive template to ${posChanged} node${posChanged === 1 ? "" : "s"}`);
   if (negChanged) changes.push(`negative template to ${negChanged} node${negChanged === 1 ? "" : "s"}`);
   if (genericChanged) changes.push(`generic text to ${genericChanged} node${genericChanged === 1 ? "" : "s"}`);
