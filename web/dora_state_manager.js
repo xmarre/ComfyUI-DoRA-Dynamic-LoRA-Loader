@@ -33,7 +33,8 @@ const OUTPUT_NAMES = {
   settings: ["settings_json", "state_settings"],
   seed: ["seed"],
 };
-const TEXT_WIDGET_NAMES = ["text", "prompt", "positive", "negative", "string", "value", "wildcard", "wildcards"];
+const TEXT_WIDGET_NAMES = ["text", "prompt", "positive", "negative", "string", "value", "wildcard", "wildcards", "wildcard_text", "populated_text"];
+const STATE_TEXT_OUTPUT_NAMES = ["text"];
 const STATE_TEXT_SLOT_WIDGET = "state_slot";
 const TEXT_BOX_ROLE_CHOICES = ["positive", "negative", "generic"];
 const POSITIVE_HINT_RE = /positive|pos|prompt/i;
@@ -575,6 +576,30 @@ function markNodeDirty(node) {
   node?.graph?.change?.();
 }
 
+function markDownstreamDirty(node) {
+  const graph = getGraph(node);
+  if (!graph || !node) return 0;
+  const queue = [node];
+  const seen = new Set([node.id]);
+  let changed = 0;
+  while (queue.length) {
+    const current = queue.shift();
+    for (const output of current?.outputs || []) {
+      for (const linkId of output?.links || []) {
+        const link = graph.links?.[linkId];
+        if (!link) continue;
+        const target = graph.getNodeById?.(link.target_id);
+        if (!target || seen.has(target.id)) continue;
+        seen.add(target.id);
+        markNodeDirty(target);
+        changed += 1;
+        queue.push(target);
+      }
+    }
+  }
+  return changed;
+}
+
 function updateState(node, state, uiState, opts = {}) {
   const widgets = getWidgets(node);
   const normalizedState = normalizeState(state);
@@ -655,11 +680,18 @@ function chainNodeCallback(node, name, fn) {
   };
 }
 
+function isNodeDefForClass(nodeData, nodeType, classNames) {
+  const values = [nodeData?.name, nodeData?.display_name, nodeType?.comfyClass, nodeType?.title]
+    .map((value) => String(value ?? ""));
+  return classNames.some((className) => values.includes(className));
+}
+
 function isTargetNode(nodeData, nodeType) {
-  const nodeName = nodeData?.name ?? "";
-  const displayName = nodeData?.display_name ?? "";
-  const comfyClass = nodeType?.comfyClass ?? "";
-  return [nodeName, displayName, comfyClass].some((name) => name === NODE_CLASS || name === LEGACY_NODE_CLASS);
+  return isNodeDefForClass(nodeData, nodeType, [NODE_CLASS, LEGACY_NODE_CLASS]);
+}
+
+function isStateTextNodeDef(nodeData, nodeType) {
+  return isNodeDefForClass(nodeData, nodeType, [STATE_TEXT_CLASS, STATE_TEXT_DISPLAY_CLASS]);
 }
 
 function nodeNameText(node) {
@@ -894,11 +926,31 @@ function getWidgetMap(node) {
   return map;
 }
 
+function syncNodeWidgetsValueCache(widgetNode, widget) {
+  const widgets = widgetNode?.widgets || [];
+  const index = widgets.indexOf(widget);
+  if (index < 0) return;
+  if (!Array.isArray(widgetNode.widgets_values)) widgetNode.widgets_values = [];
+  widgetNode.widgets_values[index] = widget.value;
+}
+
 function setNodeWidget(widgetNode, widget, value) {
   if (!widget) return false;
   widget.value = value;
   widget.callback?.(value);
   widgetNode?.onWidgetChanged?.(widget.name, value, widget.value, widget);
+  markNodeDirty(widgetNode);
+  return true;
+}
+
+function setMirroredNodeWidget(widgetNode, widget, value) {
+  if (!widget) return false;
+  const oldValue = widget.value;
+  widget.value = value;
+  syncNodeWidgetsValueCache(widgetNode, widget);
+  if (Object.is(oldValue, value)) return false;
+  widget.callback?.call?.(widget, value, app?.canvas, widgetNode, null, null);
+  widgetNode?.onWidgetChanged?.(widget.name, value, oldValue, widget);
   markNodeDirty(widgetNode);
   return true;
 }
@@ -939,6 +991,74 @@ function extractTextFromNode(sourceNode, role = "", inputName = "") {
 function applyTextToNode(targetNode, text, role = "", inputName = "") {
   const widget = findTextWidget(targetNode, role, inputName);
   return setNodeWidget(targetNode, widget, String(text ?? ""));
+}
+
+
+function textInputLooksMirrorable(inputName) {
+  return /text|prompt|wildcard|positive|negative|populated|string/i.test(String(inputName ?? ""));
+}
+
+function widgetByExactName(node, name) {
+  const wanted = String(name ?? "").toLowerCase();
+  return (node?.widgets || []).find((widget) => String(widget?.name ?? "").toLowerCase() === wanted) || null;
+}
+
+function isImpactWildcardNode(node) {
+  const text = nodeNameText(node);
+  if (/ImpactWildcard(?:Processor|Encode)?/i.test(text)) return true;
+  return !!(widgetByExactName(node, "wildcard_text") && widgetByExactName(node, "populated_text"));
+}
+
+function mirrorTextToImpactWildcardNode(targetNode, text, inputName = "") {
+  if (!isImpactWildcardNode(targetNode)) return false;
+  const input = String(inputName ?? "").toLowerCase();
+  const next = String(text ?? "");
+  let changed = 0;
+
+  // ImpactWildcardProcessor and ImpactWildcardEncode execute from populated_text.
+  // wildcard_text is mostly a UI/template field; if only that widget changes,
+  // the backend can keep processing the previous populated_text value.
+  const populated = widgetByExactName(targetNode, "populated_text");
+  if (populated && setMirroredNodeWidget(targetNode, populated, next)) changed += 1;
+
+  // Keep wildcard_text visually synchronized when the State Manager is connected
+  // to that input, or when no specific input name is available.
+  if (!input || input === "wildcard_text") {
+    const wildcard = widgetByExactName(targetNode, "wildcard_text");
+    if (wildcard && wildcard !== populated && setMirroredNodeWidget(targetNode, wildcard, next)) changed += 1;
+  }
+
+  return changed > 0;
+}
+
+function mirrorTextToLinkedWidgetTarget(targetNode, text, role = "", inputName = "") {
+  if (!targetNode || isStateManagerNode(targetNode)) return false;
+  if (isImpactWildcardNode(targetNode) && mirrorTextToImpactWildcardNode(targetNode, text, inputName)) return true;
+  if (inputName && !textInputLooksMirrorable(inputName) && !isPromptLikeNode(targetNode)) return false;
+  const widget = findTextWidget(targetNode, role, inputName);
+  if (!widget) return false;
+  return setMirroredNodeWidget(targetNode, widget, String(text ?? ""));
+}
+
+function mirrorStateTextToDownstreamWidgets(sourceNode, text, role = "") {
+  let changed = 0;
+  const changedTargets = [];
+  for (const target of getOutputTargets(sourceNode, STATE_TEXT_OUTPUT_NAMES)) {
+    if (target.node === sourceNode) continue;
+    if (mirrorTextToLinkedWidgetTarget(target.node, text, role, target.inputName)) {
+      changed += 1;
+      changedTargets.push(target.node);
+    }
+  }
+  for (const targetNode of changedTargets) markDownstreamDirty(targetNode);
+  return changed;
+}
+
+function syncStateTextNodeDownstream(sourceNode) {
+  if (!sourceNode || !isStateTextNode(sourceNode)) return 0;
+  const role = getStateTextRole(sourceNode);
+  const text = extractTextFromNode(sourceNode, role);
+  return mirrorStateTextToDownstreamWidgets(sourceNode, text, role);
 }
 
 function isJsonSafeWidgetValue(value) {
@@ -1219,6 +1339,7 @@ function applyConnectedState(targetNode, character, prompt) {
     const saved = findPromptTextBox(prompt, role, slot, { allowRoleFallback: false });
     if (!saved) continue;
     if (applyTextToNode(textNode, saved.text, role)) {
+      mirrorStateTextToDownstreamWidgets(textNode, saved.text, role);
       if (role === "positive") posChanged += 1;
       else if (role === "negative") negChanged += 1;
       else genericChanged += 1;
@@ -1334,7 +1455,10 @@ function applySelectedState(targetNode, character, prompt) {
     const role = getStateTextRole(textNode);
     const slot = ensureUniqueStateTextSlot(textNode, role, usedTextKeys, index);
     const saved = findPromptTextBox(prompt, role, slot, { allowRoleFallback: false });
-    if (saved && applyTextToNode(textNode, saved.text, role)) changedTextCounts[role] = (changedTextCounts[role] || 0) + 1;
+    if (saved && applyTextToNode(textNode, saved.text, role)) {
+      mirrorStateTextToDownstreamWidgets(textNode, saved.text, role);
+      changedTextCounts[role] = (changedTextCounts[role] || 0) + 1;
+    }
   }
   if (changedTextCounts.positive) changes.push(`positive template to ${changedTextCounts.positive} node${changedTextCounts.positive === 1 ? "" : "s"}`);
   if (changedTextCounts.negative) changes.push(`negative template to ${changedTextCounts.negative} node${changedTextCounts.negative === 1 ? "" : "s"}`);
@@ -2202,6 +2326,62 @@ function initializeNode(node, widget) {
   return widget;
 }
 
+
+function initializeStateTextNode(node) {
+  if (node.__dsmStateTextInitialized) return;
+  node.__dsmStateTextInitialized = true;
+
+  const sync = () => {
+    try {
+      syncStateTextNodeDownstream(node);
+    } catch (err) {
+      console.warn(`[${EXT_NAME}] failed to sync State Manager Text Box downstream widgets`, err);
+    }
+  };
+
+  chainNodeCallback(node, "onWidgetChanged", function (name, value, oldValue, widget) {
+    const widgetName = String(name ?? widget?.name ?? "").toLowerCase();
+    if (widgetName === "text" || widgetName === "role" || widgetName === STATE_TEXT_SLOT_WIDGET) sync();
+  });
+
+  chainNodeCallback(node, "onConnectionsChange", function () {
+    sync();
+  });
+
+  const textWidget = widgetByExactName(node, "text");
+  if (textWidget && !textWidget.__dsmStateTextBeforeQueued) {
+    textWidget.__dsmStateTextBeforeQueued = true;
+    const originalBeforeQueued = textWidget.beforeQueued;
+    textWidget.beforeQueued = function () {
+      const result = originalBeforeQueued?.apply(this, arguments);
+      sync();
+      return result;
+    };
+  }
+
+  requestAnimationFrame(sync);
+}
+
+function patchStateTextNodeDef(nodeType) {
+  if (nodeType.prototype.__dsmStateTextPatched) return;
+  nodeType.prototype.__dsmStateTextPatched = true;
+
+  const originalOnNodeCreated = nodeType.prototype.onNodeCreated;
+  nodeType.prototype.onNodeCreated = function () {
+    const result = originalOnNodeCreated?.apply(this, arguments);
+    initializeStateTextNode(this);
+    return result;
+  };
+
+  const originalOnConfigure = nodeType.prototype.onConfigure;
+  nodeType.prototype.onConfigure = function () {
+    const result = originalOnConfigure?.apply(this, arguments);
+    initializeStateTextNode(this);
+    requestAnimationFrame(() => syncStateTextNodeDownstream(this));
+    return result;
+  };
+}
+
 function maybeInjectWidgetInput(nodeData) {
   const name = nodeData?.name ?? "";
   const displayName = nodeData?.display_name ?? "";
@@ -2238,6 +2418,7 @@ app.registerExtension({
 
   async beforeRegisterNodeDef(nodeType, nodeData) {
     maybeInjectWidgetInput(nodeData);
+    if (isStateTextNodeDef(nodeData, nodeType)) patchStateTextNodeDef(nodeType);
     if (!isTargetNode(nodeData, nodeType)) return;
     const originalOnSerialize = nodeType.prototype.onSerialize;
     nodeType.prototype.onSerialize = function (o) {
