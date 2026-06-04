@@ -436,6 +436,7 @@ class FlexibleOptionalInputType(dict):
 
 _DORA_STATE_MANAGER_SCHEMA_VERSION = 1
 _DORA_STATE_KIND = "dora_state_manager_state"
+_DORA_LORA_STACK_KIND = "dora_lora_stack"
 _DORA_STATE_LOADER_GLOBAL_KEYS: Set[str] = {
     "stack_enabled",
     "verbose",
@@ -468,6 +469,7 @@ def _state_manager_default_state() -> Dict[str, Any]:
             {
                 "id": "default_character",
                 "name": "Default Character",
+                "thumbnail": {},
                 "loras": [],
                 "loader_globals": {},
                 "prompts": [
@@ -548,6 +550,91 @@ def _normalize_manager_settings(settings: Any) -> Dict[str, Any]:
         return settings
     parsed = _safe_json_load(settings, {})
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _normalize_manager_thumbnail(thumbnail: Any) -> Dict[str, Any]:
+    if isinstance(thumbnail, dict):
+        filename = str(thumbnail.get("filename", "")).strip()
+        subfolder = str(thumbnail.get("subfolder", "")).strip()
+        type_name = str(thumbnail.get("type", "input")).strip() or "input"
+        url = str(thumbnail.get("url", "")).strip()
+        if filename:
+            return {"filename": filename, "subfolder": subfolder, "type": type_name}
+        if url:
+            return {"url": url}
+        return {}
+    text = str(thumbnail or "").strip()
+    if text:
+        return {"url": text}
+    return {}
+
+
+def _normalize_runtime_lora_stack(raw: Any) -> Optional[Dict[str, Any]]:
+    payload = _safe_json_load(raw, None)
+    if not isinstance(payload, dict):
+        return None
+
+    # Accept either the explicit stack output from DoRA Power LoRA Loader or a resolved
+    # manager payload. The latter makes manager chaining and old workflows less brittle.
+    kind = payload.get("kind")
+    if kind not in {_DORA_LORA_STACK_KIND, _DORA_STATE_KIND}:
+        return None
+
+    rows_in = payload.get("loras", payload.get("rows", []))
+    rows: List[Dict[str, Any]] = []
+    if isinstance(rows_in, list):
+        for row in rows_in:
+            normalized = _normalize_manager_lora_row(row)
+            if normalized is not None:
+                rows.append(normalized)
+
+    return {
+        "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
+        "kind": _DORA_LORA_STACK_KIND,
+        "loras": rows,
+        "loader_globals": _normalize_manager_loader_globals(payload.get("loader_globals", payload.get("globals", {}))),
+    }
+
+
+def _manager_rows_to_lora_entries(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for row in rows:
+        normalized = _normalize_manager_lora_row(row)
+        if normalized is None:
+            continue
+        name = normalized.get("name", "None")
+        if name in ("", "None", "NONE"):
+            continue
+        entries.append({
+            "on": bool(normalized.get("enabled", True)),
+            "lora": name,
+            "strength_model": float(normalized.get("strength_model", 1.0)),
+            "strength_clip": float(normalized.get("strength_clip", normalized.get("strength_model", 1.0))),
+        })
+    return entries
+
+
+def _lora_entries_to_manager_rows(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        rows.append({
+            "enabled": bool(entry.get("on", entry.get("enabled", True))),
+            "name": str(entry.get("lora", entry.get("name", "None")) or "None"),
+            "strength_model": float(entry.get("strength_model", entry.get("strength", 1.0))),
+            "strength_clip": float(entry.get("strength_clip", entry.get("strengthTwo", entry.get("strength_model", entry.get("strength", 1.0))))),
+        })
+    return rows
+
+
+def _build_lora_stack_payload(entries: Iterable[Dict[str, Any]], loader_globals: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
+        "kind": _DORA_LORA_STACK_KIND,
+        "loras": _lora_entries_to_manager_rows(entries),
+        "loader_globals": _normalize_manager_loader_globals(loader_globals),
+    }
 
 
 def _normalize_manager_loader_globals(globals_in: Any) -> Dict[str, Any]:
@@ -657,6 +744,7 @@ def _normalize_state_manager_state(raw: Any) -> Dict[str, Any]:
             {
                 "id": char_id,
                 "name": name,
+                "thumbnail": _normalize_manager_thumbnail(char.get("thumbnail", {})),
                 "loras": loras,
                 "loader_globals": _normalize_manager_loader_globals(char.get("loader_globals", char.get("globals", {}))),
                 "prompts": prompts,
@@ -690,27 +778,58 @@ def _pick_state_manager_prompt(character: Dict[str, Any], selected_prompt_id: An
     return prompts[0] if prompts else _state_manager_default_state()["characters"][0]["prompts"][0]
 
 
-def _resolve_dora_state_payload(state_json: Any, selected_character_id: Any, selected_prompt_id: Any) -> Dict[str, Any]:
+def _resolve_dora_state_payload(
+    state_json: Any,
+    selected_character_id: Any,
+    selected_prompt_id: Any,
+    positive_prompt: Any = None,
+    negative_prompt: Any = None,
+    lora_stack: Any = None,
+    settings_json_input: Any = None,
+    use_runtime_inputs: Any = False,
+) -> Dict[str, Any]:
     state = _normalize_state_manager_state(state_json)
     character = _pick_state_manager_character(state, selected_character_id)
     prompt = _pick_state_manager_prompt(character, selected_prompt_id)
+
     settings = _normalize_manager_settings(prompt.get("settings", {}))
+    loras = character.get("loras", [])
+    loader_globals = character.get("loader_globals", {})
+    positive = str(prompt.get("positive", "") or "")
+    negative = str(prompt.get("negative", "") or "")
+
+    if _state_manager_bool(use_runtime_inputs, default=False):
+        stack_payload = _normalize_runtime_lora_stack(lora_stack)
+        if stack_payload is not None:
+            loras = stack_payload.get("loras", [])
+            stack_globals = stack_payload.get("loader_globals")
+            if isinstance(stack_globals, dict) and stack_globals:
+                loader_globals = stack_globals
+        if positive_prompt is not None:
+            positive = str(positive_prompt or "")
+        if negative_prompt is not None:
+            negative = str(negative_prompt or "")
+        parsed_settings = _normalize_manager_settings(settings_json_input)
+        if parsed_settings:
+            settings = parsed_settings
+
     return {
         "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
         "kind": _DORA_STATE_KIND,
         "character": {
             "id": character.get("id", ""),
             "name": character.get("name", ""),
+            "thumbnail": character.get("thumbnail", {}),
         },
         "prompt": {
             "id": prompt.get("id", ""),
             "name": prompt.get("name", ""),
         },
-        "loras": character.get("loras", []),
-        "loader_globals": character.get("loader_globals", {}),
+        "loras": loras,
+        "loader_globals": loader_globals,
         "settings": settings,
-        "positive_prompt": str(prompt.get("positive", "") or ""),
-        "negative_prompt": str(prompt.get("negative", "") or ""),
+        "positive_prompt": positive,
+        "negative_prompt": negative,
     }
 
 
@@ -748,23 +867,7 @@ def _parse_dora_state_lora_entries(state_payload: Optional[Dict[str, Any]]) -> O
     rows = state_payload.get("loras")
     if not isinstance(rows, list):
         return None
-    entries: List[Dict[str, Any]] = []
-    for row in rows:
-        normalized = _normalize_manager_lora_row(row)
-        if normalized is None:
-            continue
-        name = normalized.get("name", "None")
-        if name in ("", "None", "NONE"):
-            continue
-        entries.append(
-            {
-                "on": bool(normalized.get("enabled", True)),
-                "lora": name,
-                "strength_model": float(normalized.get("strength_model", 1.0)),
-                "strength_clip": float(normalized.get("strength_clip", normalized.get("strength_model", 1.0))),
-            }
-        )
-    return entries
+    return _manager_rows_to_lora_entries(rows)
 
 
 def _state_payload_get_loader_global(state_payload: Optional[Dict[str, Any]], key: str, fallback: Any) -> Any:
@@ -3575,27 +3678,73 @@ class DoraStateManager:
                         "multiline": True,
                     },
                 ),
+                "ui_state_json": (
+                    "STRING",
+                    {
+                        "default": json.dumps({"version": _DORA_STATE_MANAGER_SCHEMA_VERSION}, separators=(",", ":")),
+                        "multiline": False,
+                    },
+                ),
                 "selected_character_id": ("STRING", {"default": "default_character", "multiline": False}),
                 "selected_prompt_id": ("STRING", {"default": "default_prompt", "multiline": False}),
-            }
+                "use_runtime_inputs": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "positive_prompt": ("STRING", {"forceInput": True, "multiline": True, "default": ""}),
+                "negative_prompt": ("STRING", {"forceInput": True, "multiline": True, "default": ""}),
+                "settings_json_input": ("STRING", {"forceInput": True, "multiline": True, "default": ""}),
+                "lora_stack": ("DORA_LORA_STACK",),
+            },
         }
 
-    RETURN_TYPES = ("DORA_STATE", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("dora_state", "positive_prompt", "negative_prompt", "settings_json")
+    RETURN_TYPES = ("DORA_STATE", "STRING", "STRING", "STRING", "DORA_LORA_STACK")
+    RETURN_NAMES = ("dora_state", "positive_prompt", "negative_prompt", "settings_json", "selected_lora_stack")
     FUNCTION = "resolve_state"
     CATEGORY = "state managers"
 
     @classmethod
-    def IS_CHANGED(cls, state_json: Any, selected_character_id: Any = "", selected_prompt_id: Any = ""):
+    def IS_CHANGED(
+        cls,
+        state_json: Any,
+        ui_state_json: Any = "",
+        selected_character_id: Any = "",
+        selected_prompt_id: Any = "",
+        use_runtime_inputs: Any = False,
+        positive_prompt: Any = None,
+        negative_prompt: Any = None,
+        settings_json_input: Any = None,
+        lora_stack: Any = None,
+    ):
         payload = {
             "state_json": state_json,
+            "ui_state_json": ui_state_json,
             "selected_character_id": selected_character_id,
             "selected_prompt_id": selected_prompt_id,
+            "use_runtime_inputs": use_runtime_inputs,
         }
+        if _state_manager_bool(use_runtime_inputs, default=False):
+            payload.update({
+                "positive_prompt": positive_prompt,
+                "negative_prompt": negative_prompt,
+                "settings_json_input": settings_json_input,
+                "lora_stack": lora_stack,
+            })
         return json.dumps(payload, sort_keys=True, default=str)
 
     @classmethod
-    def VALIDATE_INPUTS(cls, state_json: Any, selected_character_id: Any = "", selected_prompt_id: Any = ""):
+    def VALIDATE_INPUTS(
+        cls,
+        state_json: Any,
+        ui_state_json: Any = "",
+        selected_character_id: Any = "",
+        selected_prompt_id: Any = "",
+        use_runtime_inputs: Any = False,
+        positive_prompt: Any = None,
+        negative_prompt: Any = None,
+        settings_json_input: Any = None,
+        lora_stack: Any = None,
+    ):
+        del ui_state_json, use_runtime_inputs, positive_prompt, negative_prompt, settings_json_input, lora_stack
         state = _normalize_state_manager_state(state_json)
         character = _pick_state_manager_character(state, selected_character_id)
         prompt = _pick_state_manager_prompt(character, selected_prompt_id)
@@ -3605,14 +3754,40 @@ class DoraStateManager:
             return "DoRA State Manager: no prompt states are available for the selected character."
         return True
 
-    def resolve_state(self, state_json: Any, selected_character_id: Any = "", selected_prompt_id: Any = ""):
-        payload = _resolve_dora_state_payload(state_json, selected_character_id, selected_prompt_id)
+    def resolve_state(
+        self,
+        state_json: Any,
+        ui_state_json: Any = "",
+        selected_character_id: Any = "",
+        selected_prompt_id: Any = "",
+        use_runtime_inputs: Any = False,
+        positive_prompt: Any = None,
+        negative_prompt: Any = None,
+        settings_json_input: Any = None,
+        lora_stack: Any = None,
+    ):
+        del ui_state_json
+        payload = _resolve_dora_state_payload(
+            state_json,
+            selected_character_id,
+            selected_prompt_id,
+            positive_prompt=positive_prompt,
+            negative_prompt=negative_prompt,
+            lora_stack=lora_stack,
+            settings_json_input=settings_json_input,
+            use_runtime_inputs=use_runtime_inputs,
+        )
         settings_json = json.dumps(payload.get("settings", {}), ensure_ascii=False, sort_keys=True, indent=2)
+        lora_stack_payload = _build_lora_stack_payload(
+            _manager_rows_to_lora_entries(payload.get("loras", [])),
+            payload.get("loader_globals", {}),
+        )
         return (
             payload,
             payload.get("positive_prompt", ""),
             payload.get("negative_prompt", ""),
             settings_json,
+            lora_stack_payload,
         )
 
 
@@ -3664,8 +3839,8 @@ class DoraPowerLoraLoader:
             "hidden": {},
         }
 
-    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "STRING")
-    RETURN_NAMES = ("MODEL", "CLIP", "auto_strength_report_json", "analysis_report")
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "STRING", "DORA_LORA_STACK")
+    RETURN_NAMES = ("MODEL", "CLIP", "auto_strength_report_json", "analysis_report", "lora_stack")
     HAS_INTERMEDIATE_OUTPUT = True
     FUNCTION = "load_loras"
     CATEGORY = "loaders"
@@ -3978,6 +4153,31 @@ class DoraPowerLoraLoader:
 
         report_rows: List[Dict[str, Any]] = []
 
+        entries = _parse_dora_state_lora_entries(state_payload) if state_payload is not None else None
+        if entries is None:
+            entries = _parse_lora_stack_kwargs(kwargs)
+
+        loader_globals_payload = {
+            "stack_enabled": stack_enabled,
+            "verbose": verbose,
+            "log_unloaded_keys": log_unloaded_keys,
+            "broadcast_auto_scale": broadcast_auto_scale,
+            "broadcast_modulations": broadcast_modulations,
+            "broadcast_include_dora_scale": broadcast_include_dora_scale,
+            "broadcast_scale": broadcast_scale,
+            "dora_decompose_debug": dora_dbg,
+            "dora_decompose_debug_n": dora_dbg_n,
+            "dora_decompose_debug_stack_depth": dora_dbg_stack,
+            "dora_slice_fix": dora_slice_fix,
+            "dora_adaln_swap_fix": dora_adaln_swap_fix,
+            "zimage_lumina2_compat": zimage_lumina2_compat,
+            "auto_strength_enabled": auto_strength_enabled,
+            "auto_strength_device": auto_strength_device,
+            "auto_strength_ratio_floor": auto_strength_ratio_floor,
+            "auto_strength_ratio_ceiling": auto_strength_ratio_ceiling,
+        }
+        lora_stack_payload = _build_lora_stack_payload(entries, loader_globals_payload)
+
         if not stack_enabled:
             stack_report = {
                 "schema": 1,
@@ -3991,16 +4191,13 @@ class DoraPowerLoraLoader:
             report_json = _auto_strength_json_dumps(stack_report, pretty=True)
             report_text = _build_auto_strength_stack_text_report(stack_report)
             return {
-                "result": (model, clip, report_json, report_text),
+                "result": (model, clip, report_json, report_text, lora_stack_payload),
                 "ui": {
                     "auto_strength_report_json": (report_json,),
                     "analysis_report": (report_text,),
                 },
             }
 
-        entries = _parse_dora_state_lora_entries(state_payload) if state_payload is not None else None
-        if entries is None:
-            entries = _parse_lora_stack_kwargs(kwargs)
         if not entries:
             stack_report = {
                 "schema": 1,
@@ -4014,7 +4211,7 @@ class DoraPowerLoraLoader:
             report_json = _auto_strength_json_dumps(stack_report, pretty=True)
             report_text = _build_auto_strength_stack_text_report(stack_report)
             return {
-                "result": (model, clip, report_json, report_text),
+                "result": (model, clip, report_json, report_text, lora_stack_payload),
                 "ui": {
                     "auto_strength_report_json": (report_json,),
                     "analysis_report": (report_text,),
@@ -4138,7 +4335,7 @@ class DoraPowerLoraLoader:
         report_json = _auto_strength_json_dumps(stack_report, pretty=True)
         report_text = _build_auto_strength_stack_text_report(stack_report)
         return {
-            "result": (new_model, new_clip, report_json, report_text),
+            "result": (new_model, new_clip, report_json, report_text, lora_stack_payload),
             "ui": {
                 "auto_strength_report_json": (report_json,),
                 "analysis_report": (report_text,),

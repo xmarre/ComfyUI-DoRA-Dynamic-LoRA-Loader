@@ -541,3 +541,20 @@ The manager state is stored in the workflow through hidden backend widgets:
 No external preset database is required for this first version.
 
 The `DORA_STATE` payload contains the selected character identity, selected prompt identity, saved LoRA rows, saved loader-global overrides, prompt text, and prompt settings. The loader accepts only this typed payload shape; invalid or missing `dora_state` data falls back to the loader's existing local row-widget parsing.
+
+## DoRA State Manager
+
+The `DoRA State Manager` stores character-level LoRA stacks and per-character prompt/settings presets.
+
+Recommended workflow:
+
+1. Configure a normal `DoRA Power LoRA Loader` and prompt nodes as usual.
+2. Add `DoRA State Manager`.
+3. Select a character tile or create a new one.
+4. Use **Capture selected nodes** after selecting an existing `DoRA Power LoRA Loader` and prompt text nodes, or connect the manager inputs and use **Capture connected**.
+5. Connect `DoRA State Manager.dora_state` to `DoRA Power LoRA Loader.dora_state` to drive the loader from the selected character.
+6. Connect `positive_prompt` / `negative_prompt` to text encode nodes as needed.
+
+The manager has optional input ports for `positive_prompt`, `negative_prompt`, `settings_json_input`, and `lora_stack`. The loader appends a `lora_stack` output so an existing stack can be routed into the manager without manually recreating rows. Existing loader outputs keep their original indexes; `lora_stack` is appended after `analysis_report`.
+
+The UI uses a resizable DOM widget, character thumbnail tiles, and a selected-character submenu for prompts, LoRA stack capture/editing, and future settings JSON.
