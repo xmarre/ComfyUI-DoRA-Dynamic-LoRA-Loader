@@ -48,6 +48,9 @@ const STATE_SEED_INCREMENT = -2;
 const STATE_SEED_DECREMENT = -3;
 const STATE_SEED_SPECIALS = [STATE_SEED_RANDOM, STATE_SEED_INCREMENT, STATE_SEED_DECREMENT];
 const LAST_SEED_BUTTON_LABEL = "♻️ (Use Last Queued Seed)";
+const BACKUP_STORAGE_PREFIX = "comfyui_dora_state_manager_backup_v1";
+const BACKUP_WORKFLOW_ID_EXTRA_KEY = "dora_state_manager_backup_workflow_id";
+const BACKUP_EXPORT_KIND = "dora_state_manager_export";
 
 
 function structuredCloneCompat(value) {
@@ -525,6 +528,221 @@ function serializeUiState(uiState) {
   return JSON.stringify(normalizeUiState(uiState), null, 0);
 }
 
+function canonicalJson(value) {
+  return JSON.stringify(value);
+}
+
+function isDefaultStateValue(value) {
+  try {
+    return canonicalJson(normalizeState(value)) === canonicalJson(normalizeState(defaultState()));
+  } catch {
+    return true;
+  }
+}
+
+function isStateJsonDefaultOrEmpty(raw) {
+  if (raw == null) return true;
+  if (typeof raw === "string" && !raw.trim()) return true;
+  return isDefaultStateValue(raw);
+}
+
+function graphForBackup(node) {
+  return getGraph(node) || app?.graph || null;
+}
+
+function workflowBackupId(node, { create = true } = {}) {
+  const graph = graphForBackup(node);
+  if (!graph) return "unknown_workflow";
+  graph.extra = graph.extra || {};
+  const existing = String(graph.extra[BACKUP_WORKFLOW_ID_EXTRA_KEY] ?? "").trim();
+  if (existing) return existing;
+  if (!create) return "";
+  const id = makeId("workflow");
+  graph.extra[BACKUP_WORKFLOW_ID_EXTRA_KEY] = id;
+  return id;
+}
+
+function nodeBackupId(node) {
+  const id = node?.id ?? node?.__id ?? "unknown_node";
+  return String(id).trim() || "unknown_node";
+}
+
+function stateBackupKey(node, { createWorkflowId = true } = {}) {
+  const workflowId = workflowBackupId(node, { create: createWorkflowId }) || "unknown_workflow";
+  return `${BACKUP_STORAGE_PREFIX}:${workflowId}:node:${nodeBackupId(node)}`;
+}
+
+function backupStateSummary(state) {
+  const normalized = normalizeState(state);
+  const characterCount = normalized.characters.length;
+  const promptCount = normalized.characters.reduce((sum, character) => sum + (character.prompts?.length || 0), 0);
+  const loaderCount = normalized.characters.reduce((sum, character) => sum + normalizeLoaderStacks(character).length, 0);
+  return { characterCount, promptCount, loaderCount };
+}
+
+function normalizeBackupRecord(raw) {
+  const parsed = safeJsonParse(raw, null);
+  if (!parsed || typeof parsed !== "object") return null;
+  const stateRaw = parsed.state ?? parsed.state_json ?? parsed.stateJson;
+  if (stateRaw == null) return null;
+  const state = normalizeState(stateRaw);
+  const uiState = normalizeUiState(parsed.ui_state ?? parsed.uiState ?? parsed.ui_state_json ?? parsed.uiStateJson ?? defaultUiState());
+  const characterId = String(parsed.selected_character_id ?? parsed.selectedCharacterId ?? "").trim();
+  const promptId = String(parsed.selected_prompt_id ?? parsed.selectedPromptId ?? "").trim();
+  return {
+    version: 1,
+    kind: "dora_state_manager_backup",
+    workflowId: String(parsed.workflow_id ?? parsed.workflowId ?? "").trim(),
+    nodeId: String(parsed.node_id ?? parsed.nodeId ?? "").trim(),
+    updatedAt: String(parsed.updated_at ?? parsed.updatedAt ?? "").trim(),
+    state,
+    uiState,
+    selectedCharacterId: characterId,
+    selectedPromptId: promptId,
+  };
+}
+
+function readStateBackup(node) {
+  try {
+    const raw = globalThis.localStorage?.getItem(stateBackupKey(node, { createWorkflowId: false }));
+    return normalizeBackupRecord(raw);
+  } catch (err) {
+    console.warn(`[${EXT_NAME}] failed to read State Manager browser backup`, err);
+    return null;
+  }
+}
+
+function makeBackupRecord(node, state, uiState, widgets = getWidgets(node)) {
+  const normalizedState = normalizeState(state);
+  const normalizedUiState = normalizeUiState(uiState || defaultUiState());
+  return {
+    version: 1,
+    kind: "dora_state_manager_backup",
+    workflow_id: workflowBackupId(node, { create: true }),
+    node_id: nodeBackupId(node),
+    updated_at: new Date().toISOString(),
+    summary: backupStateSummary(normalizedState),
+    state: normalizedState,
+    ui_state: normalizedUiState,
+    selected_character_id: String(widgetValue(widgets.characterWidget, "") || ""),
+    selected_prompt_id: String(widgetValue(widgets.promptWidget, "") || ""),
+  };
+}
+
+function writeStateBackup(node, state, uiState, widgets = getWidgets(node)) {
+  if (!node) return;
+  try {
+    const normalizedState = normalizeState(state);
+    const existing = readStateBackup(node);
+    if (isDefaultStateValue(normalizedState) && existing && !isDefaultStateValue(existing.state)) return;
+    const record = makeBackupRecord(node, normalizedState, uiState, widgets);
+    globalThis.localStorage?.setItem(stateBackupKey(node, { createWorkflowId: true }), JSON.stringify(record));
+  } catch (err) {
+    console.warn(`[${EXT_NAME}] failed to write State Manager browser backup`, err);
+  }
+}
+
+function selectionIdsForState(state, characterId = "", promptId = "") {
+  const normalizedState = normalizeState(state);
+  const character = normalizedState.characters.find((item) => item.id === characterId) || normalizedState.characters[0];
+  const prompt = character?.prompts?.find((item) => item.id === promptId) || character?.prompts?.[0];
+  return { characterId: character?.id || "", promptId: prompt?.id || "" };
+}
+
+function backupRestoredStatus(record) {
+  const summary = record?.state ? backupStateSummary(record.state) : null;
+  const suffix = summary ? ` (${summary.characterCount} character${summary.characterCount === 1 ? "" : "s"}, ${summary.promptCount} prompt${summary.promptCount === 1 ? "" : "s"}).` : ".";
+  return `Warning: this node loaded with default/empty state while a browser backup existed. Restored backup${suffix} Save the workflow to persist the recovered state.`;
+}
+
+function tryRestoreStateBackup(node, { force = false } = {}) {
+  const widgets = getWidgets(node);
+  const rawState = widgetValue(widgets.stateWidget, "");
+  if (!force && !isStateJsonDefaultOrEmpty(rawState)) return false;
+  const backup = readStateBackup(node);
+  if (!backup || isDefaultStateValue(backup.state)) return false;
+  const selection = selectionIdsForState(backup.state, backup.selectedCharacterId, backup.selectedPromptId);
+  setWidgetValue(widgets.stateWidget, serializeState(backup.state));
+  setWidgetValue(widgets.uiStateWidget, serializeUiState({ ...backup.uiState, status: backupRestoredStatus(backup) }));
+  setWidgetValue(widgets.characterWidget, selection.characterId);
+  setWidgetValue(widgets.promptWidget, selection.promptId);
+  node.properties = node.properties || {};
+  node.properties.dora_state_manager = {
+    state: normalizeState(backup.state),
+    selected_character_id: selection.characterId,
+    selected_prompt_id: selection.promptId,
+  };
+  node.__dsmBackupWarning = backupRestoredStatus(backup);
+  cacheRenderableState(node, backup.state, { ...backup.uiState, status: backupRestoredStatus(backup) });
+  markNodeDirty(node);
+  return true;
+}
+
+function buildStateExportPayload(node, state, uiState, characterId, promptId) {
+  const normalizedState = normalizeState(state);
+  const normalizedUiState = normalizeUiState(uiState || defaultUiState());
+  const selection = selectionIdsForState(normalizedState, characterId, promptId);
+  return {
+    version: 1,
+    kind: BACKUP_EXPORT_KIND,
+    exported_at: new Date().toISOString(),
+    workflow_id: workflowBackupId(node, { create: true }),
+    node_id: nodeBackupId(node),
+    state: normalizedState,
+    ui_state: normalizedUiState,
+    selected_character_id: selection.characterId,
+    selected_prompt_id: selection.promptId,
+  };
+}
+
+function downloadJsonFile(filename, payload) {
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.rel = "noopener";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+}
+
+function exportStateJson(node, state, uiState, characterId, promptId) {
+  const payload = buildStateExportPayload(node, state, uiState, characterId, promptId);
+  const timestamp = payload.exported_at.replace(/[:.]/g, "-");
+  downloadJsonFile(`dora-state-manager-node-${nodeBackupId(node)}-${timestamp}.json`, payload);
+}
+
+function parseImportedStateJson(text) {
+  const parsed = JSON.parse(String(text ?? ""));
+  const stateRaw = parsed.state ?? parsed.state_json ?? parsed.stateJson ?? (Array.isArray(parsed.characters) ? parsed : null);
+  if (stateRaw == null) throw new Error("JSON does not contain a State Manager state.");
+  const state = normalizeState(stateRaw);
+  if (isDefaultStateValue(state) && !isDefaultStateValue(stateRaw)) throw new Error("Imported state normalized to the default state.");
+  const uiState = normalizeUiState(parsed.ui_state ?? parsed.uiState ?? parsed.ui_state_json ?? parsed.uiStateJson ?? defaultUiState());
+  const selection = selectionIdsForState(
+    state,
+    String(parsed.selected_character_id ?? parsed.selectedCharacterId ?? ""),
+    String(parsed.selected_prompt_id ?? parsed.selectedPromptId ?? "")
+  );
+  return { state, uiState, ...selection };
+}
+
+async function importStateJsonFile(node, file, currentUiState = defaultUiState()) {
+  if (!file) return;
+  const text = await file.text();
+  const imported = parseImportedStateJson(text);
+  updateState(node, imported.state, { ...currentUiState, ...imported.uiState }, {
+    characterId: imported.characterId,
+    promptId: imported.promptId,
+    status: `Imported State Manager JSON from ${file.name || "file"}.`,
+  });
+}
+
 function getWidgets(node) {
   const map = new Map();
   for (const widget of node.widgets ?? []) map.set(widget.name, widget);
@@ -634,7 +852,9 @@ function updateState(node, state, uiState, opts = {}) {
     selected_character_id: widgetValue(widgets.characterWidget, ""),
     selected_prompt_id: widgetValue(widgets.promptWidget, ""),
   };
-  cacheRenderableState(node, normalizedState, normalizeUiState(widgetValue(widgets.uiStateWidget, "")));
+  const cachedUiState = normalizeUiState(widgetValue(widgets.uiStateWidget, ""));
+  cacheRenderableState(node, normalizedState, cachedUiState);
+  writeStateBackup(node, normalizedState, cachedUiState, widgets);
   if (opts.dirty !== false) markNodeDirty(node);
   if (opts.render !== false) scheduleRender(node);
 }
@@ -1636,8 +1856,31 @@ function renderHeader(node, state, uiState, character, prompt) {
   title.className = "dsm-title";
   title.textContent = "State Manager";
 
+  const importInput = document.createElement("input");
+  importInput.type = "file";
+  importInput.accept = "application/json,.json";
+  importInput.style.display = "none";
+  importInput.addEventListener("change", async () => {
+    const file = importInput.files?.[0];
+    if (!file) return;
+    try {
+      await importStateJsonFile(node, file, uiState);
+    } catch (err) {
+      setStatus(node, `Import failed: ${err?.message || err}`);
+    } finally {
+      importInput.value = "";
+    }
+  });
+
   toolbar.append(
     title,
+    makeButton("Export State JSON", () => {
+      exportStateJson(node, state, uiState, character.id, prompt.id);
+      setStatus(node, "Exported State Manager JSON.");
+    }, "Download the selected State Manager data as a JSON backup"),
+    makeButton("Import State JSON", () => {
+      importInput.click();
+    }, "Import a State Manager JSON backup into this node"),
     makeButton("Save connected", () => {
       const changes = saveConnectedState(node, character, prompt);
       updateState(node, state, uiState, {
@@ -1707,7 +1950,14 @@ function renderHeader(node, state, uiState, character, prompt) {
     })
   );
 
-  section.append(toolbar, grid, controls);
+  section.append(toolbar, importInput);
+  if (node.__dsmBackupWarning) {
+    const warning = document.createElement("div");
+    warning.className = "dsm-warning";
+    warning.textContent = node.__dsmBackupWarning;
+    section.appendChild(warning);
+  }
+  section.append(grid, controls);
   return section;
 }
 
@@ -2281,6 +2531,7 @@ function ensureStyles() {
     .dsm-title { flex: 1 1 auto; font-size: 13px; }
     .dsm-muted { opacity: .68; white-space: pre-wrap; }
     .dsm-status { border-top: 1px solid rgba(128,128,128,.25); padding-top: 6px; opacity: .78; }
+    .dsm-warning { border: 1px solid rgba(255, 190, 90, .7); border-radius: 6px; padding: 6px; background: rgba(255, 170, 0, .12); color: var(--input-text, #f2e6cc); }
     .dsm-flex { flex: 1 1 auto; min-width: 0; }
     .dsm-root input, .dsm-root select, .dsm-root textarea, .dsm-root button {
       font: inherit;
@@ -2330,11 +2581,13 @@ function initializeNode(node, widget) {
   node.min_size = [MIN_NODE_WIDTH, MIN_NODE_HEIGHT];
   node.setSize?.([Math.max(oldSize[0], MIN_NODE_WIDTH), Math.max(oldSize[1], MIN_NODE_HEIGHT)]);
 
+  tryRestoreStateBackup(node);
   const snapshot = getCurrentState(node);
   const { character, prompt } = ensureSelection(node, snapshot.state);
   updateState(node, snapshot.state, snapshot.uiState, { characterId: character.id, promptId: prompt.id, dirty: false, render: false });
 
   chainNodeCallback(node, "onConfigure", function () {
+    tryRestoreStateBackup(node);
     const next = getCurrentState(node);
     const selection = ensureSelection(node, next.state);
     updateState(node, next.state, next.uiState, { characterId: selection.character.id, promptId: selection.prompt.id, dirty: false, render: false });
