@@ -1,6 +1,7 @@
 import logging
 import json
 import math
+import os
 import inspect
 import re
 import sys
@@ -472,6 +473,15 @@ def _state_manager_default_state() -> Dict[str, Any]:
                 "id": "default_character",
                 "name": "Default Character",
                 "thumbnail": {},
+                "loader_stacks": [
+                    {
+                        "slot": "default",
+                        "label": "Default loader",
+                        "loras": [],
+                        "loader_globals": {},
+                    }
+                ],
+                # Legacy/default stack mirror. Kept so older workflows and older JS still load.
                 "loras": [],
                 "loader_globals": {},
                 "prompts": [
@@ -630,13 +640,107 @@ def _lora_entries_to_manager_rows(entries: Iterable[Dict[str, Any]]) -> List[Dic
     return rows
 
 
-def _build_lora_stack_payload(entries: Iterable[Dict[str, Any]], loader_globals: Dict[str, Any]) -> Dict[str, Any]:
+def _build_lora_stack_payload(entries: Iterable[Dict[str, Any]], loader_globals: Dict[str, Any], state_slot: Any = "default", label: Any = None) -> Dict[str, Any]:
+    slot = _clean_loader_slot(state_slot, "default")
     return {
         "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
         "kind": _DORA_LORA_STACK_KIND,
+        "slot": slot,
+        "label": str(label or slot),
         "loras": _lora_entries_to_manager_rows(entries),
         "loader_globals": _normalize_manager_loader_globals(loader_globals),
     }
+
+
+
+
+def _clean_loader_slot(value: Any, fallback: str = "default") -> str:
+    text = str(value or "").strip()
+    if not text:
+        text = fallback
+    text = re.sub(r"[^A-Za-z0-9_.:-]+", "_", text).strip("_")
+    return text or fallback
+
+
+def _normalize_manager_loader_stack(stack: Any, index: int = 0) -> Optional[Dict[str, Any]]:
+    if not isinstance(stack, dict):
+        return None
+    slot = _clean_loader_slot(stack.get("slot", stack.get("id", stack.get("name", ""))), f"loader_{index + 1}")
+    label = str(stack.get("label", stack.get("name", slot)) or slot).strip() or slot
+    rows_in = stack.get("loras", stack.get("rows", []))
+    loras: List[Dict[str, Any]] = []
+    if isinstance(rows_in, list):
+        for row in rows_in:
+            normalized = _normalize_manager_lora_row(row)
+            if normalized is not None:
+                loras.append(normalized)
+    return {
+        "slot": slot,
+        "label": label,
+        "loras": loras,
+        "loader_globals": _normalize_manager_loader_globals(stack.get("loader_globals", stack.get("globals", {}))),
+    }
+
+
+def _normalize_manager_loader_stacks(character: Dict[str, Any]) -> List[Dict[str, Any]]:
+    stacks_in = character.get("loader_stacks")
+    raw_stacks: List[Any] = []
+    if isinstance(stacks_in, list):
+        raw_stacks = stacks_in
+    elif isinstance(stacks_in, dict):
+        for slot, value in stacks_in.items():
+            if isinstance(value, dict):
+                merged = dict(value)
+                merged.setdefault("slot", slot)
+                raw_stacks.append(merged)
+
+    stacks: List[Dict[str, Any]] = []
+    used_slots: Set[str] = set()
+    for index, stack in enumerate(raw_stacks):
+        normalized = _normalize_manager_loader_stack(stack, index)
+        if normalized is None:
+            continue
+        base_slot = normalized["slot"]
+        slot = base_slot
+        suffix = 2
+        while slot in used_slots:
+            slot = f"{base_slot}_{suffix}"
+            suffix += 1
+        used_slots.add(slot)
+        normalized["slot"] = slot
+        stacks.append(normalized)
+
+    # Legacy migration: previous versions stored one character-level LoRA stack.
+    if not stacks:
+        rows_in = character.get("loras")
+        legacy_rows: List[Dict[str, Any]] = []
+        if isinstance(rows_in, list):
+            for row in rows_in:
+                normalized = _normalize_manager_lora_row(row)
+                if normalized is not None:
+                    legacy_rows.append(normalized)
+        stacks.append({
+            "slot": "default",
+            "label": "Default loader",
+            "loras": legacy_rows,
+            "loader_globals": _normalize_manager_loader_globals(character.get("loader_globals", character.get("globals", {}))),
+        })
+
+    return stacks
+
+
+def _pick_loader_stack(loader_stacks: Any, slot: Any = "default") -> Dict[str, Any]:
+    stacks = loader_stacks if isinstance(loader_stacks, list) else []
+    if not stacks:
+        return {"slot": "default", "label": "Default loader", "loras": [], "loader_globals": {}}
+    wanted = _clean_loader_slot(slot, "default")
+    for stack in stacks:
+        if isinstance(stack, dict) and _clean_loader_slot(stack.get("slot", ""), "default") == wanted:
+            return stack
+    for stack in stacks:
+        if isinstance(stack, dict) and _clean_loader_slot(stack.get("slot", ""), "default") == "default":
+            return stack
+    return stacks[0]
 
 
 def _normalize_manager_loader_globals(globals_in: Any) -> Dict[str, Any]:
@@ -722,6 +826,9 @@ def _normalize_state_manager_state(raw: Any) -> Dict[str, Any]:
                 if normalized is not None:
                     loras.append(normalized)
 
+        loader_stacks = _normalize_manager_loader_stacks(char)
+        default_loader_stack = _pick_loader_stack(loader_stacks, "default")
+
         prompts_in = char.get("prompts")
         prompts: List[Dict[str, Any]] = []
         if isinstance(prompts_in, list):
@@ -747,8 +854,10 @@ def _normalize_state_manager_state(raw: Any) -> Dict[str, Any]:
                 "id": char_id,
                 "name": name,
                 "thumbnail": _normalize_manager_thumbnail(char.get("thumbnail", {})),
-                "loras": loras,
-                "loader_globals": _normalize_manager_loader_globals(char.get("loader_globals", char.get("globals", {}))),
+                "loader_stacks": loader_stacks,
+                # Legacy/default stack mirror for older graphs and older consumers.
+                "loras": default_loader_stack.get("loras", loras),
+                "loader_globals": default_loader_stack.get("loader_globals", _normalize_manager_loader_globals(char.get("loader_globals", char.get("globals", {})))),
                 "prompts": prompts,
             }
         )
@@ -796,8 +905,10 @@ def _resolve_dora_state_payload(
     prompt = _pick_state_manager_prompt(character, selected_prompt_id)
 
     settings = _normalize_settings_with_canonical_seed(prompt.get("settings", {}))
-    loras = character.get("loras", [])
-    loader_globals = character.get("loader_globals", {})
+    loader_stacks = _normalize_manager_loader_stacks(character)
+    default_stack = _pick_loader_stack(loader_stacks, "default")
+    loras = default_stack.get("loras", character.get("loras", []))
+    loader_globals = default_stack.get("loader_globals", character.get("loader_globals", {}))
     positive = str(prompt.get("positive", "") or "")
     negative = str(prompt.get("negative", "") or "")
 
@@ -813,6 +924,7 @@ def _resolve_dora_state_payload(
             "id": prompt.get("id", ""),
             "name": prompt.get("name", ""),
         },
+        "loader_stacks": loader_stacks,
         "loras": loras,
         "loader_globals": loader_globals,
         "settings": settings,
@@ -848,6 +960,60 @@ def _build_state_control_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "selected_character_id": character.get("id", ""),
         "selected_prompt_id": prompt.get("id", ""),
     }
+
+
+
+
+def _state_manager_blank_image() -> torch.Tensor:
+    return torch.zeros((1, 1, 1, 3), dtype=torch.float32)
+
+
+def _state_manager_thumbnail_path(thumbnail: Any) -> Optional[str]:
+    info = _normalize_manager_thumbnail(thumbnail)
+    filename = str(info.get("filename", "")).strip()
+    if not filename:
+        return None
+    subfolder = str(info.get("subfolder", "")).strip()
+    type_name = str(info.get("type", "input")).strip().lower() or "input"
+    if type_name == "input":
+        root = folder_paths.get_input_directory()
+    elif type_name == "output":
+        root = folder_paths.get_output_directory()
+    elif type_name == "temp":
+        root = folder_paths.get_temp_directory()
+    else:
+        root = folder_paths.get_input_directory()
+    root_abs = os.path.realpath(root)
+    path = os.path.realpath(os.path.join(root_abs, subfolder, filename))
+    try:
+        common = os.path.commonpath([root_abs, path])
+    except Exception:
+        return None
+    if common != root_abs:
+        return None
+    if not os.path.isfile(path):
+        return None
+    return path
+
+
+def _load_state_manager_character_image(character: Dict[str, Any]) -> torch.Tensor:
+    path = _state_manager_thumbnail_path(character.get("thumbnail", {}) if isinstance(character, dict) else {})
+    if not path:
+        return _state_manager_blank_image()
+    try:
+        import numpy as np
+        from PIL import Image, ImageOps
+
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img)
+            img = img.convert("RGB")
+            arr = np.asarray(img, dtype=np.float32) / 255.0
+        if arr.ndim != 3 or arr.shape[-1] != 3:
+            return _state_manager_blank_image()
+        return torch.from_numpy(arr)[None, ...]
+    except Exception as exc:
+        _LOG.warning("[State Manager] failed to load character image %r: %s", path, exc)
+        return _state_manager_blank_image()
 
 
 def _extract_seed_from_settings(settings: Any, fallback: int = 0) -> int:
@@ -911,20 +1077,17 @@ def _normalize_runtime_dora_state_payload(raw: Any) -> Optional[Dict[str, Any]]:
         return None
     if payload.get("kind") != _DORA_STATE_KIND:
         return None
-    rows_in = payload.get("loras")
-    if not isinstance(rows_in, list):
-        return None
-    loras = []
-    for row in rows_in:
-        normalized = _normalize_manager_lora_row(row)
-        if normalized is not None:
-            loras.append(normalized)
-    globals_out = _normalize_manager_loader_globals(payload.get("loader_globals", payload.get("globals", {})))
+
+    loader_stacks = _normalize_manager_loader_stacks(payload)
+    default_stack = _pick_loader_stack(loader_stacks, "default")
+    loras = default_stack.get("loras", [])
+    globals_out = default_stack.get("loader_globals", _normalize_manager_loader_globals(payload.get("loader_globals", payload.get("globals", {}))))
     return {
         "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
         "kind": _DORA_STATE_KIND,
         "character": payload.get("character") if isinstance(payload.get("character"), dict) else {},
         "prompt": payload.get("prompt") if isinstance(payload.get("prompt"), dict) else {},
+        "loader_stacks": loader_stacks,
         "loras": loras,
         "loader_globals": globals_out,
         "settings": _normalize_manager_settings(payload.get("settings", {})),
@@ -933,16 +1096,45 @@ def _normalize_runtime_dora_state_payload(raw: Any) -> Optional[Dict[str, Any]]:
     }
 
 
-def _parse_dora_state_lora_entries(state_payload: Optional[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+def _select_state_loader_stack(state_payload: Optional[Dict[str, Any]], state_slot: Any = "default") -> Optional[Dict[str, Any]]:
     if not isinstance(state_payload, dict):
         return None
-    rows = state_payload.get("loras")
+    stacks = state_payload.get("loader_stacks")
+    if isinstance(stacks, list) and stacks:
+        wanted = _clean_loader_slot(state_slot, "default")
+        for stack in stacks:
+            if isinstance(stack, dict) and _clean_loader_slot(stack.get("slot", ""), "default") == wanted:
+                return stack
+        return None
+    if isinstance(state_payload.get("loras"), list):
+        return {
+            "slot": "default",
+            "label": "Default loader",
+            "loras": state_payload.get("loras", []),
+            "loader_globals": _normalize_manager_loader_globals(state_payload.get("loader_globals", {})),
+        }
+    return None
+
+
+def _parse_dora_state_lora_entries(state_payload: Optional[Dict[str, Any]], state_slot: Any = "default") -> Optional[List[Dict[str, Any]]]:
+    stack = _select_state_loader_stack(state_payload, state_slot)
+    if not isinstance(stack, dict):
+        return None
+    rows = stack.get("loras")
     if not isinstance(rows, list):
         return None
     return _manager_rows_to_lora_entries(rows)
 
 
-def _state_payload_get_loader_global(state_payload: Optional[Dict[str, Any]], key: str, fallback: Any) -> Any:
+def _state_payload_get_loader_global(state_payload: Optional[Dict[str, Any]], key: str, fallback: Any, state_slot: Any = "default") -> Any:
+    stack = _select_state_loader_stack(state_payload, state_slot)
+    if isinstance(stack, dict):
+        globals_in = stack.get("loader_globals")
+        if isinstance(globals_in, dict) and key in globals_in:
+            return globals_in[key]
+    stacks = state_payload.get("loader_stacks") if isinstance(state_payload, dict) else None
+    if isinstance(stacks, list) and stacks:
+        return fallback
     if isinstance(state_payload, dict):
         globals_in = state_payload.get("loader_globals")
         if isinstance(globals_in, dict) and key in globals_in:
@@ -3760,7 +3952,7 @@ class StateManager:
             }
         }
 
-    RETURN_TYPES = ("DORA_STATE", "STRING", "STRING", "STRING", "DORA_LORA_STACK", "DORA_STATE_SETTINGS", "INT", "STATE_MANAGER_CONTROL")
+    RETURN_TYPES = ("DORA_STATE", "STRING", "STRING", "STRING", "DORA_LORA_STACK", "DORA_STATE_SETTINGS", "INT", "STATE_MANAGER_CONTROL", "IMAGE")
     RETURN_NAMES = (
         "dora_state",
         "positive_prompt_template",
@@ -3770,6 +3962,7 @@ class StateManager:
         "state_settings",
         "seed",
         "state_control",
+        "character_image",
     )
     FUNCTION = "resolve_state"
     CATEGORY = "state managers"
@@ -3830,6 +4023,9 @@ class StateManager:
         state_settings_payload = _build_state_settings_payload(payload)
         state_control_payload = _build_state_control_payload(payload)
         seed = _extract_seed_from_settings(settings)
+        state = _normalize_state_manager_state(state_json)
+        character = _pick_state_manager_character(state, selected_character_id)
+        character_image = _load_state_manager_character_image(character)
         return (
             payload,
             payload.get("positive_prompt", ""),
@@ -3839,6 +4035,7 @@ class StateManager:
             state_settings_payload,
             seed,
             state_control_payload,
+            character_image,
         )
 
 
@@ -3943,6 +4140,7 @@ class DoraPowerLoraLoader:
                     # Editor-only relationship used by State Manager Save/Load connected.
                     # Ignored by backend execution.
                     "state_control": ("STATE_MANAGER_CONTROL",),
+                    "state_slot": ("STRING", {"default": "default", "multiline": False}),
 
                     # Flux2 modulation handling
                     "broadcast_modulations": ("BOOLEAN", {"default": True}),
@@ -4235,41 +4433,42 @@ class DoraPowerLoraLoader:
         # Editor-only relationship token for State Manager save/load discovery.
         # It must not participate in runtime LoRA row or settings resolution.
         kwargs.pop("state_control", None)
+        state_slot = _clean_loader_slot(kwargs.get("state_slot", "default"), "default")
         state_payload = _normalize_runtime_dora_state_payload(kwargs.get("dora_state"))
 
         # Global controls (provided by JS UI; optionally overridden by DoRA State Manager)
-        stack_enabled = bool(_state_payload_get_loader_global(state_payload, "stack_enabled", kwargs.get("stack_enabled", True)))
-        verbose = bool(_state_payload_get_loader_global(state_payload, "verbose", kwargs.get("verbose", False)))
-        log_unloaded_keys = bool(_state_payload_get_loader_global(state_payload, "log_unloaded_keys", kwargs.get("log_unloaded_keys", False)))
-        broadcast_auto_scale = bool(_state_payload_get_loader_global(state_payload, "broadcast_auto_scale", kwargs.get("broadcast_auto_scale", True)))
-        broadcast_modulations = bool(_state_payload_get_loader_global(state_payload, "broadcast_modulations", kwargs.get("broadcast_modulations", True)))
-        broadcast_include_dora_scale = bool(_state_payload_get_loader_global(state_payload, "broadcast_include_dora_scale", kwargs.get("broadcast_include_dora_scale", False)))
+        stack_enabled = bool(_state_payload_get_loader_global(state_payload, "stack_enabled", kwargs.get("stack_enabled", True), state_slot))
+        verbose = bool(_state_payload_get_loader_global(state_payload, "verbose", kwargs.get("verbose", False), state_slot))
+        log_unloaded_keys = bool(_state_payload_get_loader_global(state_payload, "log_unloaded_keys", kwargs.get("log_unloaded_keys", False), state_slot))
+        broadcast_auto_scale = bool(_state_payload_get_loader_global(state_payload, "broadcast_auto_scale", kwargs.get("broadcast_auto_scale", True), state_slot))
+        broadcast_modulations = bool(_state_payload_get_loader_global(state_payload, "broadcast_modulations", kwargs.get("broadcast_modulations", True), state_slot))
+        broadcast_include_dora_scale = bool(_state_payload_get_loader_global(state_payload, "broadcast_include_dora_scale", kwargs.get("broadcast_include_dora_scale", False), state_slot))
         try:
-            broadcast_scale = float(_state_payload_get_loader_global(state_payload, "broadcast_scale", kwargs.get("broadcast_scale", 1.0)))
+            broadcast_scale = float(_state_payload_get_loader_global(state_payload, "broadcast_scale", kwargs.get("broadcast_scale", 1.0), state_slot))
         except Exception:
             broadcast_scale = 1.0
 
         # DoRA decompose debug controls (node-adjustable / state-manager overrideable)
-        dora_dbg = bool(_state_payload_get_loader_global(state_payload, "dora_decompose_debug", kwargs.get("dora_decompose_debug", False)))
+        dora_dbg = bool(_state_payload_get_loader_global(state_payload, "dora_decompose_debug", kwargs.get("dora_decompose_debug", False), state_slot))
         try:
-            dora_dbg_n = int(_state_payload_get_loader_global(state_payload, "dora_decompose_debug_n", kwargs.get("dora_decompose_debug_n", 30)))
+            dora_dbg_n = int(_state_payload_get_loader_global(state_payload, "dora_decompose_debug_n", kwargs.get("dora_decompose_debug_n", 30), state_slot))
         except Exception:
             dora_dbg_n = 30
         try:
-            dora_dbg_stack = int(_state_payload_get_loader_global(state_payload, "dora_decompose_debug_stack_depth", kwargs.get("dora_decompose_debug_stack_depth", 10)))
+            dora_dbg_stack = int(_state_payload_get_loader_global(state_payload, "dora_decompose_debug_stack_depth", kwargs.get("dora_decompose_debug_stack_depth", 10), state_slot))
         except Exception:
             dora_dbg_stack = 10
-        dora_slice_fix = bool(_state_payload_get_loader_global(state_payload, "dora_slice_fix", kwargs.get("dora_slice_fix", True)))
-        dora_adaln_swap_fix = bool(_state_payload_get_loader_global(state_payload, "dora_adaln_swap_fix", kwargs.get("dora_adaln_swap_fix", True)))
-        zimage_lumina2_compat = bool(_state_payload_get_loader_global(state_payload, "zimage_lumina2_compat", kwargs.get("zimage_lumina2_compat", True)))
-        auto_strength_enabled = bool(_state_payload_get_loader_global(state_payload, "auto_strength_enabled", kwargs.get("auto_strength_enabled", False)))
-        auto_strength_device = _normalize_auto_strength_device(_state_payload_get_loader_global(state_payload, "auto_strength_device", kwargs.get("auto_strength_device", "gpu")))
+        dora_slice_fix = bool(_state_payload_get_loader_global(state_payload, "dora_slice_fix", kwargs.get("dora_slice_fix", True), state_slot))
+        dora_adaln_swap_fix = bool(_state_payload_get_loader_global(state_payload, "dora_adaln_swap_fix", kwargs.get("dora_adaln_swap_fix", True), state_slot))
+        zimage_lumina2_compat = bool(_state_payload_get_loader_global(state_payload, "zimage_lumina2_compat", kwargs.get("zimage_lumina2_compat", True), state_slot))
+        auto_strength_enabled = bool(_state_payload_get_loader_global(state_payload, "auto_strength_enabled", kwargs.get("auto_strength_enabled", False), state_slot))
+        auto_strength_device = _normalize_auto_strength_device(_state_payload_get_loader_global(state_payload, "auto_strength_device", kwargs.get("auto_strength_device", "gpu"), state_slot))
         try:
-            auto_strength_ratio_floor = float(_state_payload_get_loader_global(state_payload, "auto_strength_ratio_floor", kwargs.get("auto_strength_ratio_floor", _AUTO_STRENGTH_RATIO_FLOOR)))
+            auto_strength_ratio_floor = float(_state_payload_get_loader_global(state_payload, "auto_strength_ratio_floor", kwargs.get("auto_strength_ratio_floor", _AUTO_STRENGTH_RATIO_FLOOR), state_slot))
         except Exception:
             auto_strength_ratio_floor = _AUTO_STRENGTH_RATIO_FLOOR
         try:
-            auto_strength_ratio_ceiling = float(_state_payload_get_loader_global(state_payload, "auto_strength_ratio_ceiling", kwargs.get("auto_strength_ratio_ceiling", _AUTO_STRENGTH_RATIO_CEILING)))
+            auto_strength_ratio_ceiling = float(_state_payload_get_loader_global(state_payload, "auto_strength_ratio_ceiling", kwargs.get("auto_strength_ratio_ceiling", _AUTO_STRENGTH_RATIO_CEILING), state_slot))
         except Exception:
             auto_strength_ratio_ceiling = _AUTO_STRENGTH_RATIO_CEILING
         if auto_strength_ratio_ceiling < auto_strength_ratio_floor:
@@ -4285,7 +4484,7 @@ class DoraPowerLoraLoader:
 
         report_rows: List[Dict[str, Any]] = []
 
-        entries = _parse_dora_state_lora_entries(state_payload) if state_payload is not None else None
+        entries = _parse_dora_state_lora_entries(state_payload, state_slot) if state_payload is not None else None
         if entries is None:
             entries = _parse_lora_stack_kwargs(kwargs)
 
@@ -4308,7 +4507,7 @@ class DoraPowerLoraLoader:
             "auto_strength_ratio_floor": auto_strength_ratio_floor,
             "auto_strength_ratio_ceiling": auto_strength_ratio_ceiling,
         }
-        lora_stack_payload = _build_lora_stack_payload(entries, loader_globals_payload)
+        lora_stack_payload = _build_lora_stack_payload(entries, loader_globals_payload, state_slot)
 
         if not stack_enabled:
             stack_report = {

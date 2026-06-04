@@ -516,11 +516,12 @@ The manager separates **saved state** from **runtime execution**:
 
 Use it to save:
 
-- character / LoRA combinations
-- per-character DoRA loader settings such as auto-strength and compatibility toggles
+- character / LoRA combinations across multiple separate DoRA loader nodes
+- per-loader DoRA settings such as auto-strength and compatibility toggles
 - multiple positive / negative prompt **templates** per character
 - arbitrary downstream node widget snapshots
 - seed state, including rgthree-style seed nodes
+- one character image / thumbnail reference; the UI preview is CSS-scaled, while the `character_image` output loads the original uploaded image file
 
 ### Basic wiring
 
@@ -529,11 +530,12 @@ Recommended connected save/load wiring:
 1. Add **State Manager**.
 2. Add **State Text Box** nodes for editable positive and negative prompt templates.
 3. Add **State Seed** for an editable seed value.
-4. Add **DoRA Power LoRA Loader**.
-5. Connect `state_control` from the manager to each helper node's optional `state_control` input.
-6. Connect `text` from each State Text Box into the prompt/wildcard path.
-7. Connect `seed` from State Seed only to the sampler seed input.
-8. Configure LoRA rows on the DoRA Power LoRA Loader as usual.
+4. Add one or more **DoRA Power LoRA Loader** nodes.
+5. Give every DoRA loader a unique **State slot** value, for example `face`, `outfit`, `style`, `refiner`.
+6. Connect `state_control` from the manager to each helper node's optional `state_control` input, including every DoRA loader you want managed.
+7. Connect `text` from each State Text Box into the prompt/wildcard path.
+8. Connect `seed` from State Seed only to the sampler seed input.
+9. Configure LoRA rows on each DoRA Power LoRA Loader as usual.
 
 The manager should not receive processed wildcard, prompt-generation, or other runtime text outputs. Store the wildcard/template prompt in State Text Box, then let your wildcard node expand it downstream.
 
@@ -562,11 +564,28 @@ The older runtime-output path is still available for workflows that intentionall
 
 ```text
 State Manager.dora_state -> DoRA Power LoRA Loader.dora_state
+DoRA loader State slot selects which saved loader stack to use
 State Manager.positive_prompt_template -> prompt/wildcard path
 State Manager.negative_prompt_template -> prompt/wildcard path
 ```
 
 Do not use that runtime path as the replacement for connected save/load. For editable prompt and seed values that survive normal execution, use `state_control` plus State Text Box / State Seed.
+
+
+### Multiple DoRA loaders
+
+A character now stores `loader_stacks`, not only one flat `loras` list. Each stack has a stable `slot`. The DoRA loader exposes a **State slot** widget; Save/Load connected matches by that slot.
+
+Example:
+
+```text
+State Manager.state_control -> DoRA Loader A.state_control  # State slot: face
+State Manager.state_control -> DoRA Loader B.state_control  # State slot: outfit
+State Manager.state_control -> DoRA Loader C.state_control  # State slot: style
+State Manager.state_control -> DoRA Loader D.state_control  # State slot: refiner
+```
+
+Click **Save connected** to capture all four stacks separately. Click **Load connected** to push each saved stack back into the matching loader.
 
 ### Save / load / apply workflow
 
@@ -589,6 +608,7 @@ The manager outputs:
 - `state_settings` — typed `DORA_STATE_SETTINGS` payload
 - `seed` — integer seed extracted from saved settings / rgthree seed snapshots
 - `state_control` — typed `STATE_MANAGER_CONTROL` payload used only by the frontend to discover connected nodes for Save connected / Load connected
+- `character_image` — original uploaded character image as an `IMAGE` tensor
 
 Future or external nodes can add optional inputs for `settings_json`, `state_settings`, or `seed` to consume saved state deterministically during execution. `state_control` is reserved for editor save/load association.
 
@@ -612,6 +632,7 @@ The settings snapshot stores widget values by node identity and class/title fall
 - `state_settings` — typed `DORA_STATE_SETTINGS` payload for future compatible nodes
 - `seed` — integer seed extracted from saved settings / rgthree seed snapshots
 - `state_control` — typed `STATE_MANAGER_CONTROL` payload for editor/control-only save/load association
+- `character_image` — original uploaded character image as an `IMAGE` tensor. The manager uploads the original image to ComfyUI's input folder and only scales it visually in the browser.
 
 ### Persistence and payload behavior
 
