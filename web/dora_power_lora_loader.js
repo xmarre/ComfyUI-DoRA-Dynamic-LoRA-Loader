@@ -499,6 +499,27 @@ function parseRowsFromWidgetValues(widgetsValues) {
   return { rows: [], globals: { stack_enabled: true, verbose: false, log_unloaded_keys: false } };
 }
 
+function normalizeStateSlot(value, fallback = "default") {
+  const text = String(value ?? "")
+    .trim()
+    .replace(/[^A-Za-z0-9_.:-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return text || fallback;
+}
+
+function getStateSlot(node) {
+  node.properties = node.properties || {};
+  return normalizeStateSlot(node.properties.dora_state_slot, `loader_${node.id ?? "default"}`);
+}
+
+function setStateSlot(node, value) {
+  if (!node) return "default";
+  node.properties = node.properties || {};
+  const slot = normalizeStateSlot(value, `loader_${node.id ?? "default"}`);
+  node.properties.dora_state_slot = slot;
+  return slot;
+}
+
 function defaultState() {
   return {
     rows: [makeRowDefaults()],
@@ -625,11 +646,13 @@ function normalizeExternalDoraState(external) {
 function installGlobalStateApi() {
   globalThis.__doraPowerLoraLoaderApi = {
     getState(node) {
-      return getState(node);
+      const state = getState(node);
+      return { ...state, slot: getStateSlot(node), label: String(node?.title || getStateSlot(node)) };
     },
     setState(node, externalState) {
       if (!node) return false;
       const next = normalizeExternalDoraState(externalState);
+      if (externalState?.slot) setStateSlot(node, externalState.slot);
       setState(node, next);
       node._doraRows = next.rows;
       node._doraGlobals = next.globals;
@@ -642,6 +665,16 @@ function installGlobalStateApi() {
       node.setDirtyCanvas?.(true, true);
       node.graph?.change?.();
       return true;
+    },
+    getSlot(node) {
+      return getStateSlot(node);
+    },
+    setSlot(node, value) {
+      const slot = setStateSlot(node, value);
+      try { rebuild(node); } catch (_) {}
+      node?.setDirtyCanvas?.(true, true);
+      node?.graph?.change?.();
+      return slot;
     },
   };
 }
@@ -1424,6 +1457,13 @@ function buildUI(node, state, loraValues) {
   });
   wRefresh.serialize = false;
 
+  const wStateSlot = node.addWidget("text", "state_slot", getStateSlot(node), (v) => {
+    setStateSlot(node, v);
+    node.setDirtyCanvas?.(true, true);
+    node.graph?.change?.();
+  });
+  wStateSlot.label = "State slot";
+
   node._doraRows.forEach((row, i) => {
     const widget = new DoraLoraRowWidget(`LORA_${i + 1}`, node, row);
     if (typeof node.addCustomWidget === "function") {
@@ -1707,6 +1747,7 @@ app.registerExtension({
           st = defaultState();
         }
         setState(this, st);
+        setStateSlot(this, info?.properties?.dora_state_slot ?? this.properties?.dora_state_slot ?? `loader_${this.id ?? "default"}`);
 
         if (origConfigure) {
           const safeInfo = info ? { ...info } : info;
@@ -1737,6 +1778,7 @@ app.registerExtension({
       } catch (_) {}
       o.properties = o.properties || {};
       o.properties.dora_power_lora = getState(this);
+      o.properties.dora_state_slot = getStateSlot(this);
       o.widgets_values = [];
     };
   },

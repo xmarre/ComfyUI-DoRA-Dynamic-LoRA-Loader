@@ -78,13 +78,25 @@ function defaultPrompt() {
   };
 }
 
+function defaultLoaderStack(slot = "default", label = "Default loader") {
+  return {
+    slot: normalizeLoaderSlot(slot, "default"),
+    label: String(label || slot || "Default loader"),
+    loras: [],
+    loader_globals: {},
+  };
+}
+
 function defaultCharacter() {
+  const stack = defaultLoaderStack();
   return {
     id: "default_character",
     name: "Default Character",
     thumbnail: {},
-    loras: [],
-    loader_globals: {},
+    loader_stacks: [stack],
+    // Legacy/default stack mirror. Kept for old workflows and old consumers.
+    loras: stack.loras,
+    loader_globals: stack.loader_globals,
     prompts: [defaultPrompt()],
   };
 }
@@ -187,6 +199,99 @@ function normalizeLoaderGlobals(globalsIn) {
   return out;
 }
 
+function normalizeLoaderSlot(value, fallback = "default") {
+  const text = String(value ?? "")
+    .trim()
+    .replace(/[^A-Za-z0-9_.:-]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return text || fallback;
+}
+
+function normalizeLoaderStack(stack, index = 0) {
+  const src = stack && typeof stack === "object" ? stack : {};
+  const slot = normalizeLoaderSlot(src.slot ?? src.id ?? src.name, `loader_${index + 1}`);
+  const label = String(src.label ?? src.name ?? slot).trim() || slot;
+  const rowsIn = Array.isArray(src.loras) ? src.loras : Array.isArray(src.rows) ? src.rows : [];
+  return {
+    slot,
+    label,
+    loras: rowsIn.map(normalizeLoraRow).filter(Boolean),
+    loader_globals: normalizeLoaderGlobals(src.loader_globals ?? src.globals),
+  };
+}
+
+function normalizeLoaderStacks(character) {
+  const c = character && typeof character === "object" ? character : {};
+  const raw = [];
+  if (Array.isArray(c.loader_stacks)) {
+    raw.push(...c.loader_stacks);
+  } else if (c.loader_stacks && typeof c.loader_stacks === "object") {
+    for (const [slot, stack] of Object.entries(c.loader_stacks)) {
+      if (stack && typeof stack === "object") raw.push({ ...stack, slot: stack.slot ?? slot });
+    }
+  }
+
+  const stacks = [];
+  const used = new Set();
+  raw.forEach((stack, index) => {
+    const normalized = normalizeLoaderStack(stack, index);
+    let slot = normalized.slot;
+    const base = slot;
+    let suffix = 2;
+    while (used.has(slot)) slot = `${base}_${suffix++}`;
+    used.add(slot);
+    normalized.slot = slot;
+    stacks.push(normalized);
+  });
+
+  if (!stacks.length) {
+    stacks.push({
+      slot: "default",
+      label: "Default loader",
+      loras: Array.isArray(c.loras) ? c.loras.map(normalizeLoraRow).filter(Boolean) : [],
+      loader_globals: normalizeLoaderGlobals(c.loader_globals ?? c.globals),
+    });
+  }
+  return stacks;
+}
+
+function syncLegacyLoaderMirror(character) {
+  const stacks = normalizeLoaderStacks(character);
+  character.loader_stacks = stacks;
+  const primary = stacks.find((stack) => stack.slot === "default") || stacks[0] || defaultLoaderStack();
+  character.loras = primary.loras || [];
+  character.loader_globals = primary.loader_globals || {};
+  return character;
+}
+
+function getCharacterLoaderStacks(character) {
+  syncLegacyLoaderMirror(character);
+  return character.loader_stacks;
+}
+
+function findCharacterLoaderStack(character, slot, { allowFallback = true } = {}) {
+  const stacks = getCharacterLoaderStacks(character);
+  const wanted = normalizeLoaderSlot(slot, "default");
+  const exact = stacks.find((stack) => normalizeLoaderSlot(stack.slot, "default") === wanted);
+  if (exact) return exact;
+  if (!allowFallback) return null;
+  return stacks.find((stack) => stack.slot === "default") || stacks[0] || null;
+}
+
+function setCharacterLoaderStack(character, stack) {
+  const normalized = normalizeLoaderStack(stack, getCharacterLoaderStacks(character).length);
+  const stacks = getCharacterLoaderStacks(character);
+  const index = stacks.findIndex((existing) => normalizeLoaderSlot(existing.slot, "default") === normalized.slot);
+  if (index >= 0) stacks[index] = normalized;
+  else stacks.push(normalized);
+  syncLegacyLoaderMirror(character);
+  return normalized;
+}
+
+function loaderStackActiveRowCount(stack) {
+  return (stack?.loras || []).filter((row) => row.enabled && row.name && row.name !== "None").length;
+}
+
 function normalizeLoraRow(row) {
   const r = row && typeof row === "object" ? row : {};
   const strengthModel = normalizeNumber(r.strength_model ?? r.strengthModel ?? r.strength, 1.0);
@@ -213,15 +318,16 @@ function normalizePrompt(prompt, index) {
 function normalizeCharacter(character, index) {
   const c = character && typeof character === "object" ? character : {};
   const prompts = Array.isArray(c.prompts) ? c.prompts.map(normalizePrompt).filter(Boolean) : [];
-  return {
+  const normalized = {
     id: cleanId(c.id, `character_${index + 1}`),
     name: String(c.name ?? `Character ${index + 1}`).trim() || `Character ${index + 1}`,
     thumbnail: normalizeThumbnail(c.thumbnail),
-    loras: Array.isArray(c.loras) ? c.loras.map(normalizeLoraRow) : [],
-    loader_globals: normalizeLoaderGlobals(c.loader_globals ?? c.globals),
+    loader_stacks: normalizeLoaderStacks(c),
     prompts: prompts.length ? prompts : [defaultPrompt()],
   };
+  return syncLegacyLoaderMirror(normalized);
 }
+
 
 function normalizeState(raw) {
   const parsed = safeJsonParse(raw, defaultState());
@@ -455,38 +561,70 @@ function getControlledNodes(node) {
   return uniqueNodes(getControlledTargets(node));
 }
 
-function normalizeDoraLoaderState(state) {
+function getDoraLoaderSlot(sourceNode, fallbackIndex = 0) {
+  const loaderApi = globalThis.__doraPowerLoraLoaderApi;
+  if (loaderApi?.getSlot && isDoraLoaderNode(sourceNode)) {
+    return normalizeLoaderSlot(loaderApi.getSlot(sourceNode), `loader_${sourceNode?.id ?? fallbackIndex + 1}`);
+  }
+  const widgetMap = getWidgetMap(sourceNode);
+  const widgetValue = widgetMap.get("state_slot")?.value;
+  const propValue = sourceNode?.properties?.dora_state_slot;
+  return normalizeLoaderSlot(widgetValue ?? propValue, `loader_${sourceNode?.id ?? fallbackIndex + 1}`);
+}
+
+function getDoraLoaderLabel(sourceNode, slot) {
+  const title = String(sourceNode?.title || "").trim();
+  if (title && title !== DORA_LOADER_CLASS) return title;
+  return slot || "loader";
+}
+
+function normalizeDoraLoaderState(state, sourceNode = null, fallbackIndex = 0) {
   const st = state && typeof state === "object" ? state : {};
   const rowsIn = Array.isArray(st.rows) ? st.rows : Array.isArray(st.loras) ? st.loras : [];
   const rows = rowsIn.map(normalizeLoraRow).filter((row) => row.name && row.name !== "None");
+  const slot = normalizeLoaderSlot(st.slot ?? (sourceNode ? getDoraLoaderSlot(sourceNode, fallbackIndex) : "default"), `loader_${sourceNode?.id ?? fallbackIndex + 1}`);
   return {
+    slot,
+    label: String(st.label ?? getDoraLoaderLabel(sourceNode, slot)).trim() || slot,
     loras: rows,
     loader_globals: normalizeLoaderGlobals(st.globals ?? st.loader_globals),
   };
 }
 
-function extractLoraStackFromNode(sourceNode) {
+function extractLoraStackFromNode(sourceNode, fallbackIndex = 0) {
   if (!sourceNode) return null;
   const loaderApi = globalThis.__doraPowerLoraLoaderApi;
-  if (loaderApi?.getState && isDoraLoaderNode(sourceNode)) return normalizeDoraLoaderState(loaderApi.getState(sourceNode));
-  if (sourceNode.properties?.dora_power_lora) return normalizeDoraLoaderState(sourceNode.properties.dora_power_lora);
+  if (loaderApi?.getState && isDoraLoaderNode(sourceNode)) return normalizeDoraLoaderState(loaderApi.getState(sourceNode), sourceNode, fallbackIndex);
+  if (sourceNode.properties?.dora_power_lora) return normalizeDoraLoaderState(sourceNode.properties.dora_power_lora, sourceNode, fallbackIndex);
   if (sourceNode._doraRows || sourceNode._doraGlobals) {
-    return normalizeDoraLoaderState({ rows: sourceNode._doraRows || [], globals: sourceNode._doraGlobals || {} });
+    return normalizeDoraLoaderState({ rows: sourceNode._doraRows || [], globals: sourceNode._doraGlobals || {} }, sourceNode, fallbackIndex);
   }
   if (sourceNode.properties?.dora_state_manager?.state) {
     const state = normalizeState(sourceNode.properties.dora_state_manager.state);
     const charId = sourceNode.properties.dora_state_manager.selected_character_id;
     const character = selectedCharacter(state, charId);
-    return { loras: character.loras || [], loader_globals: character.loader_globals || {} };
+    const stack = findCharacterLoaderStack(character, getDoraLoaderSlot(sourceNode, fallbackIndex));
+    return stack ? structuredCloneCompat(stack) : null;
   }
   return null;
 }
 
 function applyLoraStackToNode(targetNode, character) {
   if (!targetNode || !isDoraLoaderNode(targetNode)) return false;
-  const payload = { loras: character.loras || [], loader_globals: character.loader_globals || {} };
+  const slot = getDoraLoaderSlot(targetNode);
+  const stack = findCharacterLoaderStack(character, slot, { allowFallback: true });
+  if (!stack) return false;
+  const payload = {
+    slot,
+    label: stack.label,
+    loras: stack.loras || [],
+    loader_globals: stack.loader_globals || {},
+  };
   const loaderApi = globalThis.__doraPowerLoraLoaderApi;
-  if (loaderApi?.setState) return !!loaderApi.setState(targetNode, payload);
+  if (loaderApi?.setState) {
+    loaderApi.setSlot?.(targetNode, slot);
+    return !!loaderApi.setState(targetNode, payload);
+  }
 
   const rows = (payload.loras || []).map((row) => ({
     enabled: !!row.enabled,
@@ -495,12 +633,14 @@ function applyLoraStackToNode(targetNode, character) {
     strengthClip: normalizeNumber(row.strength_clip, normalizeNumber(row.strength_model, 1.0)),
   }));
   targetNode.properties = targetNode.properties || {};
+  targetNode.properties.dora_state_slot = slot;
   targetNode.properties.dora_power_lora = { rows, globals: normalizeLoaderGlobals(payload.loader_globals) };
   targetNode._doraRows = rows;
   targetNode._doraGlobals = normalizeLoaderGlobals(payload.loader_globals);
   markNodeDirty(targetNode);
   return true;
 }
+
 
 function getSelectedGraphNodes() {
   const selected = app?.canvas?.selected_nodes;
@@ -793,12 +933,14 @@ function saveConnectedState(targetNode, character, prompt) {
   const controlledLoaderTargets = controlledNodes.filter(isDoraLoaderNode);
   const legacyLoaderTargets = controlledLoaderTargets.length ? [] : uniqueNodes([...getOutputTargets(targetNode, OUTPUT_NAMES.lora)]).filter(isDoraLoaderNode);
   const loaderTargets = controlledLoaderTargets.length ? controlledLoaderTargets : legacyLoaderTargets;
-  const loaderStack = loaderTargets.map(extractLoraStackFromNode).find(Boolean);
-  if (loaderStack) {
-    character.loras = loaderStack.loras || [];
-    character.loader_globals = loaderStack.loader_globals || {};
-    changes.push("LoRA stack");
-  }
+  let savedLoaders = 0;
+  loaderTargets.forEach((loader, index) => {
+    const stack = extractLoraStackFromNode(loader, index);
+    if (!stack) return;
+    setCharacterLoaderStack(character, stack);
+    savedLoaders += 1;
+  });
+  if (savedLoaders) changes.push(`${savedLoaders} LoRA loader${savedLoaders === 1 ? "" : "s"}`);
 
   const controlledTextNodes = controlledNodes.filter(isStateTextNode);
   let savedPositive = false;
@@ -854,6 +996,7 @@ function saveConnectedState(targetNode, character, prompt) {
   return [...new Set(changes)];
 }
 
+
 function applyConnectedState(targetNode, character, prompt) {
   const changes = [];
   const controlledNodes = getControlledNodes(targetNode).filter((node) => node && node !== targetNode);
@@ -863,7 +1006,7 @@ function applyConnectedState(targetNode, character, prompt) {
   const loaderTargets = controlledLoaderTargets.length ? controlledLoaderTargets : legacyLoaderTargets;
   let loaderChanged = 0;
   for (const loader of loaderTargets) if (applyLoraStackToNode(loader, character)) loaderChanged += 1;
-  if (loaderChanged) changes.push(`LoRA stack to ${loaderChanged} loader${loaderChanged === 1 ? "" : "s"}`);
+  if (loaderChanged) changes.push(`LoRA stacks to ${loaderChanged} loader${loaderChanged === 1 ? "" : "s"}`);
 
   const controlledTextNodes = controlledNodes.filter(isStateTextNode);
   let posChanged = 0;
@@ -892,6 +1035,7 @@ function applyConnectedState(targetNode, character, prompt) {
   return changes;
 }
 
+
 function classifySelectedTextNodes(nodes) {
   const textNodes = nodes
     .map((node) => ({
@@ -910,15 +1054,17 @@ function classifySelectedTextNodes(nodes) {
 function saveSelectedState(targetNode, character, prompt) {
   const selected = getSelectedGraphNodes().filter((node) => node && node !== targetNode);
   const changes = [];
-  const loader = selected.find(isDoraLoaderNode);
-  const stack = extractLoraStackFromNode(loader);
-  if (stack) {
-    character.loras = stack.loras || [];
-    character.loader_globals = stack.loader_globals || {};
-    changes.push("LoRA stack");
-  }
+  const loaders = selected.filter(isDoraLoaderNode);
+  let savedLoaders = 0;
+  loaders.forEach((loader, index) => {
+    const stack = extractLoraStackFromNode(loader, index);
+    if (!stack) return;
+    setCharacterLoaderStack(character, stack);
+    savedLoaders += 1;
+  });
+  if (savedLoaders) changes.push(`${savedLoaders} LoRA loader${savedLoaders === 1 ? "" : "s"}`);
 
-  const classified = classifySelectedTextNodes(selected.filter((node) => node !== loader && !isSeedNode(node)));
+  const classified = classifySelectedTextNodes(selected.filter((node) => !isDoraLoaderNode(node) && !isSeedNode(node)));
   if (classified.positive) {
     prompt.positive = classified.positive.text;
     changes.push("positive prompt template");
@@ -928,7 +1074,7 @@ function saveSelectedState(targetNode, character, prompt) {
     changes.push("negative prompt template");
   }
 
-  const used = new Set([loader, ...classified.used].filter(Boolean));
+  const used = new Set([...loaders, ...classified.used].filter(Boolean));
   const settingNodes = selected.filter((node) => !used.has(node));
   const snapshots = mergeCapturedSettings(prompt, settingNodes, { replaceNodes: true });
   if (snapshots.length) changes.push(`settings from ${snapshots.length} node${snapshots.length === 1 ? "" : "s"}`);
@@ -936,13 +1082,14 @@ function saveSelectedState(targetNode, character, prompt) {
   return [...new Set(changes)];
 }
 
+
 function applySelectedState(targetNode, character, prompt) {
   const selected = getSelectedGraphNodes().filter((node) => node && node !== targetNode);
   const changes = [];
   const loaderTargets = selected.filter(isDoraLoaderNode);
   let loaderChanged = 0;
   for (const loader of loaderTargets) if (applyLoraStackToNode(loader, character)) loaderChanged += 1;
-  if (loaderChanged) changes.push(`LoRA stack to ${loaderChanged} loader${loaderChanged === 1 ? "" : "s"}`);
+  if (loaderChanged) changes.push(`LoRA stacks to ${loaderChanged} loader${loaderChanged === 1 ? "" : "s"}`);
 
   const classified = classifySelectedTextNodes(selected.filter((node) => !isDoraLoaderNode(node) && !isSeedNode(node)));
   if (classified.positive && applyTextToNode(classified.positive.node, prompt.positive, "positive")) changes.push("positive template");
@@ -954,6 +1101,7 @@ function applySelectedState(targetNode, character, prompt) {
   if (settingsChanged) changes.push(`settings/seed to ${settingsChanged} node${settingsChanged === 1 ? "" : "s"}`);
   return changes;
 }
+
 
 async function uploadThumbnailFile(file) {
   const body = new FormData();
@@ -971,6 +1119,12 @@ async function uploadThumbnailFile(file) {
     type: String(payload?.type ?? "input").trim() || "input",
     cacheKey: String(Date.now()),
   };
+}
+
+function stopComfyFileDropEvent(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation?.();
 }
 
 function makeButton(label, callback, title = "") {
@@ -1057,7 +1211,9 @@ function renderCharacterTile(node, state, uiState, character, selectedId) {
   name.textContent = character.name;
   const meta = document.createElement("div");
   meta.className = "dsm-muted";
-  meta.textContent = `${character.loras.filter((row) => row.enabled && row.name !== "None").length} LoRA · ${character.prompts.length} preset${character.prompts.length === 1 ? "" : "s"}`;
+  const stacks = getCharacterLoaderStacks(character);
+  const rowCount = stacks.reduce((sum, stack) => sum + loaderStackActiveRowCount(stack), 0);
+  meta.textContent = `${stacks.length} loader${stacks.length === 1 ? "" : "s"} · ${rowCount} LoRA · ${character.prompts.length} preset${character.prompts.length === 1 ? "" : "s"}`;
   tile.append(thumb, name, meta);
   tile.addEventListener("click", () => {
     const promptId = character.prompts[0]?.id || "";
@@ -1191,31 +1347,44 @@ function renderCharacterPanel(node, state, uiState, character) {
       fileInput.value = "";
     }
   });
-  preview.addEventListener("click", () => fileInput.click());
-  preview.addEventListener("dragover", (event) => {
+  preview.addEventListener("click", (event) => {
     event.preventDefault();
-    preview.classList.add("dragging");
+    event.stopPropagation();
+    fileInput.click();
   });
-  preview.addEventListener("dragleave", () => preview.classList.remove("dragging"));
+  preview.addEventListener("dragenter", (event) => {
+    stopComfyFileDropEvent(event);
+    preview.classList.add("dragging");
+  }, true);
+  preview.addEventListener("dragover", (event) => {
+    stopComfyFileDropEvent(event);
+    preview.classList.add("dragging");
+  }, true);
+  preview.addEventListener("dragleave", (event) => {
+    event.stopPropagation();
+    preview.classList.remove("dragging");
+  }, true);
   preview.addEventListener("drop", async (event) => {
-    event.preventDefault();
+    stopComfyFileDropEvent(event);
     preview.classList.remove("dragging");
     const file = [...(event.dataTransfer?.files || [])].find((candidate) => candidate.type.startsWith("image/"));
     if (!file) return;
     try {
       character.thumbnail = await uploadThumbnailFile(file);
-      updateState(node, state, uiState, { characterId: character.id, status: "Thumbnail uploaded." });
+      updateState(node, state, uiState, { characterId: character.id, status: "Original character image uploaded. UI preview is CSS-scaled only; backend image output loads the original file." });
     } catch (err) {
       setStatus(node, `Thumbnail upload failed: ${err?.message || err}`);
     }
-  });
+  }, true);
 
   const loraSummary = document.createElement("div");
   loraSummary.className = "dsm-lora-summary";
-  const activeRows = character.loras.filter((row) => row.enabled && row.name && row.name !== "None");
-  loraSummary.textContent = activeRows.length
-    ? activeRows.map((row) => `${row.name} (${row.strength_model}/${row.strength_clip})`).join("\n")
-    : "No saved LoRA stack for this character.";
+  const stackLines = getCharacterLoaderStacks(character).flatMap((stack) => {
+    const activeRows = (stack.loras || []).filter((row) => row.enabled && row.name && row.name !== "None");
+    if (!activeRows.length) return [`[${stack.slot}] ${stack.label}: empty`];
+    return [`[${stack.slot}] ${stack.label}`, ...activeRows.map((row) => `  ${row.name} (${row.strength_model}/${row.strength_clip})`)];
+  });
+  loraSummary.textContent = stackLines.length ? stackLines.join("\n") : "No saved LoRA stack for this character.";
 
   const thumbnailButtons = document.createElement("div");
   thumbnailButtons.className = "dsm-toolbar";
@@ -1227,7 +1396,11 @@ function renderCharacterPanel(node, state, uiState, character) {
     })
   );
 
-  section.append(title, labelledControl("Name", nameInput), preview, fileInput, thumbnailButtons, labelledControl("Saved LoRA stack", loraSummary));
+  const imageNote = document.createElement("div");
+  imageNote.className = "dsm-muted";
+  imageNote.textContent = "The State Manager image output loads the original uploaded file, not the CSS-scaled preview.";
+
+  section.append(title, labelledControl("Name", nameInput), preview, fileInput, thumbnailButtons, imageNote, labelledControl("Saved LoRA stacks", loraSummary));
   return section;
 }
 
@@ -1312,104 +1485,200 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
   section.append(header, labelledControl("Preset name", name), labelledControl("Positive template", positive), labelledControl("Negative template", negative));
 }
 
-function renderLoraPanelContent(section, node, state, uiState, character, prompt) {
-  const header = document.createElement("div");
-  header.className = "dsm-toolbar";
-  header.append(
-    makeButton("Save connected loader", () => {
-      const controlledLoaders = getControlledNodes(node).filter(isDoraLoaderNode);
-      const loaders = controlledLoaders.length ? controlledLoaders : uniqueNodes(getOutputTargets(node, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
-      const stack = loaders.map(extractLoraStackFromNode).find(Boolean);
-      if (stack) {
-        character.loras = stack.loras;
-        character.loader_globals = stack.loader_globals;
+function renderLoraStackEditor(section, node, state, uiState, character, prompt, stack, stackIndex) {
+  const box = document.createElement("div");
+  box.className = "dsm-stack-box";
+
+  const title = document.createElement("div");
+  title.className = "dsm-toolbar";
+  const slot = makeInput(stack.slot, (value) => {
+    const oldSlot = stack.slot;
+    stack.slot = normalizeLoaderSlot(value, oldSlot || `loader_${stackIndex + 1}`);
+    if (stack.slot !== oldSlot) syncLegacyLoaderMirror(character);
+    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Renamed loader slot ${oldSlot} -> ${stack.slot}. Update the matching DoRA loader's State slot too.` });
+  });
+  const label = makeInput(stack.label, (value) => {
+    stack.label = String(value || stack.slot).trim() || stack.slot;
+    syncLegacyLoaderMirror(character);
+    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+  });
+  title.append(
+    labelledControl("Slot", slot),
+    labelledControl("Label", label),
+    makeButton("Add row", () => {
+      stack.loras.push({ enabled: true, name: "None", strength_model: 1.0, strength_clip: 1.0 });
+      syncLegacyLoaderMirror(character);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Added LoRA row to ${stack.slot}.` });
+    }),
+    makeButton("Delete stack", () => {
+      const stacks = getCharacterLoaderStacks(character);
+      if (stacks.length <= 1) {
+        setStatus(node, "At least one loader stack must remain.");
+        return;
       }
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: stack ? "Saved LoRA stack from connected loader." : "No connected DoRA loader found." });
-    }),
-    makeButton("Apply connected loader", () => {
-      const controlledLoaders = getControlledNodes(node).filter(isDoraLoaderNode);
-      const loaders = controlledLoaders.length ? controlledLoaders : uniqueNodes(getOutputTargets(node, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
-      let count = 0;
-      for (const loader of loaders) if (applyLoraStackToNode(loader, character)) count += 1;
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: count ? `Applied LoRA stack to ${count} connected loader${count === 1 ? "" : "s"}.` : "No connected DoRA loader accepted the stack." });
-    }),
-    makeButton("Add manual row", () => {
-      character.loras.push({ enabled: true, name: "None", strength_model: 1.0, strength_clip: 1.0 });
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: "Added manual LoRA row." });
+      const idx = stacks.findIndex((candidate) => normalizeLoaderSlot(candidate.slot, "default") === normalizeLoaderSlot(stack.slot, "default"));
+      if (idx >= 0) stacks.splice(idx, 1);
+      syncLegacyLoaderMirror(character);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Deleted loader stack ${stack.slot}.` });
     })
   );
-  section.appendChild(header);
+  box.appendChild(title);
 
-  if (!character.loras.length) {
+  const globals = stack.loader_globals || (stack.loader_globals = {});
+  const globalsLine = document.createElement("div");
+  globalsLine.className = "dsm-grid2";
+  globalsLine.append(
+    labelledControl("Stack enabled", makeCheckbox(globals.stack_enabled ?? true, (checked) => {
+      stack.loader_globals = normalizeLoaderGlobals({ ...globals, stack_enabled: checked });
+      syncLegacyLoaderMirror(character);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    })),
+    labelledControl("Auto-strength", makeCheckbox(globals.auto_strength_enabled ?? false, (checked) => {
+      stack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_enabled: checked });
+      syncLegacyLoaderMirror(character);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    })),
+    labelledControl("Analysis device", makeSelect(AUTO_STRENGTH_DEVICE_CHOICES, normalizeDevice(globals.auto_strength_device ?? "gpu"), (value) => {
+      stack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_device: value });
+      syncLegacyLoaderMirror(character);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    })),
+    labelledControl("Ratio ceiling", makeInput(globals.auto_strength_ratio_ceiling ?? 1.5, (value) => {
+      stack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_ratio_ceiling: normalizeNumber(value, 1.5) });
+      syncLegacyLoaderMirror(character);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    }, { type: "number", step: "0.01" }))
+  );
+  box.appendChild(globalsLine);
+
+  if (!stack.loras.length) {
     const empty = document.createElement("div");
     empty.className = "dsm-muted";
-    empty.textContent = "No LoRA stack saved. Save a connected/selected DoRA loader or add manual rows.";
-    section.appendChild(empty);
-    return;
+    empty.textContent = `No LoRA rows saved for slot ${stack.slot}.`;
+    box.appendChild(empty);
   }
 
-  character.loras.forEach((row, index) => {
+  stack.loras.forEach((row, index) => {
     const line = document.createElement("div");
     line.className = "dsm-lora-row";
     const enabled = makeCheckbox(row.enabled, (checked) => {
       row.enabled = checked;
+      syncLegacyLoaderMirror(character);
       updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
     });
     const name = makeInput(row.name, (value) => {
       row.name = value.trim() || "None";
+      syncLegacyLoaderMirror(character);
       updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
     });
     const sm = makeInput(row.strength_model, (value) => {
       row.strength_model = normalizeNumber(value, row.strength_model);
+      syncLegacyLoaderMirror(character);
       updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
     }, { type: "number", step: "0.05" });
     const sc = makeInput(row.strength_clip, (value) => {
       row.strength_clip = normalizeNumber(value, row.strength_clip);
+      syncLegacyLoaderMirror(character);
       updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
     }, { type: "number", step: "0.05" });
     line.append(enabled, name, sm, sc, makeButton("×", () => {
-      character.loras.splice(index, 1);
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: "Removed LoRA row." });
+      stack.loras.splice(index, 1);
+      syncLegacyLoaderMirror(character);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Removed LoRA row from ${stack.slot}.` });
     }));
-    section.appendChild(line);
+    box.appendChild(line);
   });
+
+  section.appendChild(box);
 }
 
+function renderLoraPanelContent(section, node, state, uiState, character, prompt) {
+  const header = document.createElement("div");
+  header.className = "dsm-toolbar";
+  header.append(
+    makeButton("Save connected loaders", () => {
+      const controlledLoaders = getControlledNodes(node).filter(isDoraLoaderNode);
+      const loaders = controlledLoaders.length ? controlledLoaders : uniqueNodes(getOutputTargets(node, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
+      let count = 0;
+      loaders.forEach((loader, index) => {
+        const stack = extractLoraStackFromNode(loader, index);
+        if (!stack) return;
+        setCharacterLoaderStack(character, stack);
+        count += 1;
+      });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: count ? `Saved ${count} connected DoRA loader${count === 1 ? "" : "s"}.` : "No connected DoRA loader found." });
+    }),
+    makeButton("Apply connected loaders", () => {
+      const controlledLoaders = getControlledNodes(node).filter(isDoraLoaderNode);
+      const loaders = controlledLoaders.length ? controlledLoaders : uniqueNodes(getOutputTargets(node, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
+      let count = 0;
+      for (const loader of loaders) if (applyLoraStackToNode(loader, character)) count += 1;
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: count ? `Applied saved LoRA stacks to ${count} connected loader${count === 1 ? "" : "s"}.` : "No connected DoRA loader accepted a matching stack." });
+    }),
+    makeButton("Add loader stack", () => {
+      const stack = defaultLoaderStack(`loader_${getCharacterLoaderStacks(character).length + 1}`, `Loader ${getCharacterLoaderStacks(character).length + 1}`);
+      character.loader_stacks.push(stack);
+      syncLegacyLoaderMirror(character);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Added loader stack ${stack.slot}.` });
+    })
+  );
+  section.appendChild(header);
+
+  const note = document.createElement("div");
+  note.className = "dsm-muted";
+  note.textContent = "Each DoRA loader is matched by its State slot widget. Use unique slots, e.g. face, outfit, style, refiner.";
+  section.appendChild(note);
+
+  for (const [index, stack] of getCharacterLoaderStacks(character).entries()) {
+    renderLoraStackEditor(section, node, state, uiState, character, prompt, stack, index);
+  }
+}
+
+
 function renderSettingsPanelContent(section, node, state, uiState, character, prompt) {
-  const globals = character.loader_globals || (character.loader_globals = {});
+  const primaryStack = findCharacterLoaderStack(character, "default") || getCharacterLoaderStacks(character)[0];
+  const globals = primaryStack.loader_globals || (primaryStack.loader_globals = {});
   const grid = document.createElement("div");
   grid.className = "dsm-grid2";
 
   const stackEnabled = makeCheckbox(globals.stack_enabled ?? true, (checked) => {
-    character.loader_globals = normalizeLoaderGlobals({ ...globals, stack_enabled: checked });
+    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, stack_enabled: checked });
+    syncLegacyLoaderMirror(character);
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
   const autoStrength = makeCheckbox(globals.auto_strength_enabled ?? false, (checked) => {
-    character.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_enabled: checked });
+    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_enabled: checked });
+    syncLegacyLoaderMirror(character);
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
   const device = makeSelect(AUTO_STRENGTH_DEVICE_CHOICES, normalizeDevice(globals.auto_strength_device ?? "gpu"), (value) => {
-    character.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_device: value });
+    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_device: value });
+    syncLegacyLoaderMirror(character);
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
   const broadcastMods = makeCheckbox(globals.broadcast_modulations ?? true, (checked) => {
-    character.loader_globals = normalizeLoaderGlobals({ ...globals, broadcast_modulations: checked });
+    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, broadcast_modulations: checked });
+    syncLegacyLoaderMirror(character);
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
   const floor = makeInput(globals.auto_strength_ratio_floor ?? 0.3, (value) => {
-    character.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_ratio_floor: normalizeNumber(value, 0.3) });
+    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_ratio_floor: normalizeNumber(value, 0.3) });
+    syncLegacyLoaderMirror(character);
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   }, { type: "number", step: "0.01" });
   const ceiling = makeInput(globals.auto_strength_ratio_ceiling ?? 1.5, (value) => {
-    character.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_ratio_ceiling: normalizeNumber(value, 1.5) });
+    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_ratio_ceiling: normalizeNumber(value, 1.5) });
+    syncLegacyLoaderMirror(character);
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   }, { type: "number", step: "0.01" });
   const sliceFix = makeCheckbox(globals.dora_slice_fix ?? true, (checked) => {
-    character.loader_globals = normalizeLoaderGlobals({ ...globals, dora_slice_fix: checked });
+    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, dora_slice_fix: checked });
+    syncLegacyLoaderMirror(character);
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
   const adalnFix = makeCheckbox(globals.dora_adaln_swap_fix ?? true, (checked) => {
-    character.loader_globals = normalizeLoaderGlobals({ ...globals, dora_adaln_swap_fix: checked });
+    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, dora_adaln_swap_fix: checked });
+    syncLegacyLoaderMirror(character);
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
 
@@ -1431,6 +1700,7 @@ function renderSettingsPanelContent(section, node, state, uiState, character, pr
     if (settings.rgthree_seed?.widgets) settings.rgthree_seed.widgets.seed = settings.seed;
     if (settings.rgthree_seed) settings.rgthree_seed.seed = settings.seed;
     prompt.settings = settings;
+    syncLegacyLoaderMirror(character);
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   }, { type: "number", step: "1", min: "0" });
 
@@ -1443,6 +1713,7 @@ function renderSettingsPanelContent(section, node, state, uiState, character, pr
   }, { placeholder: "Saved node settings JSON. Save connected/selected nodes to populate this." });
   settingsJson.addEventListener("change", () => {
     settingsJson.value = JSON.stringify(prompt.settings || {}, null, 2);
+    syncLegacyLoaderMirror(character);
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
 
@@ -1555,6 +1826,7 @@ function ensureStyles() {
     .dsm-character-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
     .dsm-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
     .dsm-grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+    .dsm-stack-box { border: 1px solid rgba(128,128,128,.28); border-radius: 7px; padding: 7px; display: flex; flex-direction: column; gap: 7px; background: rgba(0,0,0,.10); }
     .dsm-lora-row { display: grid; grid-template-columns: auto minmax(110px, 1fr) 76px 76px auto; gap: 6px; align-items: center; }
     .dsm-lora-summary { white-space: pre-wrap; border: 1px solid rgba(128,128,128,.35); border-radius: 6px; padding: 6px; min-height: 58px; max-height: 190px; overflow: auto; background: rgba(0,0,0,.16); }
     @media (max-width: 720px) { .dsm-main { grid-template-columns: 1fr; } }
