@@ -490,6 +490,10 @@ def _state_manager_default_state() -> Dict[str, Any]:
                         "name": "Default Prompt",
                         "positive": "",
                         "negative": "",
+                        "text_boxes": [
+                            {"role": "positive", "slot": "default", "label": "Default positive", "text": ""},
+                            {"role": "negative", "slot": "default", "label": "Default negative", "text": ""},
+                        ],
                         "settings": {},
                     }
                 ],
@@ -562,6 +566,119 @@ def _normalize_manager_settings(settings: Any) -> Dict[str, Any]:
         return settings
     parsed = _safe_json_load(settings, {})
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _normalize_manager_text_role(value: Any, fallback: str = "generic") -> str:
+    text = str(value or fallback).strip().lower()
+    if text in {"positive", "pos"} or "positive" in text:
+        return "positive"
+    if text in {"negative", "neg"} or "negative" in text:
+        return "negative"
+    if text == "generic":
+        return "generic"
+    return fallback
+
+
+def _clean_text_slot(value: Any, fallback: str = "default") -> str:
+    return _clean_state_id(value, fallback)
+
+
+def _text_box_key(role: Any, slot: Any) -> str:
+    return f"{_normalize_manager_text_role(role)}::{_clean_text_slot(slot)}"
+
+
+def _default_manager_text_box(role: str, slot: str = "default", text: Any = "") -> Dict[str, Any]:
+    role_name = _normalize_manager_text_role(role)
+    slot_name = _clean_text_slot(slot)
+    return {
+        "role": role_name,
+        "slot": slot_name,
+        "label": f"{role_name.title()} {slot_name}",
+        "text": str(text or ""),
+    }
+
+
+def _raw_manager_text_boxes(prompt: Dict[str, Any]) -> List[Any]:
+    raw = prompt.get("text_boxes", prompt.get("textBoxes", prompt.get("prompt_boxes", prompt.get("promptBoxes", []))))
+    if isinstance(raw, list):
+        return list(raw)
+    if isinstance(raw, dict):
+        out: List[Any] = []
+        for slot, value in raw.items():
+            if isinstance(value, dict):
+                merged = dict(value)
+                merged.setdefault("slot", slot)
+                out.append(merged)
+            else:
+                out.append({"slot": slot, "text": value})
+        return out
+    return []
+
+
+def _normalize_manager_text_box(raw: Any, index: int = 0) -> Optional[Dict[str, Any]]:
+    if raw is None:
+        return None
+    src = raw if isinstance(raw, dict) else {"text": raw}
+    role = _normalize_manager_text_role(src.get("role", src.get("kind", src.get("type", "generic"))))
+    slot = _clean_text_slot(src.get("slot", src.get("id", src.get("name", ""))), f"text_{index + 1}" if role == "generic" else "default")
+    return {
+        "role": role,
+        "slot": slot,
+        "label": str(src.get("label", src.get("name", f"{role} {slot}")) or f"{role} {slot}").strip() or f"{role} {slot}",
+        "text": str(src.get("text", src.get("value", src.get("prompt", ""))) or ""),
+    }
+
+
+def _normalize_manager_text_boxes(prompt: Dict[str, Any]) -> List[Dict[str, Any]]:
+    legacy_positive = str(prompt.get("positive", prompt.get("positive_prompt", "")) or "")
+    legacy_negative = str(prompt.get("negative", prompt.get("negative_prompt", "")) or "")
+    raw_boxes = _raw_manager_text_boxes(prompt)
+    boxes: List[Dict[str, Any]] = []
+    used: Set[str] = set()
+
+    for index, raw in enumerate(raw_boxes):
+        normalized = _normalize_manager_text_box(raw, index)
+        if normalized is None:
+            continue
+        base_slot = normalized["slot"]
+        slot = base_slot
+        suffix = 2
+        while _text_box_key(normalized["role"], slot) in used:
+            slot = f"{base_slot}_{suffix}"
+            suffix += 1
+        normalized["slot"] = slot
+        used.add(_text_box_key(normalized["role"], slot))
+        boxes.append(normalized)
+
+    def upsert_legacy(role: str, text: str) -> None:
+        key = _text_box_key(role, "default")
+        existing = next((box for box in boxes if _text_box_key(box.get("role"), box.get("slot")) == key), None)
+        if existing is not None:
+            if text and not existing.get("text"):
+                existing["text"] = text
+            return
+        if text or not raw_boxes:
+            boxes.append(_default_manager_text_box(role, "default", text))
+
+    upsert_legacy("positive", legacy_positive)
+    upsert_legacy("negative", legacy_negative)
+    return boxes
+
+
+def _pick_manager_text_box(prompt: Dict[str, Any], role: str, slot: str = "default") -> Optional[Dict[str, Any]]:
+    boxes = _normalize_manager_text_boxes(prompt)
+    role_name = _normalize_manager_text_role(role)
+    slot_name = _clean_text_slot(slot)
+    for box in boxes:
+        if box.get("role") == role_name and _clean_text_slot(box.get("slot")) == slot_name:
+            return box
+    for box in boxes:
+        if box.get("role") == role_name and _clean_text_slot(box.get("slot")) == "default":
+            return box
+    for box in boxes:
+        if box.get("role") == role_name:
+            return box
+    return None
 
 
 def _normalize_manager_thumbnail(thumbnail: Any) -> Dict[str, Any]:
@@ -786,11 +903,15 @@ def _normalize_manager_prompt(prompt: Any, index: int) -> Optional[Dict[str, Any
     prompt_id = _clean_state_id(prompt.get("id"), _state_manager_make_id("prompt", index))
     name = str(prompt.get("name") or f"Prompt {index + 1}").strip() or f"Prompt {index + 1}"
     settings = _normalize_settings_with_canonical_seed(prompt.get("settings", {}))
+    text_boxes = _normalize_manager_text_boxes(prompt)
+    positive_box = next((box for box in text_boxes if box.get("role") == "positive" and box.get("slot") == "default"), None) or next((box for box in text_boxes if box.get("role") == "positive"), None)
+    negative_box = next((box for box in text_boxes if box.get("role") == "negative" and box.get("slot") == "default"), None) or next((box for box in text_boxes if box.get("role") == "negative"), None)
     return {
         "id": prompt_id,
         "name": name,
-        "positive": str(prompt.get("positive", prompt.get("positive_prompt", "")) or ""),
-        "negative": str(prompt.get("negative", prompt.get("negative_prompt", "")) or ""),
+        "positive": str(positive_box.get("text", "") if positive_box else prompt.get("positive", prompt.get("positive_prompt", "")) or ""),
+        "negative": str(negative_box.get("text", "") if negative_box else prompt.get("negative", prompt.get("negative_prompt", "")) or ""),
+        "text_boxes": text_boxes,
         "settings": settings,
     }
 
@@ -909,8 +1030,11 @@ def _resolve_dora_state_payload(
     default_stack = _pick_loader_stack(loader_stacks, "default")
     loras = default_stack.get("loras", character.get("loras", []))
     loader_globals = default_stack.get("loader_globals", character.get("loader_globals", {}))
-    positive = str(prompt.get("positive", "") or "")
-    negative = str(prompt.get("negative", "") or "")
+    text_boxes = _normalize_manager_text_boxes(prompt)
+    positive_box = _pick_manager_text_box(prompt, "positive", "default")
+    negative_box = _pick_manager_text_box(prompt, "negative", "default")
+    positive = str(positive_box.get("text", "") if positive_box else prompt.get("positive", "") or "")
+    negative = str(negative_box.get("text", "") if negative_box else prompt.get("negative", "") or "")
 
     return {
         "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
@@ -928,6 +1052,7 @@ def _resolve_dora_state_payload(
         "loras": loras,
         "loader_globals": loader_globals,
         "settings": settings,
+        "text_boxes": text_boxes,
         "positive_prompt": positive,
         "negative_prompt": negative,
     }
@@ -1082,6 +1207,9 @@ def _normalize_runtime_dora_state_payload(raw: Any) -> Optional[Dict[str, Any]]:
     default_stack = _pick_loader_stack(loader_stacks, "default")
     loras = default_stack.get("loras", [])
     globals_out = default_stack.get("loader_globals", _normalize_manager_loader_globals(payload.get("loader_globals", payload.get("globals", {}))))
+    text_boxes = _normalize_manager_text_boxes(payload)
+    positive_box = _pick_manager_text_box(payload, "positive", "default")
+    negative_box = _pick_manager_text_box(payload, "negative", "default")
     return {
         "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
         "kind": _DORA_STATE_KIND,
@@ -1091,8 +1219,9 @@ def _normalize_runtime_dora_state_payload(raw: Any) -> Optional[Dict[str, Any]]:
         "loras": loras,
         "loader_globals": globals_out,
         "settings": _normalize_manager_settings(payload.get("settings", {})),
-        "positive_prompt": str(payload.get("positive_prompt", "") or ""),
-        "negative_prompt": str(payload.get("negative_prompt", "") or ""),
+        "text_boxes": text_boxes,
+        "positive_prompt": str(positive_box.get("text", "") if positive_box else payload.get("positive_prompt", "") or ""),
+        "negative_prompt": str(negative_box.get("text", "") if negative_box else payload.get("negative_prompt", "") or ""),
     }
 
 
@@ -4053,6 +4182,7 @@ class StateManagerTextBox:
             "required": {
                 "role": (["positive", "negative", "generic"], {"default": "positive"}),
                 "text": ("STRING", {"default": "", "multiline": True}),
+                "state_slot": ("STRING", {"default": "default", "multiline": False}),
             },
             "optional": {
                 "state_control": ("STATE_MANAGER_CONTROL",),
@@ -4065,12 +4195,12 @@ class StateManagerTextBox:
     CATEGORY = "state managers"
 
     @classmethod
-    def IS_CHANGED(cls, role: Any, text: Any, state_control: Any = None):
+    def IS_CHANGED(cls, role: Any, text: Any = "", state_slot: Any = "default", state_control: Any = None):
         del state_control
-        return json.dumps({"role": str(role), "text": str(text)}, ensure_ascii=False, sort_keys=True)
+        return json.dumps({"role": str(role), "state_slot": str(state_slot), "text": str(text)}, ensure_ascii=False, sort_keys=True)
 
-    def emit(self, role: Any, text: Any, state_control: Any = None):
-        del role, state_control
+    def emit(self, role: Any, text: Any = "", state_slot: Any = "default", state_control: Any = None):
+        del role, state_slot, state_control
         return (str(text or ""),)
 
 
