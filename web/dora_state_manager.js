@@ -34,6 +34,8 @@ const OUTPUT_NAMES = {
   seed: ["seed"],
 };
 const TEXT_WIDGET_NAMES = ["text", "prompt", "positive", "negative", "string", "value", "wildcard", "wildcards"];
+const STATE_TEXT_SLOT_WIDGET = "state_slot";
+const TEXT_BOX_ROLE_CHOICES = ["positive", "negative", "generic"];
 const POSITIVE_HINT_RE = /positive|pos|prompt/i;
 const NEGATIVE_HINT_RE = /negative|neg/i;
 const SEED_HINT_RE = /seed|noise_seed|rgthree|control_after_generate|randomize|variation|subseed/i;
@@ -74,8 +76,157 @@ function defaultPrompt() {
     name: "Default Prompt",
     positive: "",
     negative: "",
+    text_boxes: [
+      { role: "positive", slot: "default", label: "Default positive", text: "" },
+      { role: "negative", slot: "default", label: "Default negative", text: "" },
+    ],
     settings: {},
   };
+}
+
+function normalizeTextRole(value, fallback = "generic") {
+  const text = String(value ?? fallback).trim().toLowerCase();
+  if (text.includes("positive") || text === "pos") return "positive";
+  if (text.includes("negative") || text === "neg") return "negative";
+  return TEXT_BOX_ROLE_CHOICES.includes(text) ? text : fallback;
+}
+
+function isTextRoleKey(value) {
+  return TEXT_BOX_ROLE_CHOICES.includes(normalizeTextRole(value, ""));
+}
+
+function normalizeTextSlot(value, fallback = "default") {
+  return cleanId(value, fallback);
+}
+
+function defaultTextBox(role = "positive", slot = "default", text = "") {
+  const normalizedRole = normalizeTextRole(role, "generic");
+  const normalizedSlot = normalizeTextSlot(slot, "default");
+  const labelRole = normalizedRole.charAt(0).toUpperCase() + normalizedRole.slice(1);
+  return {
+    role: normalizedRole,
+    slot: normalizedSlot,
+    label: `${labelRole} ${normalizedSlot}`,
+    text: String(text ?? ""),
+  };
+}
+
+function textBoxKey(role, slot) {
+  return `${normalizeTextRole(role, "generic")}::${normalizeTextSlot(slot, "default")}`;
+}
+
+function normalizeTextBox(raw, index = 0) {
+  if (raw == null) return null;
+  const src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : { text: raw };
+  const role = normalizeTextRole(src.role ?? src.kind ?? src.type, "generic");
+  const slot = normalizeTextSlot(src.slot ?? src.id ?? src.name, role === "generic" ? `text_${index + 1}` : "default");
+  return {
+    role,
+    slot,
+    label: String(src.label ?? src.name ?? `${role} ${slot}`).trim() || `${role} ${slot}`,
+    text: String(src.text ?? src.value ?? src.prompt ?? ""),
+  };
+}
+
+function rawTextBoxesFromPrompt(prompt) {
+  const p = prompt && typeof prompt === "object" ? prompt : {};
+  const raw = p.text_boxes ?? p.textBoxes ?? p.prompt_boxes ?? p.promptBoxes;
+  const out = [];
+  if (Array.isArray(raw)) {
+    out.push(...raw);
+  } else if (raw && typeof raw === "object") {
+    for (const [key, value] of Object.entries(raw)) {
+      const roleKey = isTextRoleKey(key);
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        const merged = { ...value };
+        if (roleKey && merged.role == null) merged.role = key;
+        else if (!roleKey && merged.slot == null) merged.slot = key;
+        out.push(merged);
+      } else {
+        out.push(roleKey ? { role: key, text: value } : { slot: key, text: value });
+      }
+    }
+  }
+  return out;
+}
+
+function normalizePromptTextBoxes(prompt) {
+  const p = prompt && typeof prompt === "object" ? prompt : {};
+  const legacyPositive = String(p.positive ?? p.positive_prompt ?? "");
+  const legacyNegative = String(p.negative ?? p.negative_prompt ?? "");
+  const raw = rawTextBoxesFromPrompt(p);
+  const boxes = [];
+  const used = new Set();
+  raw.forEach((box, index) => {
+    const normalized = normalizeTextBox(box, index);
+    if (!normalized) return;
+    const base = normalized.slot;
+    let slot = base;
+    let suffix = 2;
+    while (used.has(textBoxKey(normalized.role, slot))) slot = `${base}_${suffix++}`;
+    normalized.slot = slot;
+    used.add(textBoxKey(normalized.role, normalized.slot));
+    boxes.push(normalized);
+  });
+
+  const hadRawBoxes = raw.length > 0;
+  const upsertLegacy = (role, text) => {
+    const key = textBoxKey(role, "default");
+    const existing = boxes.find((box) => textBoxKey(box.role, box.slot) === key);
+    if (existing) {
+      if (text && !existing.text) existing.text = text;
+      return;
+    }
+    if (text || !hadRawBoxes) boxes.push(defaultTextBox(role, "default", text));
+  };
+
+  upsertLegacy("positive", legacyPositive);
+  upsertLegacy("negative", legacyNegative);
+  return boxes;
+}
+
+function findPromptTextBox(prompt, role, slot, { allowRoleFallback = true } = {}) {
+  const boxes = normalizePromptTextBoxes(prompt);
+  const normalizedRole = normalizeTextRole(role, "generic");
+  const normalizedSlot = normalizeTextSlot(slot, "default");
+  const exact = boxes.find((box) => box.role === normalizedRole && normalizeTextSlot(box.slot, "default") === normalizedSlot);
+  if (exact || !allowRoleFallback) return exact || null;
+  return boxes.find((box) => box.role === normalizedRole && normalizeTextSlot(box.slot, "default") === "default") || boxes.find((box) => box.role === normalizedRole) || null;
+}
+
+function syncPromptTextMirror(prompt) {
+  if (!prompt || typeof prompt !== "object") return prompt;
+  const boxes = normalizePromptTextBoxes(prompt);
+  const positive = boxes.find((box) => box.role === "positive" && box.slot === "default") || boxes.find((box) => box.role === "positive");
+  const negative = boxes.find((box) => box.role === "negative" && box.slot === "default") || boxes.find((box) => box.role === "negative");
+  prompt.text_boxes = boxes;
+  prompt.positive = String(positive?.text ?? prompt.positive ?? "");
+  prompt.negative = String(negative?.text ?? prompt.negative ?? "");
+  return prompt;
+}
+
+function setPromptTextBox(prompt, role, slot, text, label = "") {
+  const boxes = normalizePromptTextBoxes(prompt);
+  const normalizedRole = normalizeTextRole(role, "generic");
+  const normalizedSlot = normalizeTextSlot(slot, "default");
+  let box = boxes.find((item) => item.role === normalizedRole && normalizeTextSlot(item.slot, "default") === normalizedSlot);
+  if (!box) {
+    box = defaultTextBox(normalizedRole, normalizedSlot, text);
+    boxes.push(box);
+  }
+  box.text = String(text ?? "");
+  if (label) box.label = String(label).trim() || box.label;
+  prompt.text_boxes = boxes;
+  syncPromptTextMirror(prompt);
+  return box;
+}
+
+function getPromptText(prompt, role, slot = "default") {
+  const box = findPromptTextBox(prompt, role, slot);
+  if (box) return box.text;
+  if (normalizeTextRole(role, "generic") === "positive") return String(prompt?.positive ?? "");
+  if (normalizeTextRole(role, "generic") === "negative") return String(prompt?.negative ?? "");
+  return "";
 }
 
 function defaultLoaderStack(slot = "default", label = "Default loader") {
@@ -306,13 +457,14 @@ function normalizeLoraRow(row) {
 
 function normalizePrompt(prompt, index) {
   const p = prompt && typeof prompt === "object" ? prompt : {};
-  return {
+  return syncPromptTextMirror({
     id: cleanId(p.id, `prompt_${index + 1}`),
     name: String(p.name ?? `Prompt ${index + 1}`).trim() || `Prompt ${index + 1}`,
     positive: String(p.positive ?? p.positive_prompt ?? ""),
     negative: String(p.negative ?? p.negative_prompt ?? ""),
+    text_boxes: normalizePromptTextBoxes(p),
     settings: normalizeSettings(p.settings),
-  };
+  });
 }
 
 function normalizeCharacter(character, index) {
@@ -546,11 +698,55 @@ function getRoleWidget(node) {
   return map.get("role") || null;
 }
 
+function getStateTextSlotWidget(node) {
+  const map = getWidgetMap(node);
+  return map.get(STATE_TEXT_SLOT_WIDGET) || map.get("slot") || null;
+}
+
 function getStateTextRole(node, fallback = "generic") {
-  const role = String(getRoleWidget(node)?.value ?? fallback).toLowerCase();
-  if (role.includes("positive")) return "positive";
-  if (role.includes("negative")) return "negative";
-  return "generic";
+  return normalizeTextRole(getRoleWidget(node)?.value, fallback);
+}
+
+function getStateTextSlot(node, role = "generic", fallback = "default") {
+  const widgetValue = getStateTextSlotWidget(node)?.value;
+  const propValue = node?.properties?.dora_state_text_slot;
+  const normalizedRole = normalizeTextRole(role, "generic");
+  return normalizeTextSlot(widgetValue ?? propValue, normalizedRole === "generic" ? fallback : "default");
+}
+
+function setStateTextSlot(node, slot) {
+  const normalized = normalizeTextSlot(slot, "default");
+  const widget = getStateTextSlotWidget(node);
+  if (widget) setNodeWidget(node, widget, normalized);
+  node.properties = node.properties || {};
+  node.properties.dora_state_text_slot = normalized;
+  return normalized;
+}
+
+function stateTextLabel(node, role, slot) {
+  const title = String(node?.title || "").trim();
+  if (title && title !== STATE_TEXT_CLASS && title !== STATE_TEXT_DISPLAY_CLASS) return title;
+  return `${normalizeTextRole(role, "generic")} ${normalizeTextSlot(slot, "default")}`;
+}
+
+function ensureUniqueStateTextSlot(node, role, usedKeys, fallbackIndex = 0) {
+  let slot = getStateTextSlot(node, role, `${normalizeTextRole(role, "generic")}_${node?.id ?? fallbackIndex + 1}`);
+  const baseFallback = `${normalizeTextRole(role, "generic")}_${node?.id ?? fallbackIndex + 1}`;
+  const original = slot;
+  let key = textBoxKey(role, slot);
+  if (!slot || usedKeys.has(key)) {
+    slot = normalizeTextSlot(baseFallback, `text_${fallbackIndex + 1}`);
+    key = textBoxKey(role, slot);
+  }
+  let suffix = 2;
+  const base = slot;
+  while (usedKeys.has(key)) {
+    slot = `${base}_${suffix++}`;
+    key = textBoxKey(role, slot);
+  }
+  usedKeys.add(key);
+  if (slot !== original) setStateTextSlot(node, slot);
+  return slot;
 }
 
 function getControlledTargets(node) {
@@ -949,44 +1145,42 @@ function saveConnectedState(targetNode, character, prompt) {
   if (savedLoaders) changes.push(`${savedLoaders} LoRA loader${savedLoaders === 1 ? "" : "s"}`);
 
   const controlledTextNodes = controlledNodes.filter(isStateTextNode);
-  let savedPositive = false;
-  let savedNegative = false;
-  for (const textNode of controlledTextNodes) {
+  const usedTextKeys = new Set();
+  const savedTextCounts = { positive: 0, negative: 0, generic: 0 };
+  for (const [index, textNode] of controlledTextNodes.entries()) {
     const role = getStateTextRole(textNode);
+    const slot = ensureUniqueStateTextSlot(textNode, role, usedTextKeys, index);
     const value = extractTextFromNode(textNode, role);
-    if (role === "positive") {
-      prompt.positive = value;
-      savedPositive = true;
-    } else if (role === "negative") {
-      prompt.negative = value;
-      savedNegative = true;
-    }
+    setPromptTextBox(prompt, role, slot, value, stateTextLabel(textNode, role, slot));
+    savedTextCounts[role] = (savedTextCounts[role] || 0) + 1;
   }
-  if (savedPositive) changes.push("positive prompt template");
-  if (savedNegative) changes.push("negative prompt template");
+  if (savedTextCounts.positive) changes.push(`${savedTextCounts.positive} positive text box${savedTextCounts.positive === 1 ? "" : "es"}`);
+  if (savedTextCounts.negative) changes.push(`${savedTextCounts.negative} negative text box${savedTextCounts.negative === 1 ? "" : "es"}`);
+  if (savedTextCounts.generic) changes.push(`${savedTextCounts.generic} generic text box${savedTextCounts.generic === 1 ? "" : "es"}`);
 
   // Compatibility fallback for old graphs. Avoid depending on this for normal use;
   // it can make editable widgets link-controlled if users connect STRING outputs.
-  if (!savedPositive) {
+  if (!savedTextCounts.positive) {
     for (const target of getOutputTargets(targetNode, OUTPUT_NAMES.positive)) {
       const widget = findTextWidget(target.node, "positive", target.inputName);
       if (widget) {
-        prompt.positive = typeof widget.value === "string" ? widget.value : "";
+        setPromptTextBox(prompt, "positive", "default", typeof widget.value === "string" ? widget.value : "", "Default positive");
         changes.push("positive prompt template");
         break;
       }
     }
   }
-  if (!savedNegative) {
+  if (!savedTextCounts.negative) {
     for (const target of getOutputTargets(targetNode, OUTPUT_NAMES.negative)) {
       const widget = findTextWidget(target.node, "negative", target.inputName);
       if (widget) {
-        prompt.negative = typeof widget.value === "string" ? widget.value : "";
+        setPromptTextBox(prompt, "negative", "default", typeof widget.value === "string" ? widget.value : "", "Default negative");
         changes.push("negative prompt template");
         break;
       }
     }
   }
+  syncPromptTextMirror(prompt);
 
   const controlledSettingTargets = controlledNodes.filter((node) =>
     node !== targetNode && !isDoraLoaderNode(node) && !isStateTextNode(node)
@@ -1017,16 +1211,38 @@ function applyConnectedState(targetNode, character, prompt) {
   const controlledTextNodes = controlledNodes.filter(isStateTextNode);
   let posChanged = 0;
   let negChanged = 0;
-  for (const textNode of controlledTextNodes) {
+  let genericChanged = 0;
+  const usedTextKeys = new Set();
+  for (const [index, textNode] of controlledTextNodes.entries()) {
     const role = getStateTextRole(textNode);
-    if (role === "positive") {
-      if (applyTextToNode(textNode, prompt.positive, "positive")) posChanged += 1;
-    } else if (role === "negative") {
-      if (applyTextToNode(textNode, prompt.negative, "negative")) negChanged += 1;
+    const slot = ensureUniqueStateTextSlot(textNode, role, usedTextKeys, index);
+    const saved = findPromptTextBox(prompt, role, slot, { allowRoleFallback: false });
+    if (!saved) continue;
+    if (applyTextToNode(textNode, saved.text, role)) {
+      if (role === "positive") posChanged += 1;
+      else if (role === "negative") negChanged += 1;
+      else genericChanged += 1;
     }
   }
+
+  if (!controlledTextNodes.length) {
+    for (const target of getOutputTargets(targetNode, OUTPUT_NAMES.positive)) {
+      if (applyTextToNode(target.node, getPromptText(prompt, "positive", "default"), "positive", target.inputName)) {
+        posChanged += 1;
+        break;
+      }
+    }
+    for (const target of getOutputTargets(targetNode, OUTPUT_NAMES.negative)) {
+      if (applyTextToNode(target.node, getPromptText(prompt, "negative", "default"), "negative", target.inputName)) {
+        negChanged += 1;
+        break;
+      }
+    }
+  }
+
   if (posChanged) changes.push(`positive template to ${posChanged} node${posChanged === 1 ? "" : "s"}`);
   if (negChanged) changes.push(`negative template to ${negChanged} node${negChanged === 1 ? "" : "s"}`);
+  if (genericChanged) changes.push(`generic text to ${genericChanged} node${genericChanged === 1 ? "" : "s"}`);
 
   const controlledSettingTargets = controlledNodes.filter((node) =>
     node !== targetNode && !isDoraLoaderNode(node) && !isStateTextNode(node)
@@ -1070,17 +1286,31 @@ function saveSelectedState(targetNode, character, prompt) {
   });
   if (savedLoaders) changes.push(`${savedLoaders} LoRA loader${savedLoaders === 1 ? "" : "s"}`);
 
-  const classified = classifySelectedTextNodes(selected.filter((node) => !isDoraLoaderNode(node) && !isSeedNode(node)));
+  const selectedStateTextNodes = selected.filter(isStateTextNode);
+  const usedTextKeys = new Set();
+  const savedTextCounts = { positive: 0, negative: 0, generic: 0 };
+  for (const [index, textNode] of selectedStateTextNodes.entries()) {
+    const role = getStateTextRole(textNode);
+    const slot = ensureUniqueStateTextSlot(textNode, role, usedTextKeys, index);
+    setPromptTextBox(prompt, role, slot, extractTextFromNode(textNode, role), stateTextLabel(textNode, role, slot));
+    savedTextCounts[role] = (savedTextCounts[role] || 0) + 1;
+  }
+  if (savedTextCounts.positive) changes.push(`${savedTextCounts.positive} positive text box${savedTextCounts.positive === 1 ? "" : "es"}`);
+  if (savedTextCounts.negative) changes.push(`${savedTextCounts.negative} negative text box${savedTextCounts.negative === 1 ? "" : "es"}`);
+  if (savedTextCounts.generic) changes.push(`${savedTextCounts.generic} generic text box${savedTextCounts.generic === 1 ? "" : "es"}`);
+
+  const classified = selectedStateTextNodes.length ? { used: [] } : classifySelectedTextNodes(selected.filter((node) => !isDoraLoaderNode(node) && !isSeedNode(node)));
   if (classified.positive) {
-    prompt.positive = classified.positive.text;
+    setPromptTextBox(prompt, "positive", "default", classified.positive.text, "Default positive");
     changes.push("positive prompt template");
   }
   if (classified.negative) {
-    prompt.negative = classified.negative.text;
+    setPromptTextBox(prompt, "negative", "default", classified.negative.text, "Default negative");
     changes.push("negative prompt template");
   }
+  syncPromptTextMirror(prompt);
 
-  const used = new Set([...loaders, ...classified.used].filter(Boolean));
+  const used = new Set([...loaders, ...selectedStateTextNodes, ...(classified.used || [])].filter(Boolean));
   const settingNodes = selected.filter((node) => !used.has(node));
   const snapshots = mergeCapturedSettings(prompt, settingNodes, { replaceNodes: true });
   if (snapshots.length) changes.push(`settings from ${snapshots.length} node${snapshots.length === 1 ? "" : "s"}`);
@@ -1097,11 +1327,24 @@ function applySelectedState(targetNode, character, prompt) {
   for (const loader of loaderTargets) if (applyLoraStackToNode(loader, character)) loaderChanged += 1;
   if (loaderChanged) changes.push(`LoRA stacks to ${loaderChanged} loader${loaderChanged === 1 ? "" : "s"}`);
 
-  const classified = classifySelectedTextNodes(selected.filter((node) => !isDoraLoaderNode(node) && !isSeedNode(node)));
-  if (classified.positive && applyTextToNode(classified.positive.node, prompt.positive, "positive")) changes.push("positive template");
-  if (classified.negative && applyTextToNode(classified.negative.node, prompt.negative, "negative")) changes.push("negative template");
+  const selectedStateTextNodes = selected.filter(isStateTextNode);
+  const usedTextKeys = new Set();
+  const changedTextCounts = { positive: 0, negative: 0, generic: 0 };
+  for (const [index, textNode] of selectedStateTextNodes.entries()) {
+    const role = getStateTextRole(textNode);
+    const slot = ensureUniqueStateTextSlot(textNode, role, usedTextKeys, index);
+    const saved = findPromptTextBox(prompt, role, slot, { allowRoleFallback: false });
+    if (saved && applyTextToNode(textNode, saved.text, role)) changedTextCounts[role] = (changedTextCounts[role] || 0) + 1;
+  }
+  if (changedTextCounts.positive) changes.push(`positive template to ${changedTextCounts.positive} node${changedTextCounts.positive === 1 ? "" : "s"}`);
+  if (changedTextCounts.negative) changes.push(`negative template to ${changedTextCounts.negative} node${changedTextCounts.negative === 1 ? "" : "s"}`);
+  if (changedTextCounts.generic) changes.push(`generic text to ${changedTextCounts.generic} node${changedTextCounts.generic === 1 ? "" : "s"}`);
 
-  const used = new Set([...loaderTargets, ...classified.used].filter(Boolean));
+  const classified = selectedStateTextNodes.length ? { used: [] } : classifySelectedTextNodes(selected.filter((node) => !isDoraLoaderNode(node) && !isSeedNode(node)));
+  if (classified.positive && applyTextToNode(classified.positive.node, getPromptText(prompt, "positive", "default"), "positive")) changes.push("positive template");
+  if (classified.negative && applyTextToNode(classified.negative.node, getPromptText(prompt, "negative", "default"), "negative")) changes.push("negative template");
+
+  const used = new Set([...loaderTargets, ...selectedStateTextNodes, ...(classified.used || [])].filter(Boolean));
   const settingNodes = selected.filter((node) => !used.has(node));
   const settingsChanged = applySettingsToNodes(settingNodes, prompt.settings);
   if (settingsChanged) changes.push(`settings/seed to ${settingsChanged} node${settingsChanged === 1 ? "" : "s"}`);
@@ -1478,17 +1721,94 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
 
-  const positive = makeTextarea(prompt.positive, (value) => {
-    prompt.positive = value;
+  const positive = makeTextarea(getPromptText(prompt, "positive", "default"), (value) => {
+    setPromptTextBox(prompt, "positive", "default", value, "Default positive");
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, render: false });
   }, { placeholder: "Positive prompt template. Wildcards stay here and expand downstream." });
 
-  const negative = makeTextarea(prompt.negative, (value) => {
-    prompt.negative = value;
+  const negative = makeTextarea(getPromptText(prompt, "negative", "default"), (value) => {
+    setPromptTextBox(prompt, "negative", "default", value, "Default negative");
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, render: false });
   }, { placeholder: "Negative prompt template. Wildcards stay here and expand downstream." });
 
-  section.append(header, labelledControl("Preset name", name), labelledControl("Positive template", positive), labelledControl("Negative template", negative));
+  const textBoxToolbar = document.createElement("div");
+  textBoxToolbar.className = "dsm-toolbar";
+  textBoxToolbar.append(
+    makeButton("Add positive box", () => {
+      const slot = normalizeTextSlot(`positive_${normalizePromptTextBoxes(prompt).filter((box) => box.role === "positive").length + 1}`);
+      setPromptTextBox(prompt, "positive", slot, "", `Positive ${slot}`);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Added positive text box ${slot}. Match this slot on a State Manager Text Box node.` });
+    }),
+    makeButton("Add negative box", () => {
+      const slot = normalizeTextSlot(`negative_${normalizePromptTextBoxes(prompt).filter((box) => box.role === "negative").length + 1}`);
+      setPromptTextBox(prompt, "negative", slot, "", `Negative ${slot}`);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Added negative text box ${slot}. Match this slot on a State Manager Text Box node.` });
+    })
+  );
+
+  const textBoxNote = document.createElement("div");
+  textBoxNote.className = "dsm-muted";
+  textBoxNote.textContent = "Additional prompt boxes are matched by Role + State slot. Use unique slots, e.g. main, detailer, refiner, upscale.";
+
+  const boxes = normalizePromptTextBoxes(prompt);
+  const savedTextBoxes = document.createElement("div");
+  savedTextBoxes.className = "dsm-stack-box";
+  for (const [index, box] of boxes.entries()) {
+    const row = document.createElement("div");
+    row.className = "dsm-prompt-box";
+    const role = makeSelect(TEXT_BOX_ROLE_CHOICES, box.role, (value) => {
+      box.role = normalizeTextRole(value, box.role);
+      prompt.text_boxes = boxes;
+      syncPromptTextMirror(prompt);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    });
+    const slot = makeInput(box.slot, (value) => {
+      const oldSlot = box.slot;
+      box.slot = normalizeTextSlot(value, oldSlot || `text_${index + 1}`);
+      prompt.text_boxes = boxes;
+      syncPromptTextMirror(prompt);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Renamed text slot ${oldSlot} -> ${box.slot}. Update the matching State Manager Text Box node too.` });
+    });
+    const label = makeInput(box.label, (value) => {
+      box.label = String(value || `${box.role} ${box.slot}`).trim() || `${box.role} ${box.slot}`;
+      prompt.text_boxes = boxes;
+      syncPromptTextMirror(prompt);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    });
+    const text = makeTextarea(box.text, (value) => {
+      box.text = value;
+      prompt.text_boxes = boxes;
+      syncPromptTextMirror(prompt);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, render: false });
+    }, { placeholder: `${box.role} text for slot ${box.slot}` });
+    row.append(
+      labelledControl("Role", role),
+      labelledControl("State slot", slot),
+      labelledControl("Label", label),
+      makeButton("Delete", () => {
+        if (boxes.length <= 1) {
+          setStatus(node, "At least one prompt text box must remain.");
+          return;
+        }
+        boxes.splice(index, 1);
+        prompt.text_boxes = boxes;
+        syncPromptTextMirror(prompt);
+        updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Deleted text box ${box.role}/${box.slot}.` });
+      }),
+      labelledControl("Text", text)
+    );
+    savedTextBoxes.appendChild(row);
+  }
+
+  section.append(
+    header,
+    labelledControl("Preset name", name),
+    labelledControl("Default positive template", positive),
+    labelledControl("Default negative template", negative),
+    textBoxToolbar,
+    textBoxNote,
+    labelledControl("Saved prompt text boxes", savedTextBoxes)
+  );
 }
 
 function renderLoraStackEditor(section, node, state, uiState, character, prompt, stack, stackIndex) {
@@ -1834,6 +2154,8 @@ function ensureStyles() {
     .dsm-grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
     .dsm-stack-box { border: 1px solid rgba(128,128,128,.28); border-radius: 7px; padding: 7px; display: flex; flex-direction: column; gap: 7px; background: rgba(0,0,0,.10); }
     .dsm-lora-row { display: grid; grid-template-columns: auto minmax(110px, 1fr) 76px 76px auto; gap: 6px; align-items: center; }
+    .dsm-prompt-box { display: grid; grid-template-columns: 94px minmax(90px, .8fr) minmax(110px, 1fr) auto; gap: 6px; align-items: end; }
+    .dsm-prompt-box .dsm-labelled:last-child { grid-column: 1 / -1; }
     .dsm-lora-summary { white-space: pre-wrap; border: 1px solid rgba(128,128,128,.35); border-radius: 6px; padding: 6px; min-height: 58px; max-height: 190px; overflow: auto; background: rgba(0,0,0,.16); }
     @media (max-width: 720px) { .dsm-main { grid-template-columns: 1fr; } }
   `;
