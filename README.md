@@ -516,12 +516,18 @@ Use it to save:
 
 ### Basic wiring
 
-1. Add **DoRA State Manager**.
-2. Add **DoRA Power LoRA Loader**.
-3. Connect `dora_state` from the manager to the loader's optional `dora_state` input.
-4. Connect `positive_prompt` / `negative_prompt` outputs to your text encode path as needed.
+1. Configure a normal **DoRA Power LoRA Loader** and prompt nodes as usual.
+2. Add **DoRA State Manager**.
+3. Select a character tile or create a new one.
+4. Use **Capture selected nodes** after selecting an existing **DoRA Power LoRA Loader** and prompt text nodes, or connect the manager inputs and use **Capture connected**.
+5. Connect `dora_state` from the manager to the loader's optional `dora_state` input.
+6. Connect `positive_prompt` / `negative_prompt` outputs to your text encode path as needed.
 
 When `dora_state` is connected, the loader uses the selected character's saved LoRA stack. If it is not connected, the loader keeps its normal local row-widget behavior.
+
+The manager has optional input ports for `positive_prompt`, `negative_prompt`, `settings_json_input`, and `lora_stack`. The loader appends a `lora_stack` output so an existing stack can be routed into the manager without manually recreating rows. Existing loader outputs keep their original indexes; `lora_stack` is appended after `analysis_report`.
+
+The UI uses a resizable DOM widget, character thumbnail tiles, and a selected-character submenu for prompts, LoRA stack capture/editing, and future settings JSON.
 
 ### Outputs
 
@@ -529,14 +535,17 @@ When `dora_state` is connected, the loader uses the selected character's saved L
 - `positive_prompt` — selected prompt preset's positive text
 - `negative_prompt` — selected prompt preset's negative text
 - `settings_json` — selected prompt preset's arbitrary settings object serialized as JSON
+- `selected_lora_stack` — selected character's LoRA stack as a typed `DORA_LORA_STACK` payload
 
 ### Persistence and payload behavior
 
 The manager state is stored in the workflow through hidden backend widgets:
 
 - `state_json`
+- `ui_state_json`
 - `selected_character_id`
 - `selected_prompt_id`
+- `use_runtime_inputs`
 
 No external preset database is required for this first version.
 
