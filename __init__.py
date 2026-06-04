@@ -1,4 +1,4 @@
-from .nodes import DoraPowerLoraLoader, DoraStateManager
+from .nodes import DoraPowerLoraLoader, DoraStateManager, StateManager, StateManagerSeed, StateManagerTextBox
 
 # Backend API for frontend LoRA dropdown (avoids relying on /object_info variants).
 import folder_paths
@@ -17,10 +17,17 @@ WEB_DIRECTORY = "./web"
 
 NODE_CLASS_MAPPINGS = {
     "DoRA Power LoRA Loader": DoraPowerLoraLoader,
+    "State Manager": StateManager,
+    "State Manager Text Box": StateManagerTextBox,
+    "State Manager Seed": StateManagerSeed,
+    # Backward-compatible alias for workflows made with the earlier patch.
     "DoRA State Manager": DoraStateManager,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DoRA Power LoRA Loader": "DoRA Power LoRA Loader",
-    "DoRA State Manager": "DoRA State Manager",
+    "State Manager": "State Manager",
+    "State Manager Text Box": "State Text Box",
+    "State Manager Seed": "State Seed",
+    "DoRA State Manager": "State Manager (legacy)",
 }

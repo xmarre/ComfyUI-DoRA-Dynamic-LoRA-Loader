@@ -17,6 +17,38 @@ Auto-strength support in this loader was inspired by [Comfyui-flux2klein-Lora-lo
 
 This implementation was reworked for the unified DoRA + standard LoRA path in this loader, including Flux.2 Klein and ZiT/Lumina2 compatibility handling.
 
+
+---
+
+## State Manager
+
+This package also includes a **State Manager** for character/preset workflows.
+
+The manager is designed as a save/load/apply controller, not as a permanent prompt or seed runtime source. The safe connected workflow is:
+
+```text
+State Manager.state_control -> State Text Box.state_control
+State Manager.state_control -> State Seed.state_control
+State Manager.state_control -> DoRA Power LoRA Loader.state_control
+
+State Text Box.text -> wildcard processor / CLIP Text Encode
+State Seed.seed -> sampler seed input
+DoRA Power LoRA Loader -> model/clip path
+```
+
+Use the manager buttons to mutate graph nodes explicitly:
+
+- **Save connected** captures the connected State Text Box, State Seed, DoRA loader, and supported settings nodes into the selected character/preset.
+- **Load connected** applies the selected character/preset back into those connected editable nodes.
+- **Save selected** captures currently selected nodes.
+- **Apply selected** applies the selected character/preset to currently selected nodes.
+
+The prompt templates live in editable **State Text Box** nodes. The seed lives in an editable **State Seed** node. Connecting `state_control` only identifies those nodes for save/load; it does not replace their editable values during execution.
+
+For wildcard workflows, save the unexpanded template in the State Text Box and put the wildcard processor downstream. Do not feed the processed wildcard text back into the State Manager.
+
+rgthree and other seed nodes are supported through **Save selected / Apply selected** and through generic widget snapshots where their seed widgets are available. For connected save/load without runtime replacement, use **State Seed**.
+
 ---
 
 ## Auto-strength
