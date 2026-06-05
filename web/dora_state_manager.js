@@ -48,8 +48,11 @@ const STATE_SEED_INCREMENT = -2;
 const STATE_SEED_DECREMENT = -3;
 const STATE_SEED_SPECIALS = [STATE_SEED_RANDOM, STATE_SEED_INCREMENT, STATE_SEED_DECREMENT];
 const LAST_SEED_BUTTON_LABEL = "♻️ (Use Last Queued Seed)";
-const BACKUP_STORAGE_PREFIX = "comfyui_dora_state_manager_backup_v1";
+const BACKUP_STORAGE_PREFIX = "comfyui_dora_state_manager_backup_v2";
+const LEGACY_BACKUP_STORAGE_PREFIX = "comfyui_dora_state_manager_backup_v1";
 const BACKUP_WORKFLOW_ID_EXTRA_KEY = "dora_state_manager_backup_workflow_id";
+const BACKUP_NODE_UID_PROPERTY = "dora_state_manager_backup_node_uid";
+const BACKUP_INDEX_STORAGE_SUFFIX = "workflow_index";
 const BACKUP_EXPORT_KIND = "dora_state_manager_export";
 
 
@@ -567,9 +570,50 @@ function nodeBackupId(node) {
   return String(id).trim() || "unknown_node";
 }
 
-function stateBackupKey(node, { createWorkflowId = true } = {}) {
+function nodeBackupUid(node, { create = true } = {}) {
+  const props = node?.properties || {};
+  const nested = props.dora_state_manager && typeof props.dora_state_manager === "object" ? props.dora_state_manager : {};
+  const existing = String(props[BACKUP_NODE_UID_PROPERTY] ?? nested.backup_node_uid ?? "").trim();
+  if (existing) return existing;
+  if (!create || !node) return "";
+  node.properties = node.properties || {};
+  const uid = makeId("state_manager_node");
+  node.properties[BACKUP_NODE_UID_PROPERTY] = uid;
+  return uid;
+}
+
+function stateBackupNodeKey(node, { createNodeUid = true } = {}) {
+  return nodeBackupUid(node, { create: createNodeUid }) || `node_id_${nodeBackupId(node)}`;
+}
+
+function stateBackupStorageKey(prefix, workflowId, nodeKey) {
+  return `${prefix}:${workflowId || "unknown_workflow"}:node:${nodeKey || "unknown_node"}`;
+}
+
+function stateBackupKey(node, { createWorkflowId = true, createNodeUid = true } = {}) {
   const workflowId = workflowBackupId(node, { create: createWorkflowId }) || "unknown_workflow";
-  return `${BACKUP_STORAGE_PREFIX}:${workflowId}:node:${nodeBackupId(node)}`;
+  return stateBackupStorageKey(BACKUP_STORAGE_PREFIX, workflowId, stateBackupNodeKey(node, { createNodeUid }));
+}
+
+function legacyStateBackupKey(node, { createWorkflowId = false } = {}) {
+  const workflowId = workflowBackupId(node, { create: createWorkflowId }) || "unknown_workflow";
+  return stateBackupStorageKey(LEGACY_BACKUP_STORAGE_PREFIX, workflowId, `node_id_${nodeBackupId(node)}`);
+}
+
+function stateBackupIndexKey(workflowId, prefix = BACKUP_STORAGE_PREFIX) {
+  return `${prefix}:${workflowId || "unknown_workflow"}:${BACKUP_INDEX_STORAGE_SUFFIX}`;
+}
+
+function nodeBackupSignature(node) {
+  const pos = Array.isArray(node?.pos) ? node.pos : [];
+  const size = Array.isArray(node?.size) ? node.size : [];
+  return {
+    type: String(node?.type ?? node?.constructor?.type ?? "").trim(),
+    title: String(node?.title ?? "").trim(),
+    comfyClass: String(node?.comfyClass ?? node?.constructor?.comfyClass ?? "").trim(),
+    pos: [Number(pos[0]) || 0, Number(pos[1]) || 0],
+    size: [Number(size[0]) || 0, Number(size[1]) || 0],
+  };
 }
 
 function backupStateSummary(state) {
@@ -580,7 +624,7 @@ function backupStateSummary(state) {
   return { characterCount, promptCount, loaderCount };
 }
 
-function normalizeBackupRecord(raw) {
+function normalizeBackupRecord(raw, storageKey = "") {
   const parsed = safeJsonParse(raw, null);
   if (!parsed || typeof parsed !== "object") return null;
   const stateRaw = parsed.state ?? parsed.state_json ?? parsed.stateJson;
@@ -589,39 +633,218 @@ function normalizeBackupRecord(raw) {
   const uiState = normalizeUiState(parsed.ui_state ?? parsed.uiState ?? parsed.ui_state_json ?? parsed.uiStateJson ?? defaultUiState());
   const characterId = String(parsed.selected_character_id ?? parsed.selectedCharacterId ?? "").trim();
   const promptId = String(parsed.selected_prompt_id ?? parsed.selectedPromptId ?? "").trim();
+  const nodeMeta = parsed.node && typeof parsed.node === "object" ? parsed.node : {};
   return {
-    version: 1,
+    version: 2,
     kind: "dora_state_manager_backup",
+    storageKey,
     workflowId: String(parsed.workflow_id ?? parsed.workflowId ?? "").trim(),
     nodeId: String(parsed.node_id ?? parsed.nodeId ?? "").trim(),
+    nodeKey: String(parsed.node_key ?? parsed.nodeKey ?? "").trim(),
+    backupNodeUid: String(parsed.backup_node_uid ?? parsed.backupNodeUid ?? parsed.node_uid ?? parsed.nodeUid ?? "").trim(),
     updatedAt: String(parsed.updated_at ?? parsed.updatedAt ?? "").trim(),
     state,
     uiState,
     selectedCharacterId: characterId,
     selectedPromptId: promptId,
+    node: {
+      type: String(nodeMeta.type ?? "").trim(),
+      title: String(nodeMeta.title ?? "").trim(),
+      comfyClass: String(nodeMeta.comfyClass ?? nodeMeta.comfy_class ?? "").trim(),
+      pos: Array.isArray(nodeMeta.pos) ? [Number(nodeMeta.pos[0]) || 0, Number(nodeMeta.pos[1]) || 0] : [0, 0],
+      size: Array.isArray(nodeMeta.size) ? [Number(nodeMeta.size[0]) || 0, Number(nodeMeta.size[1]) || 0] : [0, 0],
+    },
   };
 }
 
-function readStateBackup(node) {
+function readStorageJson(key, fallback) {
   try {
-    const raw = globalThis.localStorage?.getItem(stateBackupKey(node, { createWorkflowId: false }));
-    return normalizeBackupRecord(raw);
+    const raw = globalThis.localStorage?.getItem(key);
+    if (raw == null) return structuredCloneCompat(fallback);
+    return safeJsonParse(raw, fallback);
+  } catch (err) {
+    console.warn(`[${EXT_NAME}] failed to read localStorage key ${key}`, err);
+    return structuredCloneCompat(fallback);
+  }
+}
+
+function writeStorageJson(key, value) {
+  try {
+    globalThis.localStorage?.setItem(key, JSON.stringify(value));
+    return true;
+  } catch (err) {
+    console.warn(`[${EXT_NAME}] failed to write localStorage key ${key}`, err);
+    return false;
+  }
+}
+
+function readBackupRecordAtKey(key) {
+  try {
+    const raw = globalThis.localStorage?.getItem(key);
+    return normalizeBackupRecord(raw, key);
   } catch (err) {
     console.warn(`[${EXT_NAME}] failed to read State Manager browser backup`, err);
     return null;
   }
 }
 
+function readStateBackup(node) {
+  const keys = [
+    stateBackupKey(node, { createWorkflowId: false, createNodeUid: false }),
+    legacyStateBackupKey(node, { createWorkflowId: false }),
+  ];
+  for (const key of keys) {
+    const backup = readBackupRecordAtKey(key);
+    if (backup) return backup;
+  }
+  return null;
+}
+
+function backupIndexEntry(record, key) {
+  return {
+    key,
+    workflow_id: record.workflow_id,
+    node_id: record.node_id,
+    node_key: record.node_key,
+    backup_node_uid: record.backup_node_uid,
+    updated_at: record.updated_at,
+    summary: record.summary,
+    node: record.node,
+  };
+}
+
+function updateBackupIndex(record, key) {
+  const workflowId = String(record.workflow_id || "").trim();
+  if (!workflowId) return;
+  const indexKey = stateBackupIndexKey(workflowId);
+  const index = readStorageJson(indexKey, []);
+  const entries = Array.isArray(index) ? index.filter((entry) => entry && entry.key !== key) : [];
+  entries.unshift(backupIndexEntry(record, key));
+  writeStorageJson(indexKey, entries.slice(0, 100));
+}
+
+function scanBackupKeysForWorkflow(workflowId) {
+  const out = new Set();
+  const prefixes = [
+    `${BACKUP_STORAGE_PREFIX}:${workflowId}:node:`,
+    `${LEGACY_BACKUP_STORAGE_PREFIX}:${workflowId}:node:`,
+  ];
+  try {
+    const storage = globalThis.localStorage;
+    if (!storage) return [];
+    for (let i = 0; i < storage.length; i++) {
+      const key = storage.key(i);
+      if (prefixes.some((prefix) => String(key || "").startsWith(prefix))) out.add(key);
+    }
+  } catch (err) {
+    console.warn(`[${EXT_NAME}] failed to scan State Manager browser backups`, err);
+  }
+  return [...out];
+}
+
+function readWorkflowBackupCandidates(node) {
+  const workflowId = workflowBackupId(node, { create: false });
+  if (!workflowId) return [];
+  const keys = new Set();
+  const index = readStorageJson(stateBackupIndexKey(workflowId), []);
+  if (Array.isArray(index)) {
+    for (const entry of index) {
+      if (entry?.key) keys.add(String(entry.key));
+    }
+  }
+  for (const key of scanBackupKeysForWorkflow(workflowId)) keys.add(key);
+  const records = [];
+  for (const key of keys) {
+    const record = readBackupRecordAtKey(key);
+    if (record && !isDefaultStateValue(record.state)) records.push(record);
+  }
+  records.sort((a, b) => Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0));
+  return records;
+}
+
+function backupDistanceScore(nodeSignature, backupSignature) {
+  const a = Array.isArray(nodeSignature?.pos) ? nodeSignature.pos : [0, 0];
+  const b = Array.isArray(backupSignature?.pos) ? backupSignature.pos : [0, 0];
+  const dx = (Number(a[0]) || 0) - (Number(b[0]) || 0);
+  const dy = (Number(a[1]) || 0) - (Number(b[1]) || 0);
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function scoreBackupForNode(node, record) {
+  const currentUid = nodeBackupUid(node, { create: false });
+  const currentId = nodeBackupId(node);
+  const current = nodeBackupSignature(node);
+  const backup = record?.node || {};
+  let score = 0;
+  let exact = false;
+
+  if (currentUid && record.backupNodeUid && currentUid === record.backupNodeUid) {
+    score += 10000;
+    exact = true;
+  }
+  if (currentId && record.nodeId && currentId === record.nodeId) {
+    score += 5000;
+    exact = true;
+  }
+
+  const sameTitle = current.title && backup.title && current.title === backup.title;
+  const sameType = current.type && backup.type && current.type === backup.type;
+  const sameClass = current.comfyClass && backup.comfyClass && current.comfyClass === backup.comfyClass;
+  const distance = backupDistanceScore(current, backup);
+
+  if (sameTitle) score += 80;
+  if (sameType) score += 40;
+  if (sameClass) score += 40;
+  if (Number.isFinite(distance)) {
+    if (distance <= 4) score += 160;
+    else if (distance <= 32) score += 120;
+    else if (distance <= 96) score += 60;
+  }
+
+  return { score, exact, sameTitle, sameType, sameClass, distance };
+}
+
+function findBestStateBackup(node) {
+  const exact = readStateBackup(node);
+  if (exact && !isDefaultStateValue(exact.state)) return { record: exact, reason: "exact", ambiguous: false };
+
+  const candidates = readWorkflowBackupCandidates(node);
+  if (!candidates.length) return { record: null, reason: "none", ambiguous: false };
+
+  const scored = candidates
+    .map((record) => ({ record, match: scoreBackupForNode(node, record) }))
+    .sort((a, b) => b.match.score - a.match.score || Date.parse(b.record.updatedAt || 0) - Date.parse(a.record.updatedAt || 0));
+
+  const best = scored[0];
+  const second = scored[1];
+  if (best.match.exact) return { record: best.record, reason: "stable-node-id", ambiguous: false };
+
+  const strongPositionalMatch = best.match.score >= 180 && (best.match.sameTitle || best.match.sameType || best.match.sameClass) && best.match.distance <= 96;
+  if (strongPositionalMatch && (!second || best.match.score - second.match.score >= 40)) {
+    return { record: best.record, reason: "position-title", ambiguous: false };
+  }
+
+  if (candidates.length === 1) return { record: best.record, reason: "only-workflow-backup", ambiguous: false };
+
+  return { record: null, reason: "ambiguous", ambiguous: true, candidates: scored };
+}
+
 function makeBackupRecord(node, state, uiState, widgets = getWidgets(node)) {
   const normalizedState = normalizeState(state);
   const normalizedUiState = normalizeUiState(uiState || defaultUiState());
+  const workflowId = workflowBackupId(node, { create: true });
+  const backupUid = nodeBackupUid(node, { create: true });
+  const nodeKey = stateBackupNodeKey(node, { createNodeUid: true });
   return {
-    version: 1,
+    version: 2,
     kind: "dora_state_manager_backup",
-    workflow_id: workflowBackupId(node, { create: true }),
+    workflow_id: workflowId,
     node_id: nodeBackupId(node),
+    node_key: nodeKey,
+    backup_node_uid: backupUid,
     updated_at: new Date().toISOString(),
     summary: backupStateSummary(normalizedState),
+    node: nodeBackupSignature(node),
     state: normalizedState,
     ui_state: normalizedUiState,
     selected_character_id: String(widgetValue(widgets.characterWidget, "") || ""),
@@ -633,10 +856,11 @@ function writeStateBackup(node, state, uiState, widgets = getWidgets(node)) {
   if (!node) return;
   try {
     const normalizedState = normalizeState(state);
-    const existing = readStateBackup(node);
-    if (isDefaultStateValue(normalizedState) && existing && !isDefaultStateValue(existing.state)) return;
+    if (isDefaultStateValue(normalizedState)) return;
     const record = makeBackupRecord(node, normalizedState, uiState, widgets);
-    globalThis.localStorage?.setItem(stateBackupKey(node, { createWorkflowId: true }), JSON.stringify(record));
+    const key = stateBackupKey(node, { createWorkflowId: true, createNodeUid: true });
+    globalThis.localStorage?.setItem(key, JSON.stringify(record));
+    updateBackupIndex(record, key);
   } catch (err) {
     console.warn(`[${EXT_NAME}] failed to write State Manager browser backup`, err);
   }
@@ -649,31 +873,50 @@ function selectionIdsForState(state, characterId = "", promptId = "") {
   return { characterId: character?.id || "", promptId: prompt?.id || "" };
 }
 
-function backupRestoredStatus(record) {
+function backupRestoredStatus(record, reason = "") {
   const summary = record?.state ? backupStateSummary(record.state) : null;
   const suffix = summary ? ` (${summary.characterCount} character${summary.characterCount === 1 ? "" : "s"}, ${summary.promptCount} prompt${summary.promptCount === 1 ? "" : "s"}).` : ".";
-  return `Warning: this node loaded with default/empty state while a browser backup existed. Restored backup${suffix} Save the workflow to persist the recovered state.`;
+  const source = reason && reason !== "exact" ? ` Matched backup by ${reason}.` : "";
+  return `Warning: this node loaded with default/empty state while a browser backup existed. Restored backup${suffix}${source} Save the workflow to persist the recovered state.`;
+}
+
+function backupAmbiguousStatus(match) {
+  const count = match?.candidates?.length || 0;
+  return `Warning: this node loaded with default/empty state and ${count} browser backups exist for this workflow, but none matched this recreated node safely. Use Import State JSON or move/rename the node to match the original location before retrying.`;
 }
 
 function tryRestoreStateBackup(node, { force = false } = {}) {
   const widgets = getWidgets(node);
   const rawState = widgetValue(widgets.stateWidget, "");
   if (!force && !isStateJsonDefaultOrEmpty(rawState)) return false;
-  const backup = readStateBackup(node);
-  if (!backup || isDefaultStateValue(backup.state)) return false;
+  const match = findBestStateBackup(node);
+  const backup = match.record;
+  if (!backup || isDefaultStateValue(backup.state)) {
+    if (match.ambiguous) {
+      const status = backupAmbiguousStatus(match);
+      setWidgetValue(widgets.uiStateWidget, serializeUiState({ ...normalizeUiState(widgetValue(widgets.uiStateWidget, "")), status }));
+      node.__dsmBackupWarning = status;
+      markNodeDirty(node);
+    }
+    return false;
+  }
   const selection = selectionIdsForState(backup.state, backup.selectedCharacterId, backup.selectedPromptId);
+  const status = backupRestoredStatus(backup, match.reason);
   setWidgetValue(widgets.stateWidget, serializeState(backup.state));
-  setWidgetValue(widgets.uiStateWidget, serializeUiState({ ...backup.uiState, status: backupRestoredStatus(backup) }));
+  setWidgetValue(widgets.uiStateWidget, serializeUiState({ ...backup.uiState, status }));
   setWidgetValue(widgets.characterWidget, selection.characterId);
   setWidgetValue(widgets.promptWidget, selection.promptId);
   node.properties = node.properties || {};
+  if (backup.backupNodeUid) node.properties[BACKUP_NODE_UID_PROPERTY] = backup.backupNodeUid;
   node.properties.dora_state_manager = {
     state: normalizeState(backup.state),
     selected_character_id: selection.characterId,
     selected_prompt_id: selection.promptId,
+    backup_node_uid: nodeBackupUid(node, { create: true }),
   };
-  node.__dsmBackupWarning = backupRestoredStatus(backup);
-  cacheRenderableState(node, backup.state, { ...backup.uiState, status: backupRestoredStatus(backup) });
+  node.__dsmBackupWarning = status;
+  cacheRenderableState(node, backup.state, { ...backup.uiState, status });
+  writeStateBackup(node, backup.state, { ...backup.uiState, status }, widgets);
   markNodeDirty(node);
   return true;
 }
@@ -683,11 +926,14 @@ function buildStateExportPayload(node, state, uiState, characterId, promptId) {
   const normalizedUiState = normalizeUiState(uiState || defaultUiState());
   const selection = selectionIdsForState(normalizedState, characterId, promptId);
   return {
-    version: 1,
+    version: 2,
     kind: BACKUP_EXPORT_KIND,
     exported_at: new Date().toISOString(),
     workflow_id: workflowBackupId(node, { create: true }),
     node_id: nodeBackupId(node),
+    node_key: stateBackupNodeKey(node, { createNodeUid: true }),
+    backup_node_uid: nodeBackupUid(node, { create: true }),
+    node: nodeBackupSignature(node),
     state: normalizedState,
     ui_state: normalizedUiState,
     selected_character_id: selection.characterId,
@@ -847,10 +1093,13 @@ function updateState(node, state, uiState, opts = {}) {
   setWidgetValue(widgets.characterWidget, opts.characterId ?? character.id);
   setWidgetValue(widgets.promptWidget, opts.promptId ?? prompt.id);
   node.properties = node.properties || {};
+  const backupUid = nodeBackupUid(node, { create: !isDefaultStateValue(normalizedState) });
+  if (backupUid) node.properties[BACKUP_NODE_UID_PROPERTY] = backupUid;
   node.properties.dora_state_manager = {
     state: normalizedState,
     selected_character_id: widgetValue(widgets.characterWidget, ""),
     selected_prompt_id: widgetValue(widgets.promptWidget, ""),
+    backup_node_uid: backupUid,
   };
   const cachedUiState = normalizeUiState(widgetValue(widgets.uiStateWidget, ""));
   cacheRenderableState(node, normalizedState, cachedUiState);
