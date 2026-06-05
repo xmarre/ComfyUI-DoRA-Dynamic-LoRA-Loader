@@ -54,6 +54,7 @@ const BACKUP_WORKFLOW_ID_EXTRA_KEY = "dora_state_manager_backup_workflow_id";
 const BACKUP_NODE_UID_PROPERTY = "dora_state_manager_backup_node_uid";
 const BACKUP_INDEX_STORAGE_SUFFIX = "workflow_index";
 const BACKUP_EXPORT_KIND = "dora_state_manager_export";
+const BACKUP_RESTORE_STATUS_PREFIX = "Warning: this node loaded with default/empty state";
 
 
 function structuredCloneCompat(value) {
@@ -273,6 +274,28 @@ function defaultState() {
 
 function defaultUiState() {
   return { version: 1, panel: "prompts", status: "" };
+}
+
+function isBackupRestoreStatus(value) {
+  return String(value ?? "").trim().startsWith(BACKUP_RESTORE_STATUS_PREFIX);
+}
+
+function stripBackupRestoreStatus(uiState) {
+  const normalized = normalizeUiState(uiState || defaultUiState());
+  return isBackupRestoreStatus(normalized.status) ? { ...normalized, status: "" } : normalized;
+}
+
+function setBackupWarning(node, text) {
+  if (!node) return;
+  const warning = String(text ?? "").trim();
+  if (warning) node.__dsmBackupWarning = warning;
+  else delete node.__dsmBackupWarning;
+}
+
+function clearBackupWarning(node) {
+  if (!node?.__dsmBackupWarning) return false;
+  delete node.__dsmBackupWarning;
+  return true;
 }
 
 function normalizeNumber(value, fallback = 1.0) {
@@ -528,7 +551,7 @@ function serializeState(state) {
 }
 
 function serializeUiState(uiState) {
-  return JSON.stringify(normalizeUiState(uiState), null, 0);
+  return JSON.stringify(stripBackupRestoreStatus(uiState), null, 0);
 }
 
 function canonicalJson(value) {
@@ -630,7 +653,7 @@ function normalizeBackupRecord(raw, storageKey = "") {
   const stateRaw = parsed.state ?? parsed.state_json ?? parsed.stateJson;
   if (stateRaw == null) return null;
   const state = normalizeState(stateRaw);
-  const uiState = normalizeUiState(parsed.ui_state ?? parsed.uiState ?? parsed.ui_state_json ?? parsed.uiStateJson ?? defaultUiState());
+  const uiState = stripBackupRestoreStatus(parsed.ui_state ?? parsed.uiState ?? parsed.ui_state_json ?? parsed.uiStateJson ?? defaultUiState());
   const characterId = String(parsed.selected_character_id ?? parsed.selectedCharacterId ?? "").trim();
   const promptId = String(parsed.selected_prompt_id ?? parsed.selectedPromptId ?? "").trim();
   const nodeMeta = parsed.node && typeof parsed.node === "object" ? parsed.node : {};
@@ -831,7 +854,7 @@ function findBestStateBackup(node) {
 
 function makeBackupRecord(node, state, uiState, widgets = getWidgets(node)) {
   const normalizedState = normalizeState(state);
-  const normalizedUiState = normalizeUiState(uiState || defaultUiState());
+  const normalizedUiState = stripBackupRestoreStatus(uiState || defaultUiState());
   const workflowId = workflowBackupId(node, { create: true });
   const backupUid = nodeBackupUid(node, { create: true });
   const nodeKey = stateBackupNodeKey(node, { createNodeUid: true });
@@ -888,22 +911,25 @@ function backupAmbiguousStatus(match) {
 function tryRestoreStateBackup(node, { force = false } = {}) {
   const widgets = getWidgets(node);
   const rawState = widgetValue(widgets.stateWidget, "");
-  if (!force && !isStateJsonDefaultOrEmpty(rawState)) return false;
+  const result = { restored: false, preserveBackupWarning: false };
+  if (!force && !isStateJsonDefaultOrEmpty(rawState)) return result;
   const match = findBestStateBackup(node);
   const backup = match.record;
   if (!backup || isDefaultStateValue(backup.state)) {
     if (match.ambiguous) {
       const status = backupAmbiguousStatus(match);
-      setWidgetValue(widgets.uiStateWidget, serializeUiState({ ...normalizeUiState(widgetValue(widgets.uiStateWidget, "")), status }));
-      node.__dsmBackupWarning = status;
+      setWidgetValue(widgets.uiStateWidget, serializeUiState(stripBackupRestoreStatus(widgetValue(widgets.uiStateWidget, ""))));
+      setBackupWarning(node, status);
       markNodeDirty(node);
+      return { restored: false, preserveBackupWarning: true };
     }
-    return false;
+    return result;
   }
   const selection = selectionIdsForState(backup.state, backup.selectedCharacterId, backup.selectedPromptId);
   const status = backupRestoredStatus(backup, match.reason);
+  const restoredUiState = stripBackupRestoreStatus(backup.uiState);
   setWidgetValue(widgets.stateWidget, serializeState(backup.state));
-  setWidgetValue(widgets.uiStateWidget, serializeUiState({ ...backup.uiState, status }));
+  setWidgetValue(widgets.uiStateWidget, serializeUiState(restoredUiState));
   setWidgetValue(widgets.characterWidget, selection.characterId);
   setWidgetValue(widgets.promptWidget, selection.promptId);
   node.properties = node.properties || {};
@@ -914,16 +940,16 @@ function tryRestoreStateBackup(node, { force = false } = {}) {
     selected_prompt_id: selection.promptId,
     backup_node_uid: nodeBackupUid(node, { create: true }),
   };
-  node.__dsmBackupWarning = status;
-  cacheRenderableState(node, backup.state, { ...backup.uiState, status });
-  writeStateBackup(node, backup.state, { ...backup.uiState, status }, widgets);
+  setBackupWarning(node, status);
+  cacheRenderableState(node, backup.state, restoredUiState);
+  writeStateBackup(node, backup.state, restoredUiState, widgets);
   markNodeDirty(node);
-  return true;
+  return { restored: true, preserveBackupWarning: true };
 }
 
 function buildStateExportPayload(node, state, uiState, characterId, promptId) {
   const normalizedState = normalizeState(state);
-  const normalizedUiState = normalizeUiState(uiState || defaultUiState());
+  const normalizedUiState = stripBackupRestoreStatus(uiState || defaultUiState());
   const selection = selectionIdsForState(normalizedState, characterId, promptId);
   return {
     version: 2,
@@ -969,7 +995,7 @@ function parseImportedStateJson(text) {
   if (stateRaw == null) throw new Error("JSON does not contain a State Manager state.");
   const state = normalizeState(stateRaw);
   if (isDefaultStateValue(state) && !isDefaultStateValue(stateRaw)) throw new Error("Imported state normalized to the default state.");
-  const uiState = normalizeUiState(parsed.ui_state ?? parsed.uiState ?? parsed.ui_state_json ?? parsed.uiStateJson ?? defaultUiState());
+  const uiState = stripBackupRestoreStatus(parsed.ui_state ?? parsed.uiState ?? parsed.ui_state_json ?? parsed.uiStateJson ?? defaultUiState());
   const selection = selectionIdsForState(
     state,
     String(parsed.selected_character_id ?? parsed.selectedCharacterId ?? ""),
@@ -1086,7 +1112,8 @@ function markDownstreamDirty(node) {
 function updateState(node, state, uiState, opts = {}) {
   const widgets = getWidgets(node);
   const normalizedState = normalizeState(state);
-  const normalizedUiState = normalizeUiState(uiState || defaultUiState());
+  const normalizedUiState = stripBackupRestoreStatus(uiState || defaultUiState());
+  const warningCleared = opts.preserveBackupWarning ? false : clearBackupWarning(node);
   const { character, prompt } = ensureSelection(node, normalizedState);
   setWidgetValue(widgets.stateWidget, serializeState(normalizedState));
   setWidgetValue(widgets.uiStateWidget, serializeUiState({ ...normalizedUiState, status: opts.status ?? normalizedUiState.status }));
@@ -1105,7 +1132,7 @@ function updateState(node, state, uiState, opts = {}) {
   cacheRenderableState(node, normalizedState, cachedUiState);
   writeStateBackup(node, normalizedState, cachedUiState, widgets);
   if (opts.dirty !== false) markNodeDirty(node);
-  if (opts.render !== false) scheduleRender(node);
+  if (opts.render !== false || warningCleared) scheduleRender(node);
 }
 
 function cacheRenderableState(node, state, uiState) {
@@ -2203,7 +2230,13 @@ function renderHeader(node, state, uiState, character, prompt) {
   if (node.__dsmBackupWarning) {
     const warning = document.createElement("div");
     warning.className = "dsm-warning";
-    warning.textContent = node.__dsmBackupWarning;
+    const warningText = document.createElement("span");
+    warningText.textContent = node.__dsmBackupWarning;
+    const dismissButton = makeButton("Dismiss", () => {
+      clearBackupWarning(node);
+      scheduleRender(node);
+    });
+    warning.append(warningText, dismissButton);
     section.appendChild(warning);
   }
   section.append(grid, controls);
@@ -2780,7 +2813,8 @@ function ensureStyles() {
     .dsm-title { flex: 1 1 auto; font-size: 13px; }
     .dsm-muted { opacity: .68; white-space: pre-wrap; }
     .dsm-status { border-top: 1px solid rgba(128,128,128,.25); padding-top: 6px; opacity: .78; }
-    .dsm-warning { border: 1px solid rgba(255, 190, 90, .7); border-radius: 6px; padding: 6px; background: rgba(255, 170, 0, .12); color: var(--input-text, #f2e6cc); }
+    .dsm-warning { border: 1px solid rgba(255, 190, 90, .7); border-radius: 6px; padding: 6px; background: rgba(255, 170, 0, .12); color: var(--input-text, #f2e6cc); display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; }
+    .dsm-warning span { min-width: 0; }
     .dsm-flex { flex: 1 1 auto; min-width: 0; }
     .dsm-root input, .dsm-root select, .dsm-root textarea, .dsm-root button {
       font: inherit;
@@ -2830,16 +2864,16 @@ function initializeNode(node, widget) {
   node.min_size = [MIN_NODE_WIDTH, MIN_NODE_HEIGHT];
   node.setSize?.([Math.max(oldSize[0], MIN_NODE_WIDTH), Math.max(oldSize[1], MIN_NODE_HEIGHT)]);
 
-  tryRestoreStateBackup(node);
+  const restoreResult = tryRestoreStateBackup(node);
   const snapshot = getCurrentState(node);
   const { character, prompt } = ensureSelection(node, snapshot.state);
-  updateState(node, snapshot.state, snapshot.uiState, { characterId: character.id, promptId: prompt.id, dirty: false, render: false });
+  updateState(node, snapshot.state, snapshot.uiState, { characterId: character.id, promptId: prompt.id, dirty: false, render: false, preserveBackupWarning: restoreResult.preserveBackupWarning });
 
   chainNodeCallback(node, "onConfigure", function () {
-    tryRestoreStateBackup(node);
+    const restoreOnConfigureResult = tryRestoreStateBackup(node);
     const next = getCurrentState(node);
     const selection = ensureSelection(node, next.state);
-    updateState(node, next.state, next.uiState, { characterId: selection.character.id, promptId: selection.prompt.id, dirty: false, render: false });
+    updateState(node, next.state, next.uiState, { characterId: selection.character.id, promptId: selection.prompt.id, dirty: false, render: false, preserveBackupWarning: restoreOnConfigureResult.preserveBackupWarning });
     scheduleRender(node);
   });
 
