@@ -1119,6 +1119,64 @@ def _build_state_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _queued_runtime_state_from_ui_state(ui_state_json: Any) -> Optional[Dict[str, Any]]:
+    parsed = _safe_json_load(ui_state_json, {})
+    if not isinstance(parsed, dict):
+        return None
+    raw = parsed.get("__dsm_queued_runtime_state")
+    return _normalize_runtime_dora_state_payload(raw)
+
+
+def _settings_with_runtime_seed(settings: Any, seed: int) -> Dict[str, Any]:
+    normalized = dict(_normalize_manager_settings(settings))
+    normalized["seed"] = seed
+    rgthree_seed = normalized.get("rgthree_seed")
+    if isinstance(rgthree_seed, dict):
+        rgthree_seed = dict(rgthree_seed)
+        rgthree_seed["seed"] = seed
+        widgets = rgthree_seed.get("widgets")
+        if isinstance(widgets, dict):
+            widgets = dict(widgets)
+            for key in ("seed", "noise_seed", "value"):
+                if key in widgets:
+                    widgets[key] = seed
+            rgthree_seed["widgets"] = widgets
+        normalized["rgthree_seed"] = rgthree_seed
+    nodes = normalized.get("nodes")
+    if isinstance(nodes, list):
+        updated_nodes = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                updated_nodes.append(node)
+                continue
+            updated_node = dict(node)
+            widgets = updated_node.get("widgets")
+            if isinstance(widgets, dict):
+                widgets = dict(widgets)
+                for key in ("seed", "noise_seed", "value"):
+                    if key in widgets:
+                        widgets[key] = seed
+                updated_node["widgets"] = widgets
+            if updated_node.get("is_seed_node") or updated_node.get("seed") is not None or updated_node.get("seed_widgets"):
+                updated_node["seed"] = seed
+                seed_widgets = updated_node.get("seed_widgets")
+                if isinstance(seed_widgets, dict):
+                    updated_node["seed_widgets"] = {key: seed for key in seed_widgets}
+            updated_nodes.append(updated_node)
+        normalized["nodes"] = updated_nodes
+    return normalized
+
+
+def _resolve_state_manager_runtime_seed(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _normalize_runtime_dora_state_payload(payload) or dict(payload)
+    settings = _normalize_settings_with_canonical_seed(normalized.get("settings", {}))
+    seed = _extract_seed_from_settings(settings)
+    if seed in _STATE_SEED_SPECIALS:
+        settings = _settings_with_runtime_seed(settings, _state_manager_new_random_seed())
+    normalized["settings"] = settings
+    return normalized
+
+
 def _build_state_control_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Preferred State Manager edge. It remains usable as an editor relationship for
     # Save/Load connected, and it now also carries the resolved selected state at
@@ -4228,6 +4286,13 @@ class StateManager:
             "selected_character_id": selected_character_id,
             "selected_prompt_id": selected_prompt_id,
         }
+        resolved = _queued_runtime_state_from_ui_state(ui_state_json) or _resolve_dora_state_payload(
+            state_json,
+            selected_character_id,
+            selected_prompt_id,
+        )
+        if _extract_seed_from_settings(resolved.get("settings", {})) in _STATE_SEED_SPECIALS:
+            payload["runtime_seed_nonce"] = _state_manager_new_random_seed()
         return json.dumps(payload, sort_keys=True, default=str)
 
     @classmethod
@@ -4255,12 +4320,28 @@ class StateManager:
         selected_character_id: Any = "",
         selected_prompt_id: Any = "",
     ):
-        del ui_state_json
-        payload = _resolve_dora_state_payload(
-            state_json,
-            selected_character_id,
-            selected_prompt_id,
-        )
+        runtime_payload = _queued_runtime_state_from_ui_state(ui_state_json)
+        if runtime_payload is not None:
+            payload = _resolve_state_manager_runtime_seed(runtime_payload)
+            state = _normalize_state_manager_state(state_json)
+            character = _pick_state_manager_character(
+                state,
+                (payload.get("character") or {}).get("id", selected_character_id) if isinstance(payload.get("character"), dict) else selected_character_id,
+            )
+            prompt = _pick_state_manager_prompt(
+                character,
+                (payload.get("prompt") or {}).get("id", selected_prompt_id) if isinstance(payload.get("prompt"), dict) else selected_prompt_id,
+            )
+        else:
+            payload = _resolve_dora_state_payload(
+                state_json,
+                selected_character_id,
+                selected_prompt_id,
+            )
+            payload = _resolve_state_manager_runtime_seed(payload)
+            state = _normalize_state_manager_state(state_json)
+            character = _pick_state_manager_character(state, selected_character_id)
+            prompt = _pick_state_manager_prompt(character, selected_prompt_id)
         settings = _normalize_settings_with_canonical_seed(payload.get("settings", {}))
         settings_json = json.dumps(settings, ensure_ascii=False, sort_keys=True, indent=2)
         lora_stack_payload = _build_lora_stack_payload(
@@ -4270,9 +4351,6 @@ class StateManager:
         state_settings_payload = _build_state_settings_payload(payload)
         state_control_payload = _build_state_control_payload(payload)
         seed = _extract_seed_from_settings(settings)
-        state = _normalize_state_manager_state(state_json)
-        character = _pick_state_manager_character(state, selected_character_id)
-        prompt = _pick_state_manager_prompt(character, selected_prompt_id)
         character_image = _load_state_manager_prompt_or_character_image(character, prompt)
         return (
             payload,
