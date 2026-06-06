@@ -1120,18 +1120,30 @@ def _build_state_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_state_control_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Editor/control token only. The State Manager frontend uses a connected
-    # STATE_MANAGER_CONTROL edge as a safe save/load relationship. It is not a
-    # prompt, seed, or LoRA runtime override.
-    character = payload.get("character") if isinstance(payload.get("character"), dict) else {}
-    prompt = payload.get("prompt") if isinstance(payload.get("prompt"), dict) else {}
+    # Preferred State Manager edge. It remains usable as an editor relationship for
+    # Save/Load connected, and it now also carries the resolved selected state at
+    # runtime. This keeps state_control-only graphs consistent with direct dora_state
+    # and text output wiring during queued prompt/character wildcarding.
+    normalized = _normalize_runtime_dora_state_payload(payload) or dict(payload)
+    character = normalized.get("character") if isinstance(normalized.get("character"), dict) else {}
+    prompt = normalized.get("prompt") if isinstance(normalized.get("prompt"), dict) else {}
     return {
         "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
         "kind": _STATE_MANAGER_CONTROL_KIND,
+        "state": normalized,
         "character": character,
         "prompt": prompt,
         "selected_character_id": character.get("id", ""),
         "selected_prompt_id": prompt.get("id", ""),
+        "loader_stacks": normalized.get("loader_stacks", []),
+        "loras": normalized.get("loras", []),
+        "loader_globals": normalized.get("loader_globals", {}),
+        "settings": normalized.get("settings", {}),
+        "text_boxes": normalized.get("text_boxes", []),
+        "positive_prompt": normalized.get("positive_prompt", ""),
+        "negative_prompt": normalized.get("negative_prompt", ""),
+        "reference_image": normalized.get("reference_image", {}),
+        "fileimage_prefix": normalized.get("fileimage_prefix", ""),
     }
 
 
@@ -1266,7 +1278,21 @@ def _normalize_runtime_dora_state_payload(raw: Any) -> Optional[Dict[str, Any]]:
     payload = _safe_json_load(raw, None)
     if not isinstance(payload, dict):
         return None
-    if payload.get("kind") != _DORA_STATE_KIND:
+
+    # State Manager's STATE_MANAGER_CONTROL output is the preferred graph edge for
+    # save/load-only wiring. It also needs to carry the selected queued state at
+    # execution time so State Text Box, State Seed, and DoRA Loader nodes can all
+    # follow queued prompt/character wildcarding without direct dora_state/text links.
+    kind = payload.get("kind")
+    if kind == _STATE_MANAGER_CONTROL_KIND and isinstance(payload.get("state"), dict):
+        payload = payload.get("state")
+        kind = payload.get("kind") if isinstance(payload, dict) else None
+    elif kind == _STATE_MANAGER_CONTROL_KIND:
+        payload = dict(payload)
+        payload["kind"] = _DORA_STATE_KIND
+        kind = _DORA_STATE_KIND
+
+    if kind != _DORA_STATE_KIND:
         return None
 
     loader_stacks = _normalize_manager_loader_stacks(payload)
@@ -1284,13 +1310,36 @@ def _normalize_runtime_dora_state_payload(raw: Any) -> Optional[Dict[str, Any]]:
         "loader_stacks": loader_stacks,
         "loras": loras,
         "loader_globals": globals_out,
-        "settings": _normalize_manager_settings(payload.get("settings", {})),
+        "settings": _normalize_settings_with_canonical_seed(payload.get("settings", {})),
         "text_boxes": text_boxes,
         "positive_prompt": str(positive_box.get("text", "") if positive_box else payload.get("positive_prompt", "") or ""),
         "negative_prompt": str(negative_box.get("text", "") if negative_box else payload.get("negative_prompt", "") or ""),
         "reference_image": _normalize_manager_thumbnail(payload.get("reference_image", payload.get("prompt", {}).get("reference_image", {}) if isinstance(payload.get("prompt"), dict) else {})),
         "fileimage_prefix": str(payload.get("fileimage_prefix", payload.get("prompt", {}).get("fileimage_prefix", "") if isinstance(payload.get("prompt"), dict) else "") or ""),
     }
+
+
+def _state_payload_text_for_box(state_payload: Optional[Dict[str, Any]], role: Any, slot: Any = "default") -> Optional[str]:
+    if not isinstance(state_payload, dict):
+        return None
+    role_name = _normalize_manager_text_role(role)
+    slot_name = _clean_text_slot(slot, "default")
+    box = _pick_manager_text_box(state_payload, role_name, slot_name)
+    if isinstance(box, dict):
+        return str(box.get("text", "") or "")
+    if role_name == "positive" and "positive_prompt" in state_payload:
+        return str(state_payload.get("positive_prompt") or "")
+    if role_name == "negative" and "negative_prompt" in state_payload:
+        return str(state_payload.get("negative_prompt") or "")
+    return None
+
+
+def _state_payload_seed(state_payload: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not isinstance(state_payload, dict):
+        return None
+    if "settings" not in state_payload:
+        return None
+    return _extract_seed_from_settings(state_payload.get("settings", {}), None)
 
 
 def _select_state_loader_stack(state_payload: Optional[Dict[str, Any]], state_slot: Any = "default") -> Optional[Dict[str, Any]]:
@@ -4242,9 +4291,9 @@ class StateManager:
 class StateManagerTextBox:
     """Editable prompt/text node controlled by State Manager save/load actions.
 
-    The state_control input is intentionally ignored during execution. It gives
-    the State Manager frontend a safe non-STRING edge to discover this node for
-    Save connected / Load connected without replacing the editable text widget.
+    The state_control input gives the State Manager frontend a safe non-STRING
+    edge to discover this node for Save connected / Load connected and carries
+    the resolved text at runtime when connected.
     """
 
     @classmethod
@@ -4267,11 +4316,26 @@ class StateManagerTextBox:
 
     @classmethod
     def IS_CHANGED(cls, role: Any, text: Any = "", state_slot: Any = "default", state_control: Any = None):
-        del state_control
-        return json.dumps({"role": str(role), "state_slot": str(state_slot), "text": str(text)}, ensure_ascii=False, sort_keys=True)
+        state_payload = _normalize_runtime_dora_state_payload(state_control)
+        controlled_text = _state_payload_text_for_box(state_payload, role, state_slot)
+        effective_text = str(controlled_text if controlled_text is not None else (text or ""))
+        return json.dumps(
+            {
+                "role": str(role),
+                "state_slot": str(state_slot),
+                "text": effective_text,
+                "controlled_character_id": (state_payload.get("character", {}) or {}).get("id", "") if isinstance(state_payload, dict) else "",
+                "controlled_prompt_id": (state_payload.get("prompt", {}) or {}).get("id", "") if isinstance(state_payload, dict) else "",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
 
     def emit(self, role: Any, text: Any = "", state_slot: Any = "default", state_control: Any = None):
-        del role, state_slot, state_control
+        state_payload = _normalize_runtime_dora_state_payload(state_control)
+        controlled_text = _state_payload_text_for_box(state_payload, role, state_slot)
+        if controlled_text is not None:
+            return (controlled_text,)
         return (str(text or ""),)
 
 
@@ -4322,11 +4386,21 @@ class StateManagerSeed:
         unique_id: Any = None,
         control_after_generate: Any = None,
     ):
-        del state_control, prompt, extra_pnginfo, unique_id, control_after_generate
-        seed_i = _coerce_state_manager_seed(seed, -1)
+        del prompt, extra_pnginfo, unique_id, control_after_generate
+        state_payload = _normalize_runtime_dora_state_payload(state_control)
+        controlled_seed = _state_payload_seed(state_payload)
+        seed_i = _coerce_state_manager_seed(controlled_seed if controlled_seed is not None else seed, -1)
         if seed_i in _STATE_SEED_SPECIALS:
             return _state_manager_new_random_seed()
-        return seed_i
+        return json.dumps(
+            {
+                "seed": seed_i,
+                "controlled_character_id": (state_payload.get("character", {}) or {}).get("id", "") if isinstance(state_payload, dict) else "",
+                "controlled_prompt_id": (state_payload.get("prompt", {}) or {}).get("id", "") if isinstance(state_payload, dict) else "",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
 
     def emit(
         self,
@@ -4337,8 +4411,10 @@ class StateManagerSeed:
         unique_id: Any = None,
         control_after_generate: Any = None,
     ):
-        del state_control, control_after_generate
-        original_seed = _coerce_state_manager_seed(seed, -1)
+        del control_after_generate
+        state_payload = _normalize_runtime_dora_state_payload(state_control)
+        controlled_seed = _state_payload_seed(state_payload)
+        original_seed = _coerce_state_manager_seed(controlled_seed if controlled_seed is not None else seed, -1)
         seed_i = original_seed
         if seed_i in _STATE_SEED_SPECIALS:
             if seed_i in (-2, -3):
@@ -4704,11 +4780,15 @@ class DoraPowerLoraLoader:
         return model, clip, auto_strength_report
 
     def load_loras(self, model, clip, **kwargs):
-        # Editor-only relationship token for State Manager save/load discovery.
-        # It must not participate in runtime LoRA row or settings resolution.
-        kwargs.pop("state_control", None)
+        # state_control is the preferred State Manager relationship edge. When it
+        # carries a runtime payload, use it as the fallback source for LoRA rows
+        # and loader-global settings so state_control-only graphs follow queued
+        # character/prompt wildcarding. A direct dora_state input still wins.
         state_slot = _clean_loader_slot(kwargs.get("state_slot", "default"), "default")
         state_payload = _normalize_runtime_dora_state_payload(kwargs.get("dora_state"))
+        if state_payload is None:
+            state_payload = _normalize_runtime_dora_state_payload(kwargs.get("state_control"))
+        kwargs.pop("state_control", None)
 
         # Global controls (provided by JS UI; optionally overridden by DoRA State Manager)
         stack_enabled = bool(_state_payload_get_loader_global(state_payload, "stack_enabled", kwargs.get("stack_enabled", True), state_slot))

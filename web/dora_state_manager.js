@@ -64,6 +64,7 @@ const dsmQueueSession = {
   total: 1,
   nextIndex: 0,
   startedAt: 0,
+  promptPools: new Map(),
 };
 
 
@@ -3207,6 +3208,7 @@ function startDsmQueueSession(number, batchCount) {
   dsmQueueSession.total = queueSessionTotalFromArguments(number, batchCount);
   dsmQueueSession.nextIndex = 0;
   dsmQueueSession.startedAt = Date.now();
+  dsmQueueSession.promptPools = new Map();
 }
 
 function finishDsmQueueSession(startedAt) {
@@ -3222,6 +3224,7 @@ function nextDsmQueueIndex(index) {
     dsmQueueSession.total = 1;
     dsmQueueSession.nextIndex = 0;
     dsmQueueSession.startedAt = now;
+    dsmQueueSession.promptPools = new Map();
   }
   const queueIndex = dsmQueueSession.nextIndex;
   dsmQueueSession.nextIndex += 1;
@@ -3284,7 +3287,37 @@ function setQueuedStateManagerSelection(promptPayload, node, characterId, prompt
   return changed;
 }
 
-function selectQueuedCharacterAndPrompt(state, uiState, currentCharacterId, currentPromptId, queueIndex, total) {
+function shuffledPromptPool(prompts, avoidPromptId = "") {
+  const pool = [...prompts];
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  if (pool.length > 1 && avoidPromptId && pool[0]?.id === avoidPromptId) {
+    const swapIndex = pool.findIndex((prompt, index) => index > 0 && prompt?.id !== avoidPromptId);
+    if (swapIndex > 0) [pool[0], pool[swapIndex]] = [pool[swapIndex], pool[0]];
+  }
+  return pool;
+}
+
+function nextQueuedPromptFromPool(managerNode, character, prompts) {
+  if (!Array.isArray(prompts) || !prompts.length) return null;
+  if (prompts.length === 1) return prompts[0];
+  if (!(dsmQueueSession.promptPools instanceof Map)) dsmQueueSession.promptPools = new Map();
+  const key = `${managerNode?.id ?? "manager"}:${character?.id ?? "character"}`;
+  let entry = dsmQueueSession.promptPools.get(key);
+  const promptIds = prompts.map((prompt) => String(prompt?.id ?? "")).join("\n");
+  if (!entry || entry.promptIds !== promptIds || !Array.isArray(entry.pool) || !entry.pool.length) {
+    entry = { promptIds, lastId: entry?.lastId || "", pool: shuffledPromptPool(prompts, entry?.lastId || "") };
+  }
+  const prompt = entry.pool.shift() || prompts[0];
+  entry.lastId = String(prompt?.id ?? "");
+  if (!entry.pool.length) entry.pool = shuffledPromptPool(prompts, entry.lastId);
+  dsmQueueSession.promptPools.set(key, entry);
+  return prompt;
+}
+
+function selectQueuedCharacterAndPrompt(managerNode, state, uiState, currentCharacterId, currentPromptId, queueIndex, total) {
   const current = selectedCharacter(state, currentCharacterId) || state.characters[0];
   let character = current;
   if (uiState.queue_character_wildcard) {
@@ -3299,7 +3332,7 @@ function selectQueuedCharacterAndPrompt(state, uiState, currentCharacterId, curr
   let prompt = selectedPrompt(character, character?.id === current?.id ? currentPromptId : "") || character?.prompts?.[0];
   const prompts = Array.isArray(character?.prompts) ? character.prompts : [];
   if (uiState.queue_prompt_wildcard && prompts.length) {
-    prompt = prompts[Math.floor(Math.random() * prompts.length)] || prompt;
+    prompt = nextQueuedPromptFromPool(managerNode, character, prompts) || prompt;
   }
   return { character, prompt };
 }
@@ -3427,7 +3460,7 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
     if (!uiState.queue_prompt_wildcard && !uiState.queue_character_wildcard) continue;
     const currentCharacterId = String(widgetValue(widgets.characterWidget, "") || "");
     const currentPromptId = String(widgetValue(widgets.promptWidget, "") || "");
-    const { character, prompt } = selectQueuedCharacterAndPrompt(state, uiState, currentCharacterId, currentPromptId, queueIndex, total);
+    const { character, prompt } = selectQueuedCharacterAndPrompt(node, state, uiState, currentCharacterId, currentPromptId, queueIndex, total);
     if (!character || !prompt) continue;
     const payload = buildQueuedDoraStatePayload(character, prompt);
     changed += setQueuedStateManagerSelection(promptPayload, node, character.id, prompt.id);
