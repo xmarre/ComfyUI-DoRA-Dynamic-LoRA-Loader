@@ -2111,37 +2111,92 @@ function labelledControl(labelText, control) {
   return label;
 }
 
+function makeInlineCheckbox(labelText, value, onChange, description = "") {
+  const label = document.createElement("label");
+  label.className = "dsm-checkline";
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.checked = Boolean(value);
+  const text = document.createElement("span");
+  text.className = "dsm-checkline-text";
+  const main = document.createElement("strong");
+  main.textContent = labelText;
+  text.appendChild(main);
+  if (description) {
+    const detail = document.createElement("small");
+    detail.textContent = description;
+    text.appendChild(detail);
+  }
+  input.addEventListener("change", () => onChange(input.checked));
+  label.append(input, text);
+  return label;
+}
+
 function setPanel(node, panel) {
   const { state, uiState } = getCurrentState(node);
   updateState(node, state, { ...uiState, panel });
 }
 
+function queueCharacterIdsExplicit(state, uiState) {
+  const available = new Set((state?.characters || []).map((character) => character.id));
+  return normalizeIdList(uiState?.queue_character_ids).filter((id) => available.has(id));
+}
+
 function validQueueCharacterIds(state, uiState, fallbackId = "") {
   const available = new Set((state?.characters || []).map((character) => character.id));
-  const ids = normalizeIdList(uiState?.queue_character_ids).filter((id) => available.has(id));
+  const ids = queueCharacterIdsExplicit(state, uiState);
   if (ids.length) return ids;
   return fallbackId && available.has(fallbackId) ? [fallbackId] : [];
 }
 
-function toggleQueueCharacterId(uiState, characterId, enabled) {
-  const ids = normalizeIdList(uiState?.queue_character_ids);
+function toggleQueueCharacterId(state, uiState, characterId, enabled) {
+  const ids = queueCharacterIdsExplicit(state, uiState);
   const next = ids.filter((id) => id !== characterId);
   if (enabled) next.push(characterId);
   return [...new Set(next)];
 }
 
+function characterNamesForIds(state, ids) {
+  const byId = new Map((state?.characters || []).map((character) => [character.id, character.name]));
+  return ids.map((id) => byId.get(id) || id);
+}
+
 function queueSettingsSummary(state, uiState, currentCharacterId) {
-  const selectedIds = validQueueCharacterIds(state, uiState, currentCharacterId);
-  const parts = [];
-  if (uiState.queue_prompt_wildcard) parts.push("random prompt preset per queued generation");
-  if (uiState.queue_character_wildcard) parts.push(`${selectedIds.length || 1} character chunk${(selectedIds.length || 1) === 1 ? "" : "s"}`);
-  return parts.length ? `Queue wildcard: ${parts.join("; ")}.` : "Queue wildcard disabled.";
+  const explicitIds = queueCharacterIdsExplicit(state, uiState);
+  const runtimeIds = validQueueCharacterIds(state, uiState, currentCharacterId);
+  if (!uiState.queue_prompt_wildcard && !uiState.queue_character_wildcard) {
+    return "Queue wildcarding is off. Queued jobs use the selected character and selected prompt preset.";
+  }
+
+  const lines = [];
+  if (uiState.queue_character_wildcard) {
+    if (explicitIds.length) {
+      lines.push(`Character chunks: ${characterNamesForIds(state, runtimeIds).join(" -> ")}. The ComfyUI queue is split into ${runtimeIds.length} contiguous block${runtimeIds.length === 1 ? "" : "s"}.`);
+    } else {
+      lines.push("Character chunks are on, but no chunk characters are checked. Runtime falls back to the currently selected character.");
+    }
+  } else {
+    lines.push("Characters: selected character only.");
+  }
+
+  lines.push(uiState.queue_prompt_wildcard
+    ? "Prompts: each queued job randomly selects one saved prompt preset from the active character."
+    : "Prompts: selected prompt preset only.");
+  return lines.join(" ");
 }
 
 function renderCharacterTile(node, state, uiState, character, selectedId) {
-  const tile = document.createElement("button");
-  tile.type = "button";
-  tile.className = `dsm-character-tile${character.id === selectedId ? " selected" : ""}`;
+  const queueIds = queueCharacterIdsExplicit(state, uiState);
+  const queueIndex = queueIds.indexOf(character.id);
+  const isSelected = character.id === selectedId;
+  const isQueued = queueIndex >= 0;
+  const isActiveQueueChunk = Boolean(uiState.queue_character_wildcard && isQueued);
+
+  const tile = document.createElement("div");
+  tile.tabIndex = 0;
+  tile.role = "button";
+  tile.className = `dsm-character-tile${isSelected ? " selected" : ""}${isActiveQueueChunk ? " queued" : ""}${isQueued && !isActiveQueueChunk ? " prepared" : ""}`;
+
   const thumb = document.createElement("div");
   thumb.className = "dsm-thumb";
   const url = thumbnailUrl(character.thumbnail);
@@ -2153,18 +2208,48 @@ function renderCharacterTile(node, state, uiState, character, selectedId) {
   } else {
     thumb.textContent = character.name.trim().slice(0, 2).toUpperCase() || "?";
   }
+
   const name = document.createElement("div");
   name.className = "dsm-character-name";
   name.textContent = character.name;
+
   const meta = document.createElement("div");
   meta.className = "dsm-muted";
   const stacks = getCharacterLoaderStacks(character);
   const rowCount = stacks.reduce((sum, stack) => sum + loaderStackActiveRowCount(stack), 0);
   meta.textContent = `${stacks.length} loader${stacks.length === 1 ? "" : "s"} · ${rowCount} LoRA · ${character.prompts.length} preset${character.prompts.length === 1 ? "" : "s"}`;
-  tile.append(thumb, name, meta);
-  tile.addEventListener("click", () => {
+
+  const queueRow = document.createElement("label");
+  queueRow.className = "dsm-character-queue";
+  const queueCheckbox = makeCheckbox(isQueued, (checked) => {
+    const ids = toggleQueueCharacterId(state, uiState, character.id, checked);
+    const nextUiState = {
+      ...uiState,
+      queue_character_ids: ids,
+      queue_character_wildcard: checked ? true : uiState.queue_character_wildcard,
+    };
+    updateState(node, state, nextUiState, {
+      characterId: selectedId || character.id,
+      status: queueSettingsSummary(state, nextUiState, selectedId || character.id),
+    });
+  });
+  queueRow.addEventListener("click", (event) => event.stopPropagation());
+  queueRow.addEventListener("mousedown", (event) => event.stopPropagation());
+  const queueLabel = document.createElement("span");
+  queueLabel.textContent = isQueued ? (uiState.queue_character_wildcard ? `Chunk ${queueIndex + 1}` : "Prepared") : "Use in chunks";
+  queueRow.append(queueCheckbox, queueLabel);
+
+  tile.append(thumb, name, meta, queueRow);
+
+  const selectCharacter = () => {
     const promptId = character.prompts[0]?.id || "";
-    updateState(node, state, uiState, { characterId: character.id, promptId, status: `Selected ${character.name}. Use Load/Apply to push it into connected nodes.` });
+    updateState(node, state, uiState, { characterId: character.id, promptId, status: `Editing ${character.name}. Use Load/Apply to push it into connected nodes.` });
+  };
+  tile.addEventListener("click", selectCharacter);
+  tile.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    selectCharacter();
   });
   return tile;
 }
@@ -2238,23 +2323,73 @@ function renderHeader(node, state, uiState, character, prompt) {
     }, "Apply the current character/preset to selected graph nodes")
   );
 
-  const queueControls = document.createElement("div");
-  queueControls.className = "dsm-toolbar";
-  const promptWildcard = makeCheckbox(uiState.queue_prompt_wildcard, (checked) => {
-    updateState(node, state, { ...uiState, queue_prompt_wildcard: checked }, { characterId: character.id, promptId: prompt.id, status: checked ? "Prompt wildcard queue enabled: queued generations will randomly choose a saved prompt preset." : "Prompt wildcard queue disabled." });
-  });
-  const characterWildcard = makeCheckbox(uiState.queue_character_wildcard, (checked) => {
-    const ids = validQueueCharacterIds(state, uiState, character.id);
-    updateState(node, state, { ...uiState, queue_character_wildcard: checked, queue_character_ids: ids }, { characterId: character.id, promptId: prompt.id, status: checked ? queueSettingsSummary(state, { ...uiState, queue_character_wildcard: true, queue_character_ids: ids }, character.id) : "Character chunk queue disabled." });
-  });
-  const queueSummary = document.createElement("div");
-  queueSummary.className = "dsm-muted";
-  queueSummary.textContent = queueSettingsSummary(state, uiState, character.id);
-  queueControls.append(
-    labelledControl("Random prompt per queued generation", promptWildcard),
-    labelledControl("Linear character chunks", characterWildcard),
-    queueSummary
+  const queueBox = document.createElement("div");
+  queueBox.className = "dsm-queue-box";
+
+  const queueHeader = document.createElement("div");
+  queueHeader.className = "dsm-queue-header";
+  const queueTitle = document.createElement("div");
+  queueTitle.className = "dsm-section-title";
+  queueTitle.textContent = "Queued generation wildcarding";
+  const queueBadge = document.createElement("div");
+  queueBadge.className = "dsm-queue-badge";
+  const explicitQueueIds = queueCharacterIdsExplicit(state, uiState);
+  queueBadge.textContent = uiState.queue_character_wildcard
+    ? `${explicitQueueIds.length || 1} character chunk${(explicitQueueIds.length || 1) === 1 ? "" : "s"}`
+    : "single character";
+  queueHeader.append(queueTitle, queueBadge);
+
+  const queueRows = document.createElement("div");
+  queueRows.className = "dsm-queue-options";
+  queueRows.append(
+    makeInlineCheckbox(
+      "Random prompt preset per queued image",
+      uiState.queue_prompt_wildcard,
+      (checked) => {
+        const nextUiState = { ...uiState, queue_prompt_wildcard: checked };
+        updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
+      },
+      "Each queued job samples one saved prompt preset from whichever character is active for that job."
+    ),
+    makeInlineCheckbox(
+      "Split queued images into contiguous character chunks",
+      uiState.queue_character_wildcard,
+      (checked) => {
+        const ids = queueCharacterIdsExplicit(state, uiState);
+        const nextUiState = {
+          ...uiState,
+          queue_character_wildcard: checked,
+          queue_character_ids: checked && !ids.length ? [character.id] : ids,
+        };
+        updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
+      },
+      "Tick chunk characters on the cards below. Example: 15 queued jobs with 3 checked characters runs 5 jobs per character before switching."
+    )
   );
+
+  const queueActions = document.createElement("div");
+  queueActions.className = "dsm-toolbar dsm-queue-actions";
+  queueActions.append(
+    makeButton("Use current character", () => {
+      const nextUiState = { ...uiState, queue_character_wildcard: true, queue_character_ids: [character.id] };
+      updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
+    }, "Use only the currently selected character for character chunking"),
+    makeButton("Use all characters", () => {
+      const ids = state.characters.map((item) => item.id);
+      const nextUiState = { ...uiState, queue_character_wildcard: true, queue_character_ids: ids };
+      updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
+    }, "Add every saved character to the character chunk list"),
+    makeButton("Clear character chunks", () => {
+      const nextUiState = { ...uiState, queue_character_wildcard: false, queue_character_ids: [] };
+      updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
+    }, "Disable character chunking and clear the checked chunk list")
+  );
+
+  const queueSummary = document.createElement("div");
+  queueSummary.className = "dsm-queue-summary";
+  queueSummary.textContent = queueSettingsSummary(state, uiState, character.id);
+
+  queueBox.append(queueHeader, queueRows, queueActions, queueSummary);
 
   const grid = document.createElement("div");
   grid.className = "dsm-character-grid";
@@ -2291,7 +2426,7 @@ function renderHeader(node, state, uiState, character, prompt) {
     })
   );
 
-  section.append(toolbar, importInput, queueControls);
+  section.append(toolbar, importInput, queueBox);
   if (node.__dsmBackupWarning) {
     const warning = document.createElement("div");
     warning.className = "dsm-warning";
@@ -2401,12 +2536,7 @@ function renderCharacterPanel(node, state, uiState, character) {
   imageNote.className = "dsm-muted";
   imageNote.textContent = "The State Manager image output loads the original uploaded file, not the CSS-scaled preview.";
 
-  const queueIncluded = makeCheckbox(validQueueCharacterIds(state, uiState, character.id).includes(character.id), (checked) => {
-    const ids = toggleQueueCharacterId(uiState, character.id, checked);
-    updateState(node, state, { ...uiState, queue_character_ids: ids }, { characterId: character.id, status: queueSettingsSummary(state, { ...uiState, queue_character_ids: ids }, character.id) });
-  });
-
-  section.append(title, labelledControl("Name", nameInput), labelledControl("Use this character in linear queue chunks", queueIncluded), preview, fileInput, thumbnailButtons, imageNote, labelledControl("Saved LoRA stacks", loraSummary));
+  section.append(title, labelledControl("Name", nameInput), preview, fileInput, thumbnailButtons, imageNote, labelledControl("Saved LoRA stacks", loraSummary));
   return section;
 }
 
@@ -2964,6 +3094,17 @@ function ensureStyles() {
     .dsm-title, .dsm-section-title { font-weight: 650; opacity: .95; }
     .dsm-title { flex: 1 1 auto; font-size: 13px; }
     .dsm-muted { opacity: .68; white-space: pre-wrap; }
+    .dsm-queue-box { border: 1px solid rgba(128,128,128,.28); border-radius: 7px; padding: 7px; margin: 2px 0 8px; background: rgba(0,0,0,.14); display: flex; flex-direction: column; gap: 7px; }
+    .dsm-queue-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .dsm-queue-badge { border: 1px solid rgba(128,128,128,.38); border-radius: 999px; padding: 2px 8px; opacity: .82; white-space: nowrap; background: rgba(255,255,255,.04); }
+    .dsm-queue-options { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px; }
+    .dsm-queue-actions { margin-bottom: 0; }
+    .dsm-queue-summary { opacity: .78; white-space: pre-wrap; border-top: 1px solid rgba(128,128,128,.22); padding-top: 6px; }
+    .dsm-checkline { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px; align-items: start; border: 1px solid rgba(128,128,128,.24); border-radius: 6px; padding: 6px; background: rgba(255,255,255,.025); }
+    .dsm-checkline input { margin-top: 2px; }
+    .dsm-checkline-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .dsm-checkline-text strong { font-weight: 650; }
+    .dsm-checkline-text small { opacity: .68; line-height: 1.3; }
     .dsm-status { border-top: 1px solid rgba(128,128,128,.25); padding-top: 6px; opacity: .78; }
     .dsm-warning { border: 1px solid rgba(255, 190, 90, .7); border-radius: 6px; padding: 6px; background: rgba(255, 170, 0, .12); color: var(--input-text, #f2e6cc); display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; }
     .dsm-warning span { min-width: 0; }
@@ -2979,12 +3120,17 @@ function ensureStyles() {
     }
     .dsm-root button { cursor: pointer; white-space: nowrap; }
     .dsm-root button.selected, .dsm-character-tile.selected { border-color: rgba(180, 210, 255, .8); background: rgba(100, 140, 220, .22); }
+    .dsm-character-tile.queued:not(.selected) { border-color: rgba(180, 210, 255, .55); background: rgba(100, 140, 220, .12); }
+    .dsm-character-tile.prepared:not(.selected) { border-color: rgba(128,128,128,.62); background: rgba(255,255,255,.035); }
     .dsm-root textarea { width: 100%; min-height: 86px; resize: vertical; }
     .dsm-root input[type="checkbox"] { width: auto; }
     .dsm-labelled { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
     .dsm-labelled > span { opacity: .68; }
-    .dsm-character-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 6px; max-height: 190px; overflow: auto; padding-right: 2px; }
-    .dsm-character-tile { display: flex; flex-direction: column; align-items: stretch; gap: 4px; text-align: left; min-height: 126px; }
+    .dsm-character-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 6px; max-height: 218px; overflow: auto; padding-right: 2px; }
+    .dsm-character-tile { display: flex; flex-direction: column; align-items: stretch; gap: 4px; text-align: left; min-height: 150px; color: var(--input-text, #ddd); background: var(--comfy-input-bg, #222); border: 1px solid rgba(128,128,128,.45); border-radius: 6px; padding: 6px; cursor: pointer; min-width: 0; }
+    .dsm-character-tile:focus { outline: 1px solid rgba(180, 210, 255, .7); outline-offset: 1px; }
+    .dsm-character-queue { display: flex; align-items: center; gap: 5px; margin-top: auto; opacity: .88; cursor: pointer; }
+    .dsm-character-queue input { margin: 0; }
     .dsm-thumb, .dsm-large-thumb { display: flex; align-items: center; justify-content: center; border: 1px solid rgba(128,128,128,.35); border-radius: 7px; overflow: hidden; background: rgba(0,0,0,.22); color: rgba(220,220,220,.72); }
     .dsm-thumb { height: 76px; font-size: 22px; font-weight: 700; }
     .dsm-large-thumb { min-height: 170px; cursor: pointer; }
@@ -2998,7 +3144,7 @@ function ensureStyles() {
     .dsm-prompt-box { display: grid; grid-template-columns: 94px minmax(90px, .8fr) minmax(110px, 1fr) auto; gap: 6px; align-items: end; }
     .dsm-prompt-box .dsm-labelled:last-child { grid-column: 1 / -1; }
     .dsm-lora-summary { white-space: pre-wrap; border: 1px solid rgba(128,128,128,.35); border-radius: 6px; padding: 6px; min-height: 58px; max-height: 190px; overflow: auto; background: rgba(0,0,0,.16); }
-    @media (max-width: 720px) { .dsm-main { grid-template-columns: 1fr; } }
+    @media (max-width: 720px) { .dsm-main { grid-template-columns: 1fr; } .dsm-queue-options { grid-template-columns: 1fr; } }
   `;
   document.head.appendChild(style);
 }
