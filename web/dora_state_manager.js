@@ -3280,6 +3280,31 @@ function setQueuedWidgetInput(promptPayload, node, widgetName, value) {
   return setQueuedInput(promptPayload, node, widgetName, value, { addIfMissing: false, syncWidget: true });
 }
 
+function serializeQueuedUiStateOverride(uiState, payload, queueIndex, total) {
+  return JSON.stringify({
+    ...stripBackupRestoreStatus(uiState || defaultUiState()),
+    __dsm_queued_runtime_state: structuredCloneCompat(payload),
+    __dsm_queued_runtime_character_id: String(payload?.character?.id ?? ""),
+    __dsm_queued_runtime_prompt_id: String(payload?.prompt?.id ?? ""),
+    __dsm_queued_runtime_queue_index: Math.max(0, Number(queueIndex) || 0),
+    __dsm_queued_runtime_queue_total: Math.max(1, Number(total) || 1),
+    // The runtime override must differ per queued prompt even if the same prompt
+    // is selected again after a prompt-pool reshuffle. This prevents executor
+    // cache reuse from keeping a stale STATE_MANAGER_CONTROL payload alive.
+    __dsm_queued_runtime_nonce: `${Date.now()}:${Math.random()}:${queueIndex}`,
+  }, null, 0);
+}
+
+function setQueuedStateManagerRuntimeState(promptPayload, node, uiState, payload, queueIndex, total) {
+  return setQueuedInput(
+    promptPayload,
+    node,
+    UI_STATE_WIDGET,
+    serializeQueuedUiStateOverride(uiState, payload, queueIndex, total),
+    { addIfMissing: true, syncWidget: true }
+  );
+}
+
 function setQueuedStateManagerSelection(promptPayload, node, characterId, promptId) {
   let changed = 0;
   changed += setQueuedInput(promptPayload, node, SELECTED_CHARACTER_WIDGET, characterId, { addIfMissing: false, syncWidget: true });
@@ -3464,6 +3489,7 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
     if (!character || !prompt) continue;
     const payload = buildQueuedDoraStatePayload(character, prompt);
     changed += setQueuedStateManagerSelection(promptPayload, node, character.id, prompt.id);
+    changed += setQueuedStateManagerRuntimeState(promptPayload, node, uiState, payload, queueIndex, total);
     changed += mutateQueuedDoraLoaders(promptPayload, node, character, payload);
     changed += mutateQueuedStateTextBoxes(promptPayload, node, prompt);
     changed += mutateQueuedLegacyTextTargets(promptPayload, node, prompt);

@@ -1119,6 +1119,17 @@ def _build_state_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _queued_runtime_state_from_ui_state(ui_state_json: Any) -> Optional[Dict[str, Any]]:
+    parsed = _safe_json_load(ui_state_json, {})
+    if not isinstance(parsed, dict):
+        return None
+    raw = parsed.get("__dsm_queued_runtime_state")
+    payload = _normalize_runtime_dora_state_payload(raw)
+    if payload is not None:
+        return payload
+    return None
+
+
 def _build_state_control_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Preferred State Manager edge. It remains usable as an editor relationship for
     # Save/Load connected, and it now also carries the resolved selected state at
@@ -4255,12 +4266,27 @@ class StateManager:
         selected_character_id: Any = "",
         selected_prompt_id: Any = "",
     ):
-        del ui_state_json
-        payload = _resolve_dora_state_payload(
-            state_json,
-            selected_character_id,
-            selected_prompt_id,
-        )
+        runtime_payload = _queued_runtime_state_from_ui_state(ui_state_json)
+        if runtime_payload is not None:
+            payload = runtime_payload
+            state = _normalize_state_manager_state(state_json)
+            character = _pick_state_manager_character(
+                state,
+                (payload.get("character") or {}).get("id", selected_character_id) if isinstance(payload.get("character"), dict) else selected_character_id,
+            )
+            prompt = _pick_state_manager_prompt(
+                character,
+                (payload.get("prompt") or {}).get("id", selected_prompt_id) if isinstance(payload.get("prompt"), dict) else selected_prompt_id,
+            )
+        else:
+            payload = _resolve_dora_state_payload(
+                state_json,
+                selected_character_id,
+                selected_prompt_id,
+            )
+            state = _normalize_state_manager_state(state_json)
+            character = _pick_state_manager_character(state, selected_character_id)
+            prompt = _pick_state_manager_prompt(character, selected_prompt_id)
         settings = _normalize_settings_with_canonical_seed(payload.get("settings", {}))
         settings_json = json.dumps(settings, ensure_ascii=False, sort_keys=True, indent=2)
         lora_stack_payload = _build_lora_stack_payload(
@@ -4270,9 +4296,6 @@ class StateManager:
         state_settings_payload = _build_state_settings_payload(payload)
         state_control_payload = _build_state_control_payload(payload)
         seed = _extract_seed_from_settings(settings)
-        state = _normalize_state_manager_state(state_json)
-        character = _pick_state_manager_character(state, selected_character_id)
-        prompt = _pick_state_manager_prompt(character, selected_prompt_id)
         character_image = _load_state_manager_prompt_or_character_image(character, prompt)
         return (
             payload,
