@@ -2171,7 +2171,7 @@ function queueSettingsSummary(state, uiState, currentCharacterId) {
   const lines = [];
   if (uiState.queue_character_wildcard) {
     if (explicitIds.length) {
-      lines.push(`Character chunks: ${characterNamesForIds(state, runtimeIds).join(" -> ")}. The ComfyUI queue is split into ${runtimeIds.length} contiguous block${runtimeIds.length === 1 ? "" : "s"}.`);
+      lines.push(`Character chunks: ${characterNamesForIds(state, runtimeIds).join(" -> ")}. The ComfyUI queue uses up to ${runtimeIds.length} contiguous block${runtimeIds.length === 1 ? "" : "s"} depending on queued job count.`);
     } else {
       lines.push("Character chunks are on, but no chunk characters are checked. Runtime falls back to the currently selected character.");
     }
@@ -2235,6 +2235,7 @@ function renderCharacterTile(node, state, uiState, character, selectedId) {
   });
   queueRow.addEventListener("click", (event) => event.stopPropagation());
   queueRow.addEventListener("mousedown", (event) => event.stopPropagation());
+  queueRow.addEventListener("keydown", (event) => event.stopPropagation());
   const queueLabel = document.createElement("span");
   queueLabel.textContent = isQueued ? (uiState.queue_character_wildcard ? `Chunk ${queueIndex + 1}` : "Prepared") : "Use in chunks";
   queueRow.append(queueCheckbox, queueLabel);
@@ -2247,6 +2248,7 @@ function renderCharacterTile(node, state, uiState, character, selectedId) {
   };
   tile.addEventListener("click", selectCharacter);
   tile.addEventListener("keydown", (event) => {
+    if (event.target !== tile) return;
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
     selectCharacter();
