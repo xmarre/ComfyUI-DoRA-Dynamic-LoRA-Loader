@@ -32,6 +32,8 @@ const OUTPUT_NAMES = {
   negative: ["negative_prompt_template", "negative_prompt"],
   settings: ["settings_json", "state_settings"],
   seed: ["seed"],
+  image: ["character_image"],
+  fileimagePrefix: ["fileimage_prefix"],
 };
 const TEXT_WIDGET_NAMES = ["text", "prompt", "positive", "negative", "string", "value", "wildcard", "wildcards", "wildcard_text", "populated_text"];
 const STATE_TEXT_OUTPUT_NAMES = ["text"];
@@ -55,6 +57,14 @@ const BACKUP_NODE_UID_PROPERTY = "dora_state_manager_backup_node_uid";
 const BACKUP_INDEX_STORAGE_SUFFIX = "workflow_index";
 const BACKUP_EXPORT_KIND = "dora_state_manager_export";
 const BACKUP_RESTORE_STATUS_PREFIX = "Warning: this node loaded with default/empty state";
+const QUEUE_SESSION_MAX_AGE_MS = 30000;
+
+const dsmQueueSession = {
+  active: false,
+  total: 1,
+  nextIndex: 0,
+  startedAt: 0,
+};
 
 
 function structuredCloneCompat(value) {
@@ -97,6 +107,8 @@ function defaultPrompt() {
       { role: "negative", slot: "default", label: "Default negative", text: "" },
     ],
     settings: {},
+    reference_image: {},
+    fileimage_prefix: "",
   };
 }
 
@@ -269,7 +281,7 @@ function defaultCharacter() {
 }
 
 function defaultState() {
-  return { version: 1, characters: [defaultCharacter()] };
+  return { version: 2, characters: [defaultCharacter()] };
 }
 
 function defaultUiState() {
@@ -513,6 +525,8 @@ function normalizePrompt(prompt, index) {
     negative: String(p.negative ?? p.negative_prompt ?? ""),
     text_boxes: normalizePromptTextBoxes(p),
     settings: normalizeSettings(p.settings),
+    reference_image: normalizeThumbnail(p.reference_image ?? p.referenceImage ?? p.prompt_image ?? p.image),
+    fileimage_prefix: String(p.fileimage_prefix ?? p.filename_prefix ?? p.file_image_prefix ?? "").trim(),
   });
 }
 
@@ -534,15 +548,26 @@ function normalizeState(raw) {
   const parsed = safeJsonParse(raw, defaultState());
   const charsIn = Array.isArray(parsed.characters) ? parsed.characters : [];
   const characters = charsIn.map(normalizeCharacter).filter(Boolean);
-  return { version: 1, characters: characters.length ? characters : [defaultCharacter()] };
+  return { version: 2, characters: characters.length ? characters : [defaultCharacter()] };
+}
+
+function normalizeIdList(value) {
+  if (Array.isArray(value)) return value.map((item) => cleanId(item, "")).filter(Boolean);
+  if (typeof value === "string") {
+    return value.split(/[\n,]+/g).map((item) => cleanId(item, "")).filter(Boolean);
+  }
+  return [];
 }
 
 function normalizeUiState(raw) {
   const parsed = safeJsonParse(raw, defaultUiState());
   return {
-    version: 1,
+    version: 2,
     panel: ["prompts", "loras", "settings"].includes(parsed.panel) ? parsed.panel : "prompts",
     status: String(parsed.status ?? ""),
+    queue_prompt_wildcard: normalizeBoolean(parsed.queue_prompt_wildcard ?? parsed.prompt_wildcard_enabled, false),
+    queue_character_wildcard: normalizeBoolean(parsed.queue_character_wildcard ?? parsed.character_wildcard_enabled, false),
+    queue_character_ids: normalizeIdList(parsed.queue_character_ids ?? parsed.selected_character_ids),
   };
 }
 
@@ -2091,6 +2116,28 @@ function setPanel(node, panel) {
   updateState(node, state, { ...uiState, panel });
 }
 
+function validQueueCharacterIds(state, uiState, fallbackId = "") {
+  const available = new Set((state?.characters || []).map((character) => character.id));
+  const ids = normalizeIdList(uiState?.queue_character_ids).filter((id) => available.has(id));
+  if (ids.length) return ids;
+  return fallbackId && available.has(fallbackId) ? [fallbackId] : [];
+}
+
+function toggleQueueCharacterId(uiState, characterId, enabled) {
+  const ids = normalizeIdList(uiState?.queue_character_ids);
+  const next = ids.filter((id) => id !== characterId);
+  if (enabled) next.push(characterId);
+  return [...new Set(next)];
+}
+
+function queueSettingsSummary(state, uiState, currentCharacterId) {
+  const selectedIds = validQueueCharacterIds(state, uiState, currentCharacterId);
+  const parts = [];
+  if (uiState.queue_prompt_wildcard) parts.push("random prompt preset per queued generation");
+  if (uiState.queue_character_wildcard) parts.push(`${selectedIds.length || 1} character chunk${(selectedIds.length || 1) === 1 ? "" : "s"}`);
+  return parts.length ? `Queue wildcard: ${parts.join("; ")}.` : "Queue wildcard disabled.";
+}
+
 function renderCharacterTile(node, state, uiState, character, selectedId) {
   const tile = document.createElement("button");
   tile.type = "button";
@@ -2191,6 +2238,24 @@ function renderHeader(node, state, uiState, character, prompt) {
     }, "Apply the current character/preset to selected graph nodes")
   );
 
+  const queueControls = document.createElement("div");
+  queueControls.className = "dsm-toolbar";
+  const promptWildcard = makeCheckbox(uiState.queue_prompt_wildcard, (checked) => {
+    updateState(node, state, { ...uiState, queue_prompt_wildcard: checked }, { characterId: character.id, promptId: prompt.id, status: checked ? "Prompt wildcard queue enabled: queued generations will randomly choose a saved prompt preset." : "Prompt wildcard queue disabled." });
+  });
+  const characterWildcard = makeCheckbox(uiState.queue_character_wildcard, (checked) => {
+    const ids = validQueueCharacterIds(state, uiState, character.id);
+    updateState(node, state, { ...uiState, queue_character_wildcard: checked, queue_character_ids: ids }, { characterId: character.id, promptId: prompt.id, status: checked ? queueSettingsSummary(state, { ...uiState, queue_character_wildcard: true, queue_character_ids: ids }, character.id) : "Character chunk queue disabled." });
+  });
+  const queueSummary = document.createElement("div");
+  queueSummary.className = "dsm-muted";
+  queueSummary.textContent = queueSettingsSummary(state, uiState, character.id);
+  queueControls.append(
+    labelledControl("Random prompt per queued generation", promptWildcard),
+    labelledControl("Linear character chunks", characterWildcard),
+    queueSummary
+  );
+
   const grid = document.createElement("div");
   grid.className = "dsm-character-grid";
   for (const item of state.characters) grid.appendChild(renderCharacterTile(node, state, uiState, item, character.id));
@@ -2226,7 +2291,7 @@ function renderHeader(node, state, uiState, character, prompt) {
     })
   );
 
-  section.append(toolbar, importInput);
+  section.append(toolbar, importInput, queueControls);
   if (node.__dsmBackupWarning) {
     const warning = document.createElement("div");
     warning.className = "dsm-warning";
@@ -2336,7 +2401,12 @@ function renderCharacterPanel(node, state, uiState, character) {
   imageNote.className = "dsm-muted";
   imageNote.textContent = "The State Manager image output loads the original uploaded file, not the CSS-scaled preview.";
 
-  section.append(title, labelledControl("Name", nameInput), preview, fileInput, thumbnailButtons, imageNote, labelledControl("Saved LoRA stacks", loraSummary));
+  const queueIncluded = makeCheckbox(validQueueCharacterIds(state, uiState, character.id).includes(character.id), (checked) => {
+    const ids = toggleQueueCharacterId(uiState, character.id, checked);
+    updateState(node, state, { ...uiState, queue_character_ids: ids }, { characterId: character.id, status: queueSettingsSummary(state, { ...uiState, queue_character_ids: ids }, character.id) });
+  });
+
+  section.append(title, labelledControl("Name", nameInput), labelledControl("Use this character in linear queue chunks", queueIncluded), preview, fileInput, thumbnailButtons, imageNote, labelledControl("Saved LoRA stacks", loraSummary));
   return section;
 }
 
@@ -2418,6 +2488,83 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, render: false });
   }, { placeholder: "Negative prompt template. Wildcards stay here and expand downstream." });
 
+  const fileimagePrefix = makeInput(prompt.fileimage_prefix ?? "", (value) => {
+    prompt.fileimage_prefix = String(value ?? "").trim();
+    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+  }, { placeholder: "e.g. jl_dryfs2/AIM" });
+
+  const referencePreview = document.createElement("div");
+  referencePreview.className = "dsm-large-thumb";
+  const referenceUrl = thumbnailUrl(prompt.reference_image);
+  if (referenceUrl) {
+    const img = document.createElement("img");
+    img.src = referenceUrl;
+    img.alt = `${prompt.name || "Prompt"} reference`;
+    referencePreview.appendChild(img);
+  } else {
+    referencePreview.textContent = "Drop prompt reference image here";
+  }
+
+  const referenceInput = document.createElement("input");
+  referenceInput.type = "file";
+  referenceInput.accept = "image/*";
+  referenceInput.style.display = "none";
+  referenceInput.addEventListener("change", async () => {
+    const file = referenceInput.files?.[0];
+    if (!file) return;
+    try {
+      prompt.reference_image = await uploadThumbnailFile(file);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: "Prompt reference image uploaded." });
+    } catch (err) {
+      setStatus(node, `Prompt reference upload failed: ${err?.message || err}`);
+    } finally {
+      referenceInput.value = "";
+    }
+  });
+  referencePreview.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    referenceInput.click();
+  });
+  referencePreview.addEventListener("dragenter", (event) => {
+    stopComfyFileDropEvent(event);
+    referencePreview.classList.add("dragging");
+  }, true);
+  referencePreview.addEventListener("dragover", (event) => {
+    stopComfyFileDropEvent(event);
+    referencePreview.classList.add("dragging");
+  }, true);
+  referencePreview.addEventListener("dragleave", (event) => {
+    event.stopPropagation();
+    referencePreview.classList.remove("dragging");
+  }, true);
+  referencePreview.addEventListener("drop", async (event) => {
+    stopComfyFileDropEvent(event);
+    referencePreview.classList.remove("dragging");
+    const file = [...(event.dataTransfer?.files || [])].find((candidate) => candidate.type.startsWith("image/"));
+    if (!file) return;
+    try {
+      prompt.reference_image = await uploadThumbnailFile(file);
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: "Prompt reference image uploaded." });
+    } catch (err) {
+      setStatus(node, `Prompt reference upload failed: ${err?.message || err}`);
+    }
+  }, true);
+
+  const referenceButtons = document.createElement("div");
+  referenceButtons.className = "dsm-toolbar";
+  referenceButtons.append(
+    makeButton("Choose prompt image", () => referenceInput.click()),
+    makeButton("Clear", () => {
+      prompt.reference_image = {};
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: "Prompt reference image cleared. Character image fallback will be used." });
+    })
+  );
+
+  const referenceNote = document.createElement("div");
+  referenceNote.className = "dsm-muted";
+  referenceNote.textContent = "The image output uses this prompt reference first, then falls back to the character thumbnail.";
+
   const textBoxToolbar = document.createElement("div");
   textBoxToolbar.className = "dsm-toolbar";
   textBoxToolbar.append(
@@ -2490,6 +2637,11 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
   section.append(
     header,
     labelledControl("Preset name", name),
+    labelledControl("fileimage_prefix", fileimagePrefix),
+    referencePreview,
+    referenceInput,
+    referenceButtons,
+    referenceNote,
     labelledControl("Default positive template", positive),
     labelledControl("Default negative template", negative),
     textBoxToolbar,
@@ -2894,6 +3046,252 @@ function initializeNode(node, widget) {
 }
 
 
+function queueSessionTotalFromArguments(number, batchCount) {
+  const batch = Number(batchCount);
+  if (Number.isFinite(batch) && batch > 0) return Math.max(1, Math.floor(batch));
+  const count = Number(number);
+  if (Number.isFinite(count) && count > 1) return Math.max(1, Math.floor(count));
+  return 1;
+}
+
+function startDsmQueueSession(number, batchCount) {
+  dsmQueueSession.active = true;
+  dsmQueueSession.total = queueSessionTotalFromArguments(number, batchCount);
+  dsmQueueSession.nextIndex = 0;
+  dsmQueueSession.startedAt = Date.now();
+}
+
+function finishDsmQueueSession(startedAt) {
+  setTimeout(() => {
+    if (dsmQueueSession.startedAt === startedAt) dsmQueueSession.active = false;
+  }, 0);
+}
+
+function nextDsmQueueIndex(index) {
+  const now = Date.now();
+  if (!dsmQueueSession.active || now - dsmQueueSession.startedAt > QUEUE_SESSION_MAX_AGE_MS) {
+    dsmQueueSession.active = true;
+    dsmQueueSession.total = 1;
+    dsmQueueSession.nextIndex = 0;
+    dsmQueueSession.startedAt = now;
+  }
+  const queueIndex = dsmQueueSession.nextIndex;
+  dsmQueueSession.nextIndex += 1;
+  return queueIndex;
+}
+
+function queueOutputKeysForNode(promptPayload, node) {
+  const output = promptPayload?.output || {};
+  const id = String(node?.id ?? "");
+  const keys = [];
+  for (const key of Object.keys(output)) {
+    if (key === id || key.endsWith(`:${id}`)) keys.push(key);
+  }
+  if (id && !keys.includes(id)) keys.push(id);
+  return [...new Set(keys)];
+}
+
+function findWorkflowNodeForPromptNode(promptPayload, node, promptId = null) {
+  const workflowNodes = promptPayload?.workflow?.nodes;
+  if (!Array.isArray(workflowNodes)) return null;
+  const idText = String(promptId ?? node?.id ?? "");
+  return workflowNodes.find((item) => String(item?.id) === idText)
+    || workflowNodes.find((item) => String(item?.id) === String(node?.id ?? ""))
+    || null;
+}
+
+function syncQueuedWorkflowWidget(promptPayload, node, widget, value, promptId = null) {
+  if (!widget) return false;
+  const workflowNode = findWorkflowNodeForPromptNode(promptPayload, node, promptId);
+  const index = (node?.widgets || []).indexOf(widget);
+  if (!workflowNode || !Array.isArray(workflowNode.widgets_values) || index < 0) return false;
+  workflowNode.widgets_values[index] = value;
+  return true;
+}
+
+function setQueuedInput(promptPayload, node, inputName, value, { addIfMissing = false, syncWidget = true } = {}) {
+  if (!promptPayload?.output || !node || !inputName) return 0;
+  let changed = 0;
+  const widget = syncWidget ? widgetByExactName(node, inputName) : null;
+  for (const promptId of queueOutputKeysForNode(promptPayload, node)) {
+    const outputNode = promptPayload.output?.[promptId];
+    const inputs = outputNode?.inputs;
+    if (!inputs) continue;
+    if (!addIfMissing && !Object.prototype.hasOwnProperty.call(inputs, inputName)) continue;
+    inputs[inputName] = structuredCloneCompat(value);
+    syncQueuedWorkflowWidget(promptPayload, node, widget, value, promptId);
+    changed += 1;
+  }
+  return changed;
+}
+
+function setQueuedWidgetInput(promptPayload, node, widgetName, value) {
+  return setQueuedInput(promptPayload, node, widgetName, value, { addIfMissing: false, syncWidget: true });
+}
+
+function setQueuedStateManagerSelection(promptPayload, node, characterId, promptId) {
+  let changed = 0;
+  changed += setQueuedInput(promptPayload, node, SELECTED_CHARACTER_WIDGET, characterId, { addIfMissing: false, syncWidget: true });
+  changed += setQueuedInput(promptPayload, node, SELECTED_PROMPT_WIDGET, promptId, { addIfMissing: false, syncWidget: true });
+  return changed;
+}
+
+function selectQueuedCharacterAndPrompt(state, uiState, currentCharacterId, currentPromptId, queueIndex, total) {
+  const current = selectedCharacter(state, currentCharacterId) || state.characters[0];
+  let character = current;
+  if (uiState.queue_character_wildcard) {
+    const ids = validQueueCharacterIds(state, uiState, current?.id || currentCharacterId);
+    if (ids.length) {
+      const safeTotal = Math.max(1, Number(total) || 1);
+      const chunkIndex = Math.min(ids.length - 1, Math.floor((Math.max(0, queueIndex) * ids.length) / safeTotal));
+      character = selectedCharacter(state, ids[chunkIndex]) || current;
+    }
+  }
+
+  let prompt = selectedPrompt(character, character?.id === current?.id ? currentPromptId : "") || character?.prompts?.[0];
+  const prompts = Array.isArray(character?.prompts) ? character.prompts : [];
+  if (uiState.queue_prompt_wildcard && prompts.length) {
+    prompt = prompts[Math.floor(Math.random() * prompts.length)] || prompt;
+  }
+  return { character, prompt };
+}
+
+function buildQueuedDoraStatePayload(character, prompt) {
+  syncLegacyLoaderMirror(character);
+  syncPromptTextMirror(prompt);
+  const loaderStacks = getCharacterLoaderStacks(character).map((stack) => structuredCloneCompat(stack));
+  const defaultStack = findCharacterLoaderStack(character, "default") || loaderStacks[0] || defaultLoaderStack();
+  const textBoxes = normalizePromptTextBoxes(prompt);
+  const positiveBox = findPromptTextBox(prompt, "positive", "default") || textBoxes.find((box) => box.role === "positive");
+  const negativeBox = findPromptTextBox(prompt, "negative", "default") || textBoxes.find((box) => box.role === "negative");
+  const referenceImage = normalizeThumbnail(prompt?.reference_image);
+  const fileimagePrefix = String(prompt?.fileimage_prefix ?? "").trim();
+  return {
+    version: 2,
+    kind: "dora_state_manager_state",
+    character: {
+      id: String(character?.id ?? ""),
+      name: String(character?.name ?? ""),
+      thumbnail: normalizeThumbnail(character?.thumbnail),
+    },
+    prompt: {
+      id: String(prompt?.id ?? ""),
+      name: String(prompt?.name ?? ""),
+      reference_image: referenceImage,
+      fileimage_prefix: fileimagePrefix,
+    },
+    loader_stacks: loaderStacks,
+    loras: structuredCloneCompat(defaultStack?.loras || []),
+    loader_globals: normalizeLoaderGlobals(defaultStack?.loader_globals || character?.loader_globals || {}),
+    settings: normalizeSettings(prompt?.settings || {}),
+    text_boxes: textBoxes.map((box) => structuredCloneCompat(box)),
+    positive_prompt: String(positiveBox?.text ?? prompt?.positive ?? ""),
+    negative_prompt: String(negativeBox?.text ?? prompt?.negative ?? ""),
+    reference_image: referenceImage,
+    fileimage_prefix: fileimagePrefix,
+  };
+}
+
+function mutateQueuedDoraLoaders(promptPayload, managerNode, character, payload) {
+  const controlled = getControlledNodes(managerNode).filter((node) => node && node !== managerNode);
+  const controlledLoaders = controlled.filter(isDoraLoaderNode);
+  const legacyLoaders = controlledLoaders.length ? [] : uniqueNodes(getOutputTargets(managerNode, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
+  const loaders = controlledLoaders.length ? controlledLoaders : legacyLoaders;
+  let changed = 0;
+  for (const loader of loaders) {
+    changed += setQueuedInput(promptPayload, loader, "dora_state", payload, { addIfMissing: true, syncWidget: false });
+  }
+  return changed;
+}
+
+function mutateQueuedStateTextBoxes(promptPayload, managerNode, prompt) {
+  const controlled = getControlledNodes(managerNode).filter((node) => node && node !== managerNode);
+  const textNodes = controlled.filter(isStateTextNode);
+  let changed = 0;
+  for (const [index, textNode] of textNodes.entries()) {
+    const role = getStateTextRole(textNode);
+    const slot = getStateTextSlot(textNode, role, `${role}_${textNode?.id ?? index + 1}`);
+    const saved = findPromptTextBox(prompt, role, slot, { allowRoleFallback: false }) || findPromptTextBox(prompt, role, slot, { allowRoleFallback: true });
+    if (!saved) continue;
+    changed += setQueuedWidgetInput(promptPayload, textNode, "text", String(saved.text ?? ""));
+  }
+  return changed;
+}
+
+function mutateQueuedLegacyTextTargets(promptPayload, managerNode, prompt) {
+  let changed = 0;
+  const legacyTargets = [
+    { targets: getOutputTargets(managerNode, OUTPUT_NAMES.positive), role: "positive", text: getPromptText(prompt, "positive", "default") },
+    { targets: getOutputTargets(managerNode, OUTPUT_NAMES.negative), role: "negative", text: getPromptText(prompt, "negative", "default") },
+  ];
+  for (const group of legacyTargets) {
+    for (const target of group.targets) {
+      const inputName = target.inputName || (group.role === "negative" ? "negative" : "text");
+      changed += setQueuedInput(promptPayload, target.node, inputName, String(group.text ?? ""), { addIfMissing: true, syncWidget: true });
+      if (isImpactWildcardNode(target.node)) {
+        changed += setQueuedInput(promptPayload, target.node, "wildcard_text", String(group.text ?? ""), { addIfMissing: true, syncWidget: true });
+        changed += setQueuedInput(promptPayload, target.node, "populated_text", String(group.text ?? ""), { addIfMissing: true, syncWidget: true });
+      }
+    }
+  }
+  return changed;
+}
+
+
+function mutateQueuedSettingsNodes(promptPayload, managerNode, prompt) {
+  const controlled = getControlledNodes(managerNode).filter((node) => node && node !== managerNode && !isDoraLoaderNode(node) && !isStateTextNode(node));
+  const legacy = controlled.length ? [] : uniqueNodes([
+    ...getOutputTargets(managerNode, OUTPUT_NAMES.settings),
+    ...getOutputTargets(managerNode, OUTPUT_NAMES.seed),
+  ]).filter((node) => node && node !== managerNode && !isDoraLoaderNode(node) && !isStateTextNode(node));
+  const targets = controlled.length ? controlled : legacy;
+  const settings = normalizeSettings(prompt?.settings || {});
+  let changed = 0;
+  for (const node of targets) {
+    const snapshot = findSnapshotForNode(settings, node);
+    if (snapshot?.widgets) {
+      for (const [name, value] of Object.entries(snapshot.widgets)) {
+        changed += setQueuedInput(promptPayload, node, String(name), value, { addIfMissing: false, syncWidget: true });
+      }
+    }
+    if (isSeedNode(node)) {
+      const seed = extractSeedFromSettings(settings);
+      if (seed != null) {
+        for (const name of ["seed", "noise_seed", "value"]) {
+          const before = changed;
+          changed += setQueuedInput(promptPayload, node, name, seed, { addIfMissing: false, syncWidget: true });
+          if (changed !== before) break;
+        }
+      }
+    }
+  }
+  return changed;
+}
+
+function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
+  if (!promptPayload?.output) return 0;
+  let changed = 0;
+  const graphNodes = app?.graph?._nodes || [];
+  for (const node of graphNodes) {
+    if (!isStateManagerNode(node)) continue;
+    const widgets = getWidgets(node);
+    const { state, uiState } = getCurrentState(node);
+    if (!uiState.queue_prompt_wildcard && !uiState.queue_character_wildcard) continue;
+    const currentCharacterId = String(widgetValue(widgets.characterWidget, "") || "");
+    const currentPromptId = String(widgetValue(widgets.promptWidget, "") || "");
+    const { character, prompt } = selectQueuedCharacterAndPrompt(state, uiState, currentCharacterId, currentPromptId, queueIndex, total);
+    if (!character || !prompt) continue;
+    const payload = buildQueuedDoraStatePayload(character, prompt);
+    changed += setQueuedStateManagerSelection(promptPayload, node, character.id, prompt.id);
+    changed += mutateQueuedDoraLoaders(promptPayload, node, character, payload);
+    changed += mutateQueuedStateTextBoxes(promptPayload, node, prompt);
+    changed += mutateQueuedLegacyTextTargets(promptPayload, node, prompt);
+    changed += mutateQueuedSettingsNodes(promptPayload, node, prompt);
+  }
+  return changed;
+}
+
+
 function getStateSeedWidget(node) {
   return widgetByExactName(node, "seed") || (node?.widgets || []).find((widget) => /seed/i.test(`${widget?.name ?? ""} ${widget?.label ?? ""}`)) || null;
 }
@@ -3072,12 +3470,30 @@ function patchStateSeedNodeDef(nodeType) {
 function installStateSeedQueuePatch() {
   if (api.__dsmStateSeedQueuePatchInstalled || typeof api.queuePrompt !== "function") return;
   api.__dsmStateSeedQueuePatchInstalled = true;
+
+  if (!app.__dsmQueueSessionPatchInstalled && typeof app.queuePrompt === "function") {
+    app.__dsmQueueSessionPatchInstalled = true;
+    const originalAppQueuePrompt = app.queuePrompt;
+    app.queuePrompt = async function (number, batchCount, ...args) {
+      startDsmQueueSession(number, batchCount);
+      const startedAt = dsmQueueSession.startedAt;
+      try {
+        return await originalAppQueuePrompt.apply(this, [number, batchCount, ...args]);
+      } finally {
+        finishDsmQueueSession(startedAt);
+      }
+    };
+  }
+
   const originalQueuePrompt = api.queuePrompt;
   api.queuePrompt = async function (index, promptPayload, ...args) {
+    const queueIndex = nextDsmQueueIndex(index);
+    const total = Math.max(1, dsmQueueSession.total || 1);
     try {
       mutatePromptForStateSeeds(promptPayload);
+      mutatePromptForStateManagers(promptPayload, queueIndex, total);
     } catch (err) {
-      console.warn(`[${EXT_NAME}] failed to resolve State Manager Seed values before queue`, err);
+      console.warn(`[${EXT_NAME}] failed to resolve State Manager queue values before queue`, err);
     }
     return originalQueuePrompt.apply(this, [index, promptPayload, ...args]);
   };

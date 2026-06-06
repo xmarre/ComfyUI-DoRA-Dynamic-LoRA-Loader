@@ -462,7 +462,7 @@ class FlexibleOptionalInputType(dict):
 # DoRA state manager payload helpers
 # --------------------------------------------------------------------------------------
 
-_DORA_STATE_MANAGER_SCHEMA_VERSION = 1
+_DORA_STATE_MANAGER_SCHEMA_VERSION = 2
 _DORA_STATE_KIND = "dora_state_manager_state"
 _DORA_LORA_STACK_KIND = "dora_lora_stack"
 _DORA_STATE_SETTINGS_KIND = "dora_state_settings"
@@ -522,6 +522,8 @@ def _state_manager_default_state() -> Dict[str, Any]:
                             {"role": "negative", "slot": "default", "label": "Default negative", "text": ""},
                         ],
                         "settings": {},
+                        "reference_image": {},
+                        "fileimage_prefix": "",
                     }
                 ],
             }
@@ -941,6 +943,8 @@ def _normalize_manager_prompt(prompt: Any, index: int) -> Optional[Dict[str, Any
     prompt_id = _clean_state_id(prompt.get("id"), _state_manager_make_id("prompt", index))
     name = str(prompt.get("name") or f"Prompt {index + 1}").strip() or f"Prompt {index + 1}"
     settings = _normalize_settings_with_canonical_seed(prompt.get("settings", {}))
+    reference_image = _normalize_manager_thumbnail(prompt.get("reference_image", prompt.get("referenceImage", prompt.get("prompt_image", prompt.get("image", {})))))
+    fileimage_prefix = str(prompt.get("fileimage_prefix", prompt.get("filename_prefix", prompt.get("file_image_prefix", ""))) or "").strip()
     text_boxes = _normalize_manager_text_boxes(prompt)
     positive_box = next((box for box in text_boxes if box.get("role") == "positive" and box.get("slot") == "default"), None) or next((box for box in text_boxes if box.get("role") == "positive"), None)
     negative_box = next((box for box in text_boxes if box.get("role") == "negative" and box.get("slot") == "default"), None) or next((box for box in text_boxes if box.get("role") == "negative"), None)
@@ -951,6 +955,8 @@ def _normalize_manager_prompt(prompt: Any, index: int) -> Optional[Dict[str, Any
         "negative": str(negative_box.get("text", "") if negative_box else prompt.get("negative", prompt.get("negative_prompt", "")) or ""),
         "text_boxes": text_boxes,
         "settings": settings,
+        "reference_image": reference_image,
+        "fileimage_prefix": fileimage_prefix,
     }
 
 
@@ -1085,6 +1091,8 @@ def _resolve_dora_state_payload(
         "prompt": {
             "id": prompt.get("id", ""),
             "name": prompt.get("name", ""),
+            "reference_image": prompt.get("reference_image", {}),
+            "fileimage_prefix": str(prompt.get("fileimage_prefix", "") or ""),
         },
         "loader_stacks": loader_stacks,
         "loras": loras,
@@ -1093,6 +1101,8 @@ def _resolve_dora_state_payload(
         "text_boxes": text_boxes,
         "positive_prompt": positive,
         "negative_prompt": negative,
+        "reference_image": prompt.get("reference_image", {}),
+        "fileimage_prefix": str(prompt.get("fileimage_prefix", "") or ""),
     }
 
 
@@ -1159,10 +1169,10 @@ def _state_manager_thumbnail_path(thumbnail: Any) -> Optional[str]:
     return path
 
 
-def _load_state_manager_character_image(character: Dict[str, Any]) -> torch.Tensor:
-    path = _state_manager_thumbnail_path(character.get("thumbnail", {}) if isinstance(character, dict) else {})
+def _try_load_state_manager_image_from_info(image_info: Any, label: str = "image") -> Optional[torch.Tensor]:
+    path = _state_manager_thumbnail_path(image_info)
     if not path:
-        return _state_manager_blank_image()
+        return None
     try:
         import numpy as np
         from PIL import Image, ImageOps
@@ -1172,11 +1182,30 @@ def _load_state_manager_character_image(character: Dict[str, Any]) -> torch.Tens
             img = img.convert("RGB")
             arr = np.asarray(img, dtype=np.float32) / 255.0
         if arr.ndim != 3 or arr.shape[-1] != 3:
-            return _state_manager_blank_image()
+            return None
         return torch.from_numpy(arr)[None, ...]
     except Exception as exc:
-        _LOG.warning("[State Manager] failed to load character image %r: %s", path, exc)
-        return _state_manager_blank_image()
+        _LOG.warning("[State Manager] failed to load %s %r: %s", label, path, exc)
+        return None
+
+
+def _load_state_manager_image_from_info(image_info: Any, label: str = "image") -> torch.Tensor:
+    image = _try_load_state_manager_image_from_info(image_info, label)
+    if image is not None:
+        return image
+    return _state_manager_blank_image()
+
+
+def _load_state_manager_character_image(character: Dict[str, Any]) -> torch.Tensor:
+    return _load_state_manager_image_from_info(character.get("thumbnail", {}) if isinstance(character, dict) else {}, "character image")
+
+
+def _load_state_manager_prompt_or_character_image(character: Dict[str, Any], prompt: Dict[str, Any]) -> torch.Tensor:
+    prompt_image = prompt.get("reference_image", {}) if isinstance(prompt, dict) else {}
+    prompt_tensor = _try_load_state_manager_image_from_info(prompt_image, "prompt reference image")
+    if prompt_tensor is not None:
+        return prompt_tensor
+    return _load_state_manager_character_image(character)
 
 
 def _extract_seed_from_settings(settings: Any, fallback: int = 0) -> int:
@@ -1259,6 +1288,8 @@ def _normalize_runtime_dora_state_payload(raw: Any) -> Optional[Dict[str, Any]]:
         "text_boxes": text_boxes,
         "positive_prompt": str(positive_box.get("text", "") if positive_box else payload.get("positive_prompt", "") or ""),
         "negative_prompt": str(negative_box.get("text", "") if negative_box else payload.get("negative_prompt", "") or ""),
+        "reference_image": _normalize_manager_thumbnail(payload.get("reference_image", payload.get("prompt", {}).get("reference_image", {}) if isinstance(payload.get("prompt"), dict) else {})),
+        "fileimage_prefix": str(payload.get("fileimage_prefix", payload.get("prompt", {}).get("fileimage_prefix", "") if isinstance(payload.get("prompt"), dict) else "") or ""),
     }
 
 
@@ -4118,7 +4149,7 @@ class StateManager:
             }
         }
 
-    RETURN_TYPES = ("DORA_STATE", "STRING", "STRING", "STRING", "DORA_LORA_STACK", "DORA_STATE_SETTINGS", "INT", "STATE_MANAGER_CONTROL", "IMAGE")
+    RETURN_TYPES = ("DORA_STATE", "STRING", "STRING", "STRING", "DORA_LORA_STACK", "DORA_STATE_SETTINGS", "INT", "STATE_MANAGER_CONTROL", "IMAGE", "STRING")
     RETURN_NAMES = (
         "dora_state",
         "positive_prompt_template",
@@ -4129,6 +4160,7 @@ class StateManager:
         "seed",
         "state_control",
         "character_image",
+        "fileimage_prefix",
     )
     FUNCTION = "resolve_state"
     CATEGORY = "state managers"
@@ -4191,7 +4223,8 @@ class StateManager:
         seed = _extract_seed_from_settings(settings)
         state = _normalize_state_manager_state(state_json)
         character = _pick_state_manager_character(state, selected_character_id)
-        character_image = _load_state_manager_character_image(character)
+        prompt = _pick_state_manager_prompt(character, selected_prompt_id)
+        character_image = _load_state_manager_prompt_or_character_image(character, prompt)
         return (
             payload,
             payload.get("positive_prompt", ""),
@@ -4202,6 +4235,7 @@ class StateManager:
             seed,
             state_control_payload,
             character_image,
+            payload.get("fileimage_prefix", ""),
         )
 
 
