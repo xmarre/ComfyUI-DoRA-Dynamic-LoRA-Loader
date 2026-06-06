@@ -1169,10 +1169,10 @@ def _state_manager_thumbnail_path(thumbnail: Any) -> Optional[str]:
     return path
 
 
-def _load_state_manager_image_from_info(image_info: Any, label: str = "image") -> torch.Tensor:
+def _try_load_state_manager_image_from_info(image_info: Any, label: str = "image") -> Optional[torch.Tensor]:
     path = _state_manager_thumbnail_path(image_info)
     if not path:
-        return _state_manager_blank_image()
+        return None
     try:
         import numpy as np
         from PIL import Image, ImageOps
@@ -1182,11 +1182,18 @@ def _load_state_manager_image_from_info(image_info: Any, label: str = "image") -
             img = img.convert("RGB")
             arr = np.asarray(img, dtype=np.float32) / 255.0
         if arr.ndim != 3 or arr.shape[-1] != 3:
-            return _state_manager_blank_image()
+            return None
         return torch.from_numpy(arr)[None, ...]
     except Exception as exc:
         _LOG.warning("[State Manager] failed to load %s %r: %s", label, path, exc)
-        return _state_manager_blank_image()
+        return None
+
+
+def _load_state_manager_image_from_info(image_info: Any, label: str = "image") -> torch.Tensor:
+    image = _try_load_state_manager_image_from_info(image_info, label)
+    if image is not None:
+        return image
+    return _state_manager_blank_image()
 
 
 def _load_state_manager_character_image(character: Dict[str, Any]) -> torch.Tensor:
@@ -1195,8 +1202,9 @@ def _load_state_manager_character_image(character: Dict[str, Any]) -> torch.Tens
 
 def _load_state_manager_prompt_or_character_image(character: Dict[str, Any], prompt: Dict[str, Any]) -> torch.Tensor:
     prompt_image = prompt.get("reference_image", {}) if isinstance(prompt, dict) else {}
-    if _state_manager_thumbnail_path(prompt_image):
-        return _load_state_manager_image_from_info(prompt_image, "prompt reference image")
+    prompt_tensor = _try_load_state_manager_image_from_info(prompt_image, "prompt reference image")
+    if prompt_tensor is not None:
+        return prompt_tensor
     return _load_state_manager_character_image(character)
 
 

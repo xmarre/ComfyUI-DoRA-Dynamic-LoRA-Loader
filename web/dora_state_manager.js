@@ -281,7 +281,7 @@ function defaultCharacter() {
 }
 
 function defaultState() {
-  return { version: 1, characters: [defaultCharacter()] };
+  return { version: 2, characters: [defaultCharacter()] };
 }
 
 function defaultUiState() {
@@ -548,7 +548,7 @@ function normalizeState(raw) {
   const parsed = safeJsonParse(raw, defaultState());
   const charsIn = Array.isArray(parsed.characters) ? parsed.characters : [];
   const characters = charsIn.map(normalizeCharacter).filter(Boolean);
-  return { version: 1, characters: characters.length ? characters : [defaultCharacter()] };
+  return { version: 2, characters: characters.length ? characters : [defaultCharacter()] };
 }
 
 function normalizeIdList(value) {
@@ -3240,9 +3240,14 @@ function mutateQueuedLegacyTextTargets(promptPayload, managerNode, prompt) {
 
 function mutateQueuedSettingsNodes(promptPayload, managerNode, prompt) {
   const controlled = getControlledNodes(managerNode).filter((node) => node && node !== managerNode && !isDoraLoaderNode(node) && !isStateTextNode(node));
+  const legacy = controlled.length ? [] : uniqueNodes([
+    ...getOutputTargets(managerNode, OUTPUT_NAMES.settings),
+    ...getOutputTargets(managerNode, OUTPUT_NAMES.seed),
+  ]).filter((node) => node && node !== managerNode && !isDoraLoaderNode(node) && !isStateTextNode(node));
+  const targets = controlled.length ? controlled : legacy;
   const settings = normalizeSettings(prompt?.settings || {});
   let changed = 0;
-  for (const node of controlled) {
+  for (const node of targets) {
     const snapshot = findSnapshotForNode(settings, node);
     if (snapshot?.widgets) {
       for (const [name, value] of Object.entries(snapshot.widgets)) {
