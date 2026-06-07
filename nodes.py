@@ -1764,13 +1764,152 @@ def _auto_strength_describe_device(value: Any) -> str:
         return "unknown"
 
 
+_AUTO_STRENGTH_JSON_MAX_DEPTH = 32
+_AUTO_STRENGTH_JSON_MAX_ITEMS = 2048
+_AUTO_STRENGTH_JSON_MAX_STRING_CHARS = 32768
+
+
+def _auto_strength_json_truncate_string(value: str) -> str:
+    if len(value) <= _AUTO_STRENGTH_JSON_MAX_STRING_CHARS:
+        return value
+    omitted = len(value) - _AUTO_STRENGTH_JSON_MAX_STRING_CHARS
+    return value[:_AUTO_STRENGTH_JSON_MAX_STRING_CHARS] + f"... <truncated {omitted} chars>"
+
+
+def _auto_strength_json_safe(
+    value: Any,
+    *,
+    _depth: int = 0,
+    _seen: Optional[Set[int]] = None,
+) -> Any:
+    """
+    Convert auto-strength diagnostics to a bounded, JSON-safe structure.
+
+    This is intentionally report-only. It must not mutate or approximate the LoRA
+    tensors used for actual loading. Diagnostic serialization should degrade to a
+    bounded report instead of crashing generation.
+    """
+    if _seen is None:
+        _seen = set()
+
+    if _depth > _AUTO_STRENGTH_JSON_MAX_DEPTH:
+        return "<max-depth>"
+
+    if value is None or isinstance(value, bool):
+        return value
+
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+
+    if isinstance(value, str):
+        return _auto_strength_json_truncate_string(value)
+
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return _auto_strength_json_truncate_string(value.decode("utf-8", errors="replace"))
+        except Exception:
+            return _auto_strength_json_truncate_string(repr(value))
+
+    if isinstance(value, torch.Tensor):
+        try:
+            return {
+                "__type__": "torch.Tensor",
+                "shape": [int(x) for x in value.shape],
+                "dtype": str(value.dtype),
+                "device": str(value.device),
+            }
+        except Exception:
+            return {"__type__": "torch.Tensor"}
+
+    if isinstance(value, torch.device):
+        return str(value)
+
+    if isinstance(value, torch.dtype):
+        return str(value)
+
+    if isinstance(value, Mapping):
+        object_id = id(value)
+        if object_id in _seen:
+            return "<cycle>"
+        _seen.add(object_id)
+        try:
+            out: Dict[str, Any] = {}
+            omitted = 0
+            for index, item in enumerate(value.items()):
+                if index >= _AUTO_STRENGTH_JSON_MAX_ITEMS:
+                    try:
+                        omitted = max(0, len(value) - _AUTO_STRENGTH_JSON_MAX_ITEMS)
+                    except Exception:
+                        omitted = 1
+                    break
+                try:
+                    key, item_value = item
+                except Exception:
+                    continue
+                try:
+                    key_text = str(key)
+                except Exception:
+                    key_text = repr(key)
+                key_text = _auto_strength_json_truncate_string(key_text)
+                out[key_text] = _auto_strength_json_safe(item_value, _depth=_depth + 1, _seen=_seen)
+            if omitted:
+                out["__auto_strength_report_truncated__"] = True
+                out["__omitted_items__"] = omitted
+            return out
+        finally:
+            _seen.discard(object_id)
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        object_id = id(value)
+        if object_id in _seen:
+            return "<cycle>"
+        _seen.add(object_id)
+        try:
+            out: List[Any] = []
+            limit = min(len(value), _AUTO_STRENGTH_JSON_MAX_ITEMS)
+            for index in range(limit):
+                out.append(_auto_strength_json_safe(value[index], _depth=_depth + 1, _seen=_seen))
+            omitted = max(0, len(value) - limit)
+            if omitted:
+                out.append({"__auto_strength_report_truncated__": True, "__omitted_items__": omitted})
+            return out
+        except Exception:
+            return _auto_strength_json_truncate_string(repr(value))
+        finally:
+            _seen.discard(object_id)
+
+    try:
+        if hasattr(value, "item") and callable(value.item):
+            return _auto_strength_json_safe(value.item(), _depth=_depth + 1, _seen=_seen)
+    except Exception:
+        pass
+
+    try:
+        return _auto_strength_json_truncate_string(str(value))
+    except Exception:
+        return "<unserializable>"
+
+
 def _auto_strength_json_dumps(value: Any, *, pretty: bool = False) -> str:
     kwargs = {"ensure_ascii": False, "sort_keys": False}
     if pretty:
         kwargs["indent"] = 2
     else:
         kwargs["separators"] = (",", ":")
-    return json.dumps(value, **kwargs)
+    safe_value = _auto_strength_json_safe(value)
+    try:
+        return json.dumps(safe_value, allow_nan=False, **kwargs)
+    except Exception as exc:
+        _LOG.warning("[DoRA Power LoRA Loader] failed to serialize auto-strength report JSON: %s", exc)
+        fallback = {
+            "schema": 1,
+            "kind": "dora_power_lora_auto_strength_stack_report",
+            "serialization_error": str(exc),
+        }
+        return json.dumps(fallback, allow_nan=False, **kwargs)
 
 
 def _src_has_dora_params(lora_sd: Dict[str, Any], base: str) -> bool:
