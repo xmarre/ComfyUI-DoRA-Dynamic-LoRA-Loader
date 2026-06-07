@@ -1695,6 +1695,19 @@ _UP_ONLY_SCALE_SUFFIXES = (
 _RESHAPE_WEIGHT_MAX_DIMS = 8
 
 
+def _canonical_reshape_weight_dim(value: Any) -> Optional[int]:
+    """Return a positive integer dimension when value is safe shape metadata."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float) and math.isfinite(value) and value > 0:
+        rounded = round(value)
+        if abs(value - rounded) <= 1e-6:
+            return int(rounded)
+    return None
+
+
 def _sanitize_reshape_weight_metadata(lora_sd: Dict[str, Any], lora_name: str = "", verbose: bool = False) -> int:
     """
     Keep .reshape_weight keys only when they are small shape metadata.
@@ -1713,6 +1726,7 @@ def _sanitize_reshape_weight_metadata(lora_sd: Dict[str, Any], lora_name: str = 
             continue
         value = lora_sd.get(key)
         valid = False
+        canonical_vals = None
         reason = "unsupported value"
 
         try:
@@ -1725,34 +1739,30 @@ def _sanitize_reshape_weight_metadata(lora_sd: Dict[str, Any], lora_name: str = 
                     reason = f"not shape metadata (shape={tuple(value.shape)} numel={numel})"
                 else:
                     vals = value.detach().cpu().flatten().tolist()
-                    valid = 0 < len(vals) <= _RESHAPE_WEIGHT_MAX_DIMS and all(
-                        isinstance(v, (int, float))
-                        and math.isfinite(float(v))
-                        and int(v) > 0
-                        and abs(float(v) - int(v)) <= 1e-6
-                        for v in vals
-                    )
+                    if 0 < len(vals) <= _RESHAPE_WEIGHT_MAX_DIMS:
+                        canonical_vals = [_canonical_reshape_weight_dim(v) for v in vals]
+                        valid = all(v is not None for v in canonical_vals)
                     if not valid:
                         reason = f"non-integer shape values ({vals!r})"
             elif isinstance(value, (list, tuple)):
                 vals = list(value)
-                valid = 0 < len(vals) <= _RESHAPE_WEIGHT_MAX_DIMS and all(
-                    isinstance(v, (int, float))
-                    and math.isfinite(float(v))
-                    and int(v) > 0
-                    and abs(float(v) - int(v)) <= 1e-6
-                    for v in vals
-                )
+                if 0 < len(vals) <= _RESHAPE_WEIGHT_MAX_DIMS:
+                    canonical_vals = [_canonical_reshape_weight_dim(v) for v in vals]
+                    valid = all(v is not None for v in canonical_vals)
                 if not valid:
                     reason = f"invalid shape list ({vals!r})"
             else:
                 reason = f"unsupported type {type(value).__name__}"
-        except Exception as exc:
+        except (RuntimeError, TypeError, ValueError, OverflowError) as exc:
             valid = False
             reason = str(exc)
 
         if valid:
-            continue
+            try:
+                lora_sd[key] = torch.tensor(canonical_vals, dtype=torch.int64)
+                continue
+            except (RuntimeError, TypeError, ValueError, OverflowError) as exc:
+                reason = str(exc)
 
         lora_sd.pop(key, None)
         removed += 1
