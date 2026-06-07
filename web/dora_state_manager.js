@@ -461,13 +461,20 @@ function normalizeLoaderStacks(character) {
     stacks.push(normalized);
   });
 
+  const legacyGlobals = normalizeLoaderGlobals({
+    ...(c.globals && typeof c.globals === "object" ? c.globals : {}),
+    ...(c.loader_globals && typeof c.loader_globals === "object" ? c.loader_globals : {}),
+  });
   if (!stacks.length) {
     stacks.push({
       slot: "default",
       label: "Default loader",
       loras: Array.isArray(c.loras) ? c.loras.map(normalizeLoraRow).filter(Boolean) : [],
-      loader_globals: normalizeLoaderGlobals(c.loader_globals ?? c.globals),
+      loader_globals: legacyGlobals,
     });
+  } else if (Object.keys(legacyGlobals).length) {
+    const primary = stacks.find((stack) => normalizeLoaderSlot(stack.slot, "default") === "default") || stacks[0];
+    if (primary && !Object.keys(primary.loader_globals || {}).length) primary.loader_globals = legacyGlobals;
   }
   return stacks;
 }
@@ -493,6 +500,19 @@ function findCharacterLoaderStack(character, slot, { allowFallback = true } = {}
   if (exact) return exact;
   if (!allowFallback) return null;
   return stacks.find((stack) => stack.slot === "default") || stacks[0] || null;
+}
+
+function updateCharacterLoaderGlobals(character, stackOrSlot, patch) {
+  const slot = normalizeLoaderSlot(
+    typeof stackOrSlot === "string" ? stackOrSlot : stackOrSlot?.slot,
+    "default"
+  );
+  const stack = findCharacterLoaderStack(character, slot, { allowFallback: false });
+  if (!stack) return {};
+  const current = normalizeLoaderGlobals(stack.loader_globals || {});
+  stack.loader_globals = normalizeLoaderGlobals({ ...current, ...(patch || {}) });
+  syncLegacyLoaderMirror(character);
+  return stack.loader_globals;
 }
 
 function setCharacterLoaderStack(character, stack) {
@@ -2841,23 +2861,19 @@ function renderLoraStackEditor(section, node, state, uiState, character, prompt,
   globalsLine.className = "dsm-grid2";
   globalsLine.append(
     labelledControl("Stack enabled", makeCheckbox(globals.stack_enabled ?? true, (checked) => {
-      stack.loader_globals = normalizeLoaderGlobals({ ...globals, stack_enabled: checked });
-      syncLegacyLoaderMirror(character);
+      updateCharacterLoaderGlobals(character, stack, { stack_enabled: checked });
       updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
     })),
     labelledControl("Auto-strength", makeCheckbox(globals.auto_strength_enabled ?? false, (checked) => {
-      stack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_enabled: checked });
-      syncLegacyLoaderMirror(character);
+      updateCharacterLoaderGlobals(character, stack, { auto_strength_enabled: checked });
       updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
     })),
     labelledControl("Analysis device", makeSelect(AUTO_STRENGTH_DEVICE_CHOICES, normalizeDevice(globals.auto_strength_device ?? "gpu"), (value) => {
-      stack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_device: value });
-      syncLegacyLoaderMirror(character);
+      updateCharacterLoaderGlobals(character, stack, { auto_strength_device: value });
       updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
     })),
     labelledControl("Ratio ceiling", makeInput(globals.auto_strength_ratio_ceiling ?? 1.5, (value) => {
-      stack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_ratio_ceiling: normalizeNumber(value, 1.5) });
-      syncLegacyLoaderMirror(character);
+      updateCharacterLoaderGlobals(character, stack, { auto_strength_ratio_ceiling: normalizeNumber(value, 1.5) });
       updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
     }, { type: "number", step: "0.01" }))
   );
@@ -2954,43 +2970,35 @@ function renderSettingsPanelContent(section, node, state, uiState, character, pr
   grid.className = "dsm-grid2";
 
   const stackEnabled = makeCheckbox(globals.stack_enabled ?? true, (checked) => {
-    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, stack_enabled: checked });
-    syncLegacyLoaderMirror(character);
+    updateCharacterLoaderGlobals(character, primaryStack, { stack_enabled: checked });
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
   const autoStrength = makeCheckbox(globals.auto_strength_enabled ?? false, (checked) => {
-    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_enabled: checked });
-    syncLegacyLoaderMirror(character);
+    updateCharacterLoaderGlobals(character, primaryStack, { auto_strength_enabled: checked });
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
   const device = makeSelect(AUTO_STRENGTH_DEVICE_CHOICES, normalizeDevice(globals.auto_strength_device ?? "gpu"), (value) => {
-    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_device: value });
-    syncLegacyLoaderMirror(character);
+    updateCharacterLoaderGlobals(character, primaryStack, { auto_strength_device: value });
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
   const broadcastMods = makeCheckbox(globals.broadcast_modulations ?? true, (checked) => {
-    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, broadcast_modulations: checked });
-    syncLegacyLoaderMirror(character);
+    updateCharacterLoaderGlobals(character, primaryStack, { broadcast_modulations: checked });
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
   const floor = makeInput(globals.auto_strength_ratio_floor ?? 0.3, (value) => {
-    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_ratio_floor: normalizeNumber(value, 0.3) });
-    syncLegacyLoaderMirror(character);
+    updateCharacterLoaderGlobals(character, primaryStack, { auto_strength_ratio_floor: normalizeNumber(value, 0.3) });
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   }, { type: "number", step: "0.01" });
   const ceiling = makeInput(globals.auto_strength_ratio_ceiling ?? 1.5, (value) => {
-    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, auto_strength_ratio_ceiling: normalizeNumber(value, 1.5) });
-    syncLegacyLoaderMirror(character);
+    updateCharacterLoaderGlobals(character, primaryStack, { auto_strength_ratio_ceiling: normalizeNumber(value, 1.5) });
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   }, { type: "number", step: "0.01" });
   const sliceFix = makeCheckbox(globals.dora_slice_fix ?? true, (checked) => {
-    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, dora_slice_fix: checked });
-    syncLegacyLoaderMirror(character);
+    updateCharacterLoaderGlobals(character, primaryStack, { dora_slice_fix: checked });
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
   const adalnFix = makeCheckbox(globals.dora_adaln_swap_fix ?? true, (checked) => {
-    primaryStack.loader_globals = normalizeLoaderGlobals({ ...globals, dora_adaln_swap_fix: checked });
-    syncLegacyLoaderMirror(character);
+    updateCharacterLoaderGlobals(character, primaryStack, { dora_adaln_swap_fix: checked });
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
 
@@ -3412,6 +3420,31 @@ function buildQueuedDoraStatePayload(character, prompt) {
   };
 }
 
+function buildQueuedDoraLoaderPayload(character) {
+  syncLegacyLoaderMirror(character);
+  const loaderStacks = getCharacterLoaderStacks(character).map((stack) => structuredCloneCompat(stack));
+  const defaultStack = findCharacterLoaderStack(character, "default") || loaderStacks[0] || defaultLoaderStack();
+  return {
+    version: 2,
+    kind: "dora_state_manager_state",
+    character: {
+      id: String(character?.id ?? ""),
+      name: String(character?.name ?? ""),
+      thumbnail: normalizeThumbnail(character?.thumbnail),
+    },
+    prompt: { id: "", name: "" },
+    loader_stacks: loaderStacks,
+    loras: structuredCloneCompat(defaultStack?.loras || []),
+    loader_globals: normalizeLoaderGlobals(defaultStack?.loader_globals || character?.loader_globals || {}),
+    settings: {},
+    text_boxes: [],
+    positive_prompt: "",
+    negative_prompt: "",
+    reference_image: {},
+    fileimage_prefix: "",
+  };
+}
+
 function applyRuntimeSeedToSettings(settings, seed) {
   const normalized = normalizeSettings(settings);
   normalized.seed = seed;
@@ -3452,14 +3485,16 @@ function withRuntimeSeed(payload, seed) {
   };
 }
 
-function mutateQueuedDoraLoaders(promptPayload, managerNode, character, payload) {
+function mutateQueuedDoraLoaders(promptPayload, managerNode, character) {
   const controlled = getControlledNodes(managerNode).filter((node) => node && node !== managerNode);
   const controlledLoaders = controlled.filter(isDoraLoaderNode);
   const legacyLoaders = controlledLoaders.length ? [] : uniqueNodes(getOutputTargets(managerNode, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
   const loaders = controlledLoaders.length ? controlledLoaders : legacyLoaders;
+  if (!loaders.length) return 0;
+  const loaderPayload = buildQueuedDoraLoaderPayload(character);
   let changed = 0;
   for (const loader of loaders) {
-    changed += setQueuedInput(promptPayload, loader, "dora_state", payload, { addIfMissing: true, syncWidget: false });
+    changed += setQueuedInput(promptPayload, loader, "dora_state", loaderPayload, { addIfMissing: true, syncWidget: false });
   }
   return changed;
 }
@@ -3547,7 +3582,7 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
     }
     changed += setQueuedStateManagerSelection(promptPayload, node, character.id, prompt.id);
     changed += setQueuedStateManagerRuntimeState(promptPayload, node, uiState, payload, queueIndex, total);
-    changed += mutateQueuedDoraLoaders(promptPayload, node, character, payload);
+    changed += mutateQueuedDoraLoaders(promptPayload, node, character);
     changed += mutateQueuedStateTextBoxes(promptPayload, node, prompt);
     changed += mutateQueuedLegacyTextTargets(promptPayload, node, prompt);
     changed += mutateQueuedSettingsNodes(promptPayload, node, payload.settings);
