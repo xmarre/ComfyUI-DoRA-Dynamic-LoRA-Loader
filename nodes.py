@@ -1667,7 +1667,6 @@ _BASE_SUFFIXES = [
     ".diff",
     ".diff_b",
     ".set_weight",
-    ".reshape_weight",
 ]
 
 _SCALEABLE_SUFFIXES = (
@@ -1675,7 +1674,6 @@ _SCALEABLE_SUFFIXES = (
     ".diff",
     ".diff_b",
     ".set_weight",
-    ".reshape_weight",
     # mochi-style (no .weight suffix)
     ".lora_A",
     ".lora_B",
@@ -1693,6 +1691,82 @@ _UP_ONLY_SCALE_SUFFIXES = (
     # mochi-style (no .weight suffix)
     ".lora_A",
 )
+
+_RESHAPE_WEIGHT_MAX_DIMS = 8
+
+
+def _sanitize_reshape_weight_metadata(lora_sd: Dict[str, Any], lora_name: str = "", verbose: bool = False) -> int:
+    """
+    Keep .reshape_weight keys only when they are small shape metadata.
+
+    ComfyUI's LoRAAdapter.load() treats <base>.reshape_weight as a shape list and
+    calls .tolist() on it while constructing the adapter. If a malformed/exported
+    LoRA stores a real tensor under that suffix, the direct .tolist() can allocate a
+    huge nested Python object or crash in native code before Python can raise a
+    normal exception. The loader does not support .reshape_weight as an independent
+    weight patch, so invalid entries are report/debug data at best and must not be
+    passed into comfy.lora.load_lora(...).
+    """
+    removed = 0
+    for key in list(lora_sd.keys()):
+        if not str(key).endswith(".reshape_weight"):
+            continue
+        value = lora_sd.get(key)
+        valid = False
+        reason = "unsupported value"
+
+        try:
+            if isinstance(value, torch.Tensor):
+                numel = int(value.numel())
+                ndim = int(value.ndim)
+                if numel <= 0:
+                    reason = "empty tensor"
+                elif numel > _RESHAPE_WEIGHT_MAX_DIMS or ndim > 1:
+                    reason = f"not shape metadata (shape={tuple(value.shape)} numel={numel})"
+                else:
+                    vals = value.detach().cpu().flatten().tolist()
+                    valid = 0 < len(vals) <= _RESHAPE_WEIGHT_MAX_DIMS and all(
+                        isinstance(v, (int, float))
+                        and math.isfinite(float(v))
+                        and int(v) > 0
+                        and abs(float(v) - int(v)) <= 1e-6
+                        for v in vals
+                    )
+                    if not valid:
+                        reason = f"non-integer shape values ({vals!r})"
+            elif isinstance(value, (list, tuple)):
+                vals = list(value)
+                valid = 0 < len(vals) <= _RESHAPE_WEIGHT_MAX_DIMS and all(
+                    isinstance(v, (int, float))
+                    and math.isfinite(float(v))
+                    and int(v) > 0
+                    and abs(float(v) - int(v)) <= 1e-6
+                    for v in vals
+                )
+                if not valid:
+                    reason = f"invalid shape list ({vals!r})"
+            else:
+                reason = f"unsupported type {type(value).__name__}"
+        except Exception as exc:
+            valid = False
+            reason = str(exc)
+
+        if valid:
+            continue
+
+        lora_sd.pop(key, None)
+        removed += 1
+        _LOG.warning(
+            "[DoRA Power LoRA Loader] %s: dropping unsafe %s before comfy.lora.load_lora: %s",
+            lora_name or "LoRA",
+            key,
+            reason,
+        )
+
+    if verbose and removed:
+        _LOG.info("[DoRA Power LoRA Loader] %s: dropped %d unsafe reshape_weight metadata entries", lora_name, removed)
+    return removed
+
 
 _LORA_DIRECTION_SUFFIX_PAIRS = (
     (".lora_up.weight", ".lora_down.weight"),
@@ -1729,7 +1803,6 @@ _BROADCAST_DELTA_SUFFIXES = (
     ".diff",
     ".diff_b",
     ".set_weight",
-    ".reshape_weight",
 )
 
 # For OneTrainer DoRA exports, modulation modules often include DoRA params.
@@ -2249,7 +2322,6 @@ _ZIMAGE_QKV_CAT_SUFFIXES = (
     ".diff",
     ".diff_b",
     ".set_weight",
-    ".reshape_weight",
 )
 
 _ZIMAGE_ATTN_ALIAS_REWRITES = (
@@ -3230,7 +3302,7 @@ def _auto_strength_measure_base_delta_on_device(
     Supported cases:
       - standard LoRA / DoRA low-rank pairs / direct deltas: RMS(delta)
       - DoRA low-rank pairs: RMS(actual post-normalization DoRA update)
-      - direct delta tensors (.diff / .diff_b / .set_weight / .reshape_weight)
+      - direct delta tensors (.diff / .diff_b / .set_weight)
 
     Invariant: scores must be comparable across destination tensor sizes. Using raw
     Frobenius norms violates that invariant because ||ΔW||_F scales with sqrt(numel),
@@ -3255,7 +3327,7 @@ def _auto_strength_measure_base_delta_on_device(
             analysis_device=analysis_device,
         )
 
-    for suffix in (".diff", ".diff_b", ".set_weight", ".reshape_weight"):
+    for suffix in (".diff", ".diff_b", ".set_weight"):
         key = base + suffix
         tensor = lora_sd.get(key)
         if not isinstance(tensor, torch.Tensor):
@@ -3788,7 +3860,7 @@ def _apply_base_strength_ratios(
             should_scale = False
             if ks.endswith(".alpha"):
                 should_scale = True
-            elif ks.endswith((".diff", ".diff_b", ".set_weight", ".reshape_weight")):
+            elif ks.endswith((".diff", ".diff_b", ".set_weight")):
                 should_scale = True
             elif (not has_alpha) and ks.endswith(_UP_ONLY_SCALE_SUFFIXES):
                 should_scale = True
@@ -5030,6 +5102,8 @@ class DoraPowerLoraLoader:
                 broadcast_include_dora_scale=broadcast_include_dora_scale,
                 auto_strength_logical_groups=auto_strength_logical_groups,
             )
+
+        _sanitize_reshape_weight_metadata(lora_sd, lora_name=lora_name, verbose=verbose)
 
         # Extract base module names from file keys (after compat rewrites/broadcast).
         lora_bases = _extract_lora_bases(lora_sd.keys())
