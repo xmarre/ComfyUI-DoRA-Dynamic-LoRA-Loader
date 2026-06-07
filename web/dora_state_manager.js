@@ -461,7 +461,10 @@ function normalizeLoaderStacks(character) {
     stacks.push(normalized);
   });
 
-  const legacyGlobals = normalizeLoaderGlobals(c.loader_globals ?? c.globals);
+  const legacyGlobals = normalizeLoaderGlobals({
+    ...(c.globals && typeof c.globals === "object" ? c.globals : {}),
+    ...(c.loader_globals && typeof c.loader_globals === "object" ? c.loader_globals : {}),
+  });
   if (!stacks.length) {
     stacks.push({
       slot: "default",

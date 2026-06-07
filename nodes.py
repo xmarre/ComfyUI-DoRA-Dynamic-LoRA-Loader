@@ -839,6 +839,17 @@ def _normalize_manager_loader_stack(stack: Any, index: int = 0) -> Optional[Dict
     }
 
 
+def _normalize_manager_legacy_loader_globals(character: Dict[str, Any]) -> Dict[str, Any]:
+    globals_in = character.get("globals")
+    loader_globals = character.get("loader_globals")
+    merged: Dict[str, Any] = {}
+    if isinstance(globals_in, dict):
+        merged.update(globals_in)
+    if isinstance(loader_globals, dict):
+        merged.update(loader_globals)
+    return _normalize_manager_loader_globals(merged)
+
+
 def _normalize_manager_loader_stacks(character: Dict[str, Any]) -> List[Dict[str, Any]]:
     stacks_in = character.get("loader_stacks")
     raw_stacks: List[Any] = []
@@ -867,7 +878,7 @@ def _normalize_manager_loader_stacks(character: Dict[str, Any]) -> List[Dict[str
         normalized["slot"] = slot
         stacks.append(normalized)
 
-    legacy_loader_globals = _normalize_manager_loader_globals(character.get("loader_globals", character.get("globals", {})))
+    legacy_loader_globals = _normalize_manager_legacy_loader_globals(character)
 
     # Legacy migration: previous versions stored one character-level LoRA stack.
     if not stacks:
@@ -1492,11 +1503,16 @@ def _loader_cache_entries(entries: Optional[List[Dict[str, Any]]]) -> List[Dict[
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
+        enabled = bool(entry.get("on", entry.get("enabled", True)))
+        if not enabled:
+            continue
         name = str(entry.get("lora", entry.get("name", "None")) or "None")
+        if name in {"", "None", "NONE"}:
+            continue
         sm = _loader_cache_float(entry.get("strength_model", entry.get("strength", 0.0)), 0.0)
         sc = _loader_cache_float(entry.get("strength_clip", entry.get("strengthTwo", sm)), sm)
         out.append({
-            "on": bool(entry.get("on", entry.get("enabled", True))),
+            "on": True,
             "lora": name,
             "strength_model": sm,
             "strength_clip": sc,
