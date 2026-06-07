@@ -867,6 +867,8 @@ def _normalize_manager_loader_stacks(character: Dict[str, Any]) -> List[Dict[str
         normalized["slot"] = slot
         stacks.append(normalized)
 
+    legacy_loader_globals = _normalize_manager_loader_globals(character.get("loader_globals", character.get("globals", {})))
+
     # Legacy migration: previous versions stored one character-level LoRA stack.
     if not stacks:
         rows_in = character.get("loras")
@@ -880,8 +882,18 @@ def _normalize_manager_loader_stacks(character: Dict[str, Any]) -> List[Dict[str
             "slot": "default",
             "label": "Default loader",
             "loras": legacy_rows,
-            "loader_globals": _normalize_manager_loader_globals(character.get("loader_globals", character.get("globals", {}))),
+            "loader_globals": legacy_loader_globals,
         })
+    elif legacy_loader_globals:
+        # Older State Manager saves can contain loader_stacks plus the actual loader
+        # globals only on the legacy character mirror. Preserve those globals for the
+        # default stack instead of normalizing them away.
+        default_stack = next(
+            (stack for stack in stacks if isinstance(stack, dict) and _clean_loader_slot(stack.get("slot", ""), "default") == "default"),
+            stacks[0],
+        )
+        if isinstance(default_stack, dict) and not default_stack.get("loader_globals"):
+            default_stack["loader_globals"] = legacy_loader_globals
 
     return stacks
 
@@ -1444,6 +1456,123 @@ def _state_payload_get_loader_global(state_payload: Optional[Dict[str, Any]], ke
         if isinstance(globals_in, dict) and key in globals_in:
             return globals_in[key]
     return fallback
+
+
+def _loader_cache_lora_file_signature(lora_name: Any) -> Dict[str, Any]:
+    name = str(lora_name or "None")
+    out: Dict[str, Any] = {"name": name}
+    if not name or name in {"None", "NONE"}:
+        return out
+    try:
+        path = folder_paths.get_full_path("loras", name)
+    except Exception:
+        path = None
+    if not path:
+        out["missing"] = True
+        return out
+    try:
+        st = os.stat(path)
+        out["size"] = int(st.st_size)
+        out["mtime_ns"] = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1000000000)))
+    except Exception:
+        out["path"] = str(path)
+    return out
+
+
+def _loader_cache_float(value: Any, fallback: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        out = float(fallback)
+    return out if math.isfinite(out) else float(fallback)
+
+
+def _loader_cache_entries(entries: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("lora", entry.get("name", "None")) or "None")
+        sm = _loader_cache_float(entry.get("strength_model", entry.get("strength", 0.0)), 0.0)
+        sc = _loader_cache_float(entry.get("strength_clip", entry.get("strengthTwo", sm)), sm)
+        out.append({
+            "on": bool(entry.get("on", entry.get("enabled", True))),
+            "lora": name,
+            "strength_model": sm,
+            "strength_clip": sc,
+            "file": _loader_cache_lora_file_signature(name),
+        })
+    return out
+
+
+def _loader_cache_globals(kwargs: Dict[str, Any], state_payload: Optional[Dict[str, Any]], state_slot: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key in sorted(_DORA_STATE_LOADER_GLOBAL_KEYS):
+        if key == "stack_enabled":
+            fallback = kwargs.get(key, True)
+        elif key in {"broadcast_auto_scale", "broadcast_modulations", "dora_slice_fix", "dora_adaln_swap_fix", "zimage_lumina2_compat"}:
+            fallback = kwargs.get(key, True)
+        elif key == "auto_strength_device":
+            fallback = kwargs.get(key, "gpu")
+        elif key == "auto_strength_ratio_floor":
+            fallback = kwargs.get(key, _AUTO_STRENGTH_RATIO_FLOOR)
+        elif key == "auto_strength_ratio_ceiling":
+            fallback = kwargs.get(key, _AUTO_STRENGTH_RATIO_CEILING)
+        elif key == "broadcast_scale":
+            fallback = kwargs.get(key, 1.0)
+        elif key in {"dora_decompose_debug_n"}:
+            fallback = kwargs.get(key, 30)
+        elif key in {"dora_decompose_debug_stack_depth"}:
+            fallback = kwargs.get(key, 10)
+        else:
+            fallback = kwargs.get(key, False)
+        value = _state_payload_get_loader_global(state_payload, key, fallback, state_slot) if state_payload is not None else fallback
+        if key in {
+            "stack_enabled",
+            "verbose",
+            "log_unloaded_keys",
+            "broadcast_auto_scale",
+            "broadcast_modulations",
+            "broadcast_include_dora_scale",
+            "dora_decompose_debug",
+            "dora_slice_fix",
+            "dora_adaln_swap_fix",
+            "zimage_lumina2_compat",
+            "auto_strength_enabled",
+        }:
+            out[key] = _state_manager_bool(value)
+        elif key in {"dora_decompose_debug_n", "dora_decompose_debug_stack_depth"}:
+            try:
+                out[key] = int(value)
+            except Exception:
+                out[key] = int(fallback)
+        elif key == "auto_strength_device":
+            out[key] = _normalize_auto_strength_device(value)
+        else:
+            out[key] = _loader_cache_float(value, _loader_cache_float(fallback, 0.0))
+    return out
+
+
+def _dora_loader_cache_key_from_inputs(model: Any, clip: Any, kwargs: Dict[str, Any]) -> str:
+    state_slot = _clean_loader_slot(kwargs.get("state_slot", "default"), "default")
+    state_payload = _normalize_runtime_dora_state_payload(kwargs.get("dora_state"))
+    if state_payload is None:
+        state_payload = _normalize_runtime_dora_state_payload(kwargs.get("state_control"))
+
+    entries = _parse_dora_state_lora_entries(state_payload, state_slot) if state_payload is not None else None
+    if entries is None:
+        entries = _parse_lora_stack_kwargs(kwargs)
+
+    payload = {
+        "schema": 2,
+        "kind": "dora_power_lora_loader_cache_key",
+        "model_identity": id(model) if model is not None else None,
+        "clip_identity": id(clip) if clip is not None else None,
+        "state_slot": state_slot,
+        "loras": _loader_cache_entries(entries),
+        "loader_globals": _loader_cache_globals(kwargs, state_payload, state_slot),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
 _LORA_MAGNITUDE_VECTOR_RE = re.compile(
     r"^(?P<base>.+?)\.lora_magnitude_vector(?:\.(?P<adapter>[A-Za-z0-9_-]+))?(?:\.weight)?$"
@@ -4738,6 +4867,10 @@ class DoraPowerLoraLoader:
     HAS_INTERMEDIATE_OUTPUT = True
     FUNCTION = "load_loras"
     CATEGORY = "loaders"
+
+    @classmethod
+    def IS_CHANGED(cls, model: Any = None, clip: Any = None, **kwargs):
+        return _dora_loader_cache_key_from_inputs(model, clip, kwargs)
 
     def _load_one(
         self,
