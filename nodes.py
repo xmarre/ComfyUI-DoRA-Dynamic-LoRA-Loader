@@ -1571,19 +1571,26 @@ def _loader_cache_globals(kwargs: Dict[str, Any], state_payload: Optional[Dict[s
 
 def _dora_loader_cache_key_from_inputs(model: Any, clip: Any, kwargs: Dict[str, Any]) -> str:
     state_slot = _clean_loader_slot(kwargs.get("state_slot", "default"), "default")
-    state_payload = _normalize_runtime_dora_state_payload(kwargs.get("dora_state"))
+    # Prefer state_control. It is the intended State Manager edge. dora_state remains
+    # a compatibility fallback for old workflows or direct runtime payload wiring.
+    state_payload = _normalize_runtime_dora_state_payload(kwargs.get("state_control"))
     if state_payload is None:
-        state_payload = _normalize_runtime_dora_state_payload(kwargs.get("state_control"))
+        state_payload = _normalize_runtime_dora_state_payload(kwargs.get("dora_state"))
 
     entries = _parse_dora_state_lora_entries(state_payload, state_slot) if state_payload is not None else None
     if entries is None:
         entries = _parse_lora_stack_kwargs(kwargs)
 
+    # Do not include Python object identity here. ComfyUI may recreate ModelPatcher / CLIP
+    # wrapper objects between queued prompts even when the actual checkpoint and LoRA stack
+    # are unchanged. Real upstream model/clip dependency invalidation is handled by Comfy's
+    # graph cache; this key is only the loader's own stack/global/file signature.
+    #
+    # Also deliberately ignore prompt/seed/text/reference fields from state_control. The
+    # DoRA loader consumes only the selected loader stack and loader globals.
     payload = {
-        "schema": 2,
+        "schema": 3,
         "kind": "dora_power_lora_loader_cache_key",
-        "model_identity": id(model) if model is not None else None,
-        "clip_identity": id(clip) if clip is not None else None,
         "state_slot": state_slot,
         "loras": _loader_cache_entries(entries),
         "loader_globals": _loader_cache_globals(kwargs, state_payload, state_slot),
@@ -5230,14 +5237,14 @@ class DoraPowerLoraLoader:
         return model, clip, auto_strength_report
 
     def load_loras(self, model, clip, **kwargs):
-        # state_control is the preferred State Manager relationship edge. When it
-        # carries a runtime payload, use it as the fallback source for LoRA rows
+        # state_control is the intended State Manager relationship edge. When it
+        # carries a runtime payload, use it as the primary source for LoRA rows
         # and loader-global settings so state_control-only graphs follow queued
-        # character/prompt wildcarding. A direct dora_state input still wins.
+        # character/prompt wildcarding. dora_state is only a compatibility fallback.
         state_slot = _clean_loader_slot(kwargs.get("state_slot", "default"), "default")
-        state_payload = _normalize_runtime_dora_state_payload(kwargs.get("dora_state"))
+        state_payload = _normalize_runtime_dora_state_payload(kwargs.get("state_control"))
         if state_payload is None:
-            state_payload = _normalize_runtime_dora_state_payload(kwargs.get("state_control"))
+            state_payload = _normalize_runtime_dora_state_payload(kwargs.get("dora_state"))
         kwargs.pop("state_control", None)
 
         # Global controls (provided by JS UI; optionally overridden by DoRA State Manager)
