@@ -4840,7 +4840,11 @@ class StateManagerSeed:
         del prompt, extra_pnginfo, unique_id, control_after_generate
         state_payload = _normalize_runtime_dora_state_payload(state_control)
         controlled_seed = _state_payload_seed(state_payload)
-        seed_i = _coerce_state_manager_seed(controlled_seed if controlled_seed is not None else seed, -1)
+        local_seed = _coerce_state_manager_seed(seed, -1)
+        seed_i = local_seed if local_seed not in _STATE_SEED_SPECIALS else _coerce_state_manager_seed(
+            controlled_seed if controlled_seed is not None else local_seed,
+            -1,
+        )
         if seed_i in _STATE_SEED_SPECIALS:
             return _state_manager_new_random_seed()
         return json.dumps(
@@ -4865,7 +4869,11 @@ class StateManagerSeed:
         del control_after_generate
         state_payload = _normalize_runtime_dora_state_payload(state_control)
         controlled_seed = _state_payload_seed(state_payload)
-        original_seed = _coerce_state_manager_seed(controlled_seed if controlled_seed is not None else seed, -1)
+        local_seed = _coerce_state_manager_seed(seed, -1)
+        original_seed = local_seed if local_seed not in _STATE_SEED_SPECIALS else _coerce_state_manager_seed(
+            controlled_seed if controlled_seed is not None else local_seed,
+            -1,
+        )
         seed_i = original_seed
         if seed_i in _STATE_SEED_SPECIALS:
             if seed_i in (-2, -3):
