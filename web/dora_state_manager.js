@@ -2208,7 +2208,7 @@ function queueSettingsSummary(state, uiState, currentCharacterId) {
     ? "Prompts: each queued job randomly selects one saved prompt preset from the active character."
     : "Prompts: selected prompt preset only.");
   if (uiState.queue_randomize_saved_seed) {
-    lines.push("Saved prompt preset seeds are randomized for every queued job.");
+    lines.push("Saved prompt preset seeds randomize only when no connected State Seed provides a fixed live seed.");
   }
   return lines.join(" ");
 }
@@ -2382,13 +2382,13 @@ function renderHeader(node, state, uiState, character, prompt) {
       "Each queued job samples one saved prompt preset from whichever character is active for that job."
     ),
     makeInlineCheckbox(
-      "Always randomize saved prompt seed",
+      "Randomize saved prompt seed when live seed is random",
       uiState.queue_randomize_saved_seed,
       (checked) => {
         const nextUiState = { ...uiState, queue_randomize_saved_seed: checked };
         updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
       },
-      "Each queued job uses a fresh runtime seed even when the saved prompt preset has a fixed seed."
+      "If a connected State Seed node is set to -1, the resolved queued seed is used. A fixed live State Seed takes precedence over saved prompt seeds."
     ),
     makeInlineCheckbox(
       "Split queued images into contiguous character chunks",
@@ -3304,6 +3304,31 @@ function setQueuedWidgetInput(promptPayload, node, widgetName, value) {
   return setQueuedInput(promptPayload, node, widgetName, value, { addIfMissing: false, syncWidget: true });
 }
 
+function readQueuedInput(promptPayload, node, inputName) {
+  if (!promptPayload?.output || !node || !inputName) return undefined;
+  for (const promptId of queueOutputKeysForNode(promptPayload, node)) {
+    const inputs = promptPayload.output?.[promptId]?.inputs;
+    if (inputs && Object.prototype.hasOwnProperty.call(inputs, inputName)) return inputs[inputName];
+  }
+  return undefined;
+}
+
+function readQueuedStateSeed(promptPayload, node) {
+  const raw = readQueuedInput(promptPayload, node, "seed");
+  if (raw === undefined) return null;
+  const seed = normalizeSeedInteger(raw, STATE_SEED_RANDOM);
+  return STATE_SEED_SPECIALS.includes(seed) ? null : seed;
+}
+
+function firstControlledStateSeed(managerNode, promptPayload) {
+  const controlled = getControlledNodes(managerNode).filter((node) => node && node !== managerNode && isStateSeedNode(node));
+  for (const node of controlled) {
+    const seed = readQueuedStateSeed(promptPayload, node);
+    if (seed != null) return { node, seed };
+  }
+  return null;
+}
+
 function serializeQueuedUiStateOverride(uiState, payload, queueIndex, total) {
   return JSON.stringify({
     ...stripBackupRestoreStatus(uiState || defaultUiState()),
@@ -3567,13 +3592,15 @@ function mutateQueuedSettingsNodes(promptPayload, managerNode, settingsSource) {
   const settings = normalizeSettings(settingsSource || {});
   let changed = 0;
   for (const node of targets) {
+    const preserveLiveStateSeed = isStateSeedNode(node) && readQueuedStateSeed(promptPayload, node) != null;
     const snapshot = findSnapshotForNode(settings, node);
     if (snapshot?.widgets) {
       for (const [name, value] of Object.entries(snapshot.widgets)) {
+        if (preserveLiveStateSeed && String(name) === "seed") continue;
         changed += setQueuedInput(promptPayload, node, String(name), value, { addIfMissing: false, syncWidget: true });
       }
     }
-    if (isSeedNode(node)) {
+    if (isSeedNode(node) && !preserveLiveStateSeed) {
       const seed = extractSeedFromSettings(settings);
       if (seed != null) {
         for (const name of ["seed", "noise_seed", "value"]) {
@@ -3601,7 +3628,10 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
     const { character, prompt } = selectQueuedCharacterAndPrompt(node, state, uiState, currentCharacterId, currentPromptId, queueIndex, total);
     if (!character || !prompt) continue;
     let payload = buildQueuedDoraStatePayload(character, prompt);
-    if (uiState.queue_randomize_saved_seed) {
+    const liveStateSeed = firstControlledStateSeed(node, promptPayload);
+    if (liveStateSeed) {
+      payload = withRuntimeSeed(payload, liveStateSeed.seed);
+    } else if (uiState.queue_randomize_saved_seed) {
       payload = withRuntimeSeed(payload, generateStateManagerRuntimeSeed());
     }
     changed += setQueuedStateManagerSelection(promptPayload, node, character.id, prompt.id);
