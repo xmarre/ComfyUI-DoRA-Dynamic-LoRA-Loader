@@ -6,6 +6,8 @@ const EXT_NAME = "comfyui_dora_dynamic_lora.state_manager";
 const NODE_CLASS = "State Manager";
 const LEGACY_NODE_CLASS = "DoRA State Manager";
 const DORA_LOADER_CLASS = "DoRA Power LoRA Loader";
+const DORA_STATE_KIND = "dora_state_manager_state";
+const STATE_MANAGER_CONTROL_KIND = "state_manager_control";
 const STATE_TEXT_CLASS = "State Manager Text Box";
 const STATE_TEXT_DISPLAY_CLASS = "State Text Box";
 const STATE_SEED_CLASS = "State Manager Seed";
@@ -3420,28 +3422,46 @@ function buildQueuedDoraStatePayload(character, prompt) {
   };
 }
 
-function buildQueuedDoraLoaderPayload(character) {
+function buildQueuedDoraLoaderStatePayload(character, loader = null, fallbackIndex = 0) {
   syncLegacyLoaderMirror(character);
-  const loaderStacks = getCharacterLoaderStacks(character).map((stack) => structuredCloneCompat(stack));
-  const defaultStack = findCharacterLoaderStack(character, "default") || loaderStacks[0] || defaultLoaderStack();
+  const slot = loader ? getDoraLoaderSlot(loader, fallbackIndex) : "default";
+  const stack = findCharacterLoaderStack(character, slot, { allowFallback: false })
+    || findCharacterLoaderStack(character, "default", { allowFallback: true })
+    || defaultLoaderStack();
+  const normalizedStack = normalizeLoaderStack({
+    ...structuredCloneCompat(stack),
+    slot,
+    label: stack?.label || slot,
+  });
+  const globals = normalizeLoaderGlobals(normalizedStack.loader_globals || {});
+
+  // Loader-only runtime state. Keep prompts, settings, seeds, text boxes,
+  // thumbnails, reference images, and unrelated loader stacks out of the DoRA
+  // loader's state_control payload so prompt-only queue wildcarding cannot
+  // invalidate/reload LoRA patches.
   return {
     version: 2,
-    kind: "dora_state_manager_state",
-    character: {
-      id: String(character?.id ?? ""),
-      name: String(character?.name ?? ""),
-      thumbnail: normalizeThumbnail(character?.thumbnail),
-    },
-    prompt: { id: "", name: "" },
-    loader_stacks: loaderStacks,
-    loras: structuredCloneCompat(defaultStack?.loras || []),
-    loader_globals: normalizeLoaderGlobals(defaultStack?.loader_globals || character?.loader_globals || {}),
-    settings: {},
-    text_boxes: [],
-    positive_prompt: "",
-    negative_prompt: "",
-    reference_image: {},
-    fileimage_prefix: "",
+    kind: DORA_STATE_KIND,
+    loader_stacks: [{
+      slot: normalizedStack.slot,
+      label: normalizedStack.label,
+      loras: structuredCloneCompat(normalizedStack.loras || []),
+      loader_globals: globals,
+    }],
+    loras: structuredCloneCompat(normalizedStack.loras || []),
+    loader_globals: globals,
+  };
+}
+
+function buildQueuedDoraLoaderControlPayload(character, loader = null, fallbackIndex = 0) {
+  const state = buildQueuedDoraLoaderStatePayload(character, loader, fallbackIndex);
+  return {
+    version: 2,
+    kind: STATE_MANAGER_CONTROL_KIND,
+    state,
+    loader_stacks: structuredCloneCompat(state.loader_stacks || []),
+    loras: structuredCloneCompat(state.loras || []),
+    loader_globals: structuredCloneCompat(state.loader_globals || {}),
   };
 }
 
@@ -3491,10 +3511,14 @@ function mutateQueuedDoraLoaders(promptPayload, managerNode, character) {
   const legacyLoaders = controlledLoaders.length ? [] : uniqueNodes(getOutputTargets(managerNode, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
   const loaders = controlledLoaders.length ? controlledLoaders : legacyLoaders;
   if (!loaders.length) return 0;
-  const loaderPayload = buildQueuedDoraLoaderPayload(character);
   let changed = 0;
-  for (const loader of loaders) {
-    changed += setQueuedInput(promptPayload, loader, "dora_state", loaderPayload, { addIfMissing: true, syncWidget: false });
+  for (const [index, loader] of loaders.entries()) {
+    const loaderControlPayload = buildQueuedDoraLoaderControlPayload(character, loader, index);
+
+    // state_control is the intended State Manager edge. During queued wildcarding,
+    // keep using state_control, but replace the queued API input with a loader-only
+    // control payload. The editor graph remains connected through state_control.
+    changed += setQueuedInput(promptPayload, loader, "state_control", loaderControlPayload, { addIfMissing: true, syncWidget: false });
   }
   return changed;
 }
