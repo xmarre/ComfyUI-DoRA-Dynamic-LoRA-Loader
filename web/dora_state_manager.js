@@ -3508,7 +3508,7 @@ function withRuntimeSeed(payload, seed) {
 function mutateQueuedDoraLoaders(promptPayload, managerNode, character) {
   const controlled = getControlledNodes(managerNode).filter((node) => node && node !== managerNode);
   const controlledLoaders = controlled.filter(isDoraLoaderNode);
-  const legacyLoaders = controlledLoaders.length ? [] : uniqueNodes(getOutputTargets(managerNode, OUTPUT_NAMES.control)).filter(isDoraLoaderNode);
+  const legacyLoaders = controlledLoaders.length ? [] : uniqueNodes(getOutputTargets(managerNode, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
   const loaders = controlledLoaders.length ? controlledLoaders : legacyLoaders;
   if (!loaders.length) return 0;
   let changed = 0;
