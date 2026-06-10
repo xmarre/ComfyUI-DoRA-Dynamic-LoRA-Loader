@@ -128,7 +128,7 @@ def _patch_comfy_weight_decompose() -> None:
     def weight_decompose_fixed(*args, **kwargs):
         if not getattr(wa_base, "_dora_weight_decompose_first_call_logged", False):
             wa_base._dora_weight_decompose_first_call_logged = True
-            _LOG.warning("[DoRA Power LoRA Loader] weight_decompose_fixed invoked (DoRA normalization patch active).")
+            _LOG.info("[DoRA Power LoRA Loader] weight_decompose_fixed invoked (DoRA normalization patch active).")
 
         if len(args) >= 4:
             dora_scale, weight, lora_diff, alpha = args[:4]
@@ -318,7 +318,7 @@ def _patch_comfy_weight_decompose() -> None:
 
     wa_base.weight_decompose = weight_decompose_fixed
     wa_base._dora_weight_decompose_patched_by_dora_loader = True
-    _LOG.warning("[DoRA Power LoRA Loader] patched ComfyUI weight_decompose for correct DoRA normalization (norm(V) + broadcast-shape + slice fix).")
+    _LOG.info("[DoRA Power LoRA Loader] patched ComfyUI weight_decompose for correct DoRA normalization (norm(V) + broadcast-shape + slice fix).")
 
     patched_refs = 0
     for m in list(sys.modules.values()):
@@ -334,7 +334,7 @@ def _patch_comfy_weight_decompose() -> None:
         except Exception:
             pass
     if patched_refs:
-        _LOG.warning("[DoRA Power LoRA Loader] patched %d cached weight_decompose references across sys.modules.", patched_refs)
+        _LOG.info("[DoRA Power LoRA Loader] patched %d cached weight_decompose references across sys.modules.", patched_refs)
 
 
 def _patch_comfy_lora_calculate_weight_fp32() -> None:
@@ -417,7 +417,7 @@ def _patch_comfy_lora_calculate_weight_fp32() -> None:
 
     if patched:
         wa_lora._dora_loader_patched_calc_weight_fp32 = True
-        _LOG.warning(
+        _LOG.info(
             "[DoRA Power LoRA Loader] patched %d weight_adapter.lora calculate_weight() methods: forcing fp32 intermediate_dtype "
             "(fixes lora_diff flush-to-zero on mixed-precision/quantized models).",
             patched,
