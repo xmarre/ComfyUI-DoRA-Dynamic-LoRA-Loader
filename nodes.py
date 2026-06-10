@@ -325,8 +325,11 @@ def _patch_comfy_weight_decompose() -> None:
         if m is None:
             continue
         try:
-            if getattr(m, "weight_decompose", None) is orig:
-                setattr(m, "weight_decompose", weight_decompose_fixed)
+            # Avoid getattr(): module-level __getattr__ may resolve deprecated or
+            # lazy aliases and emit warnings merely because this scan probes them.
+            module_dict = vars(m)
+            if module_dict.get("weight_decompose") is orig:
+                module_dict["weight_decompose"] = weight_decompose_fixed
                 patched_refs += 1
         except Exception:
             pass
