@@ -367,6 +367,58 @@ function isTargetNodeInstance(node) {
   return !!node && (node.type === NODE_CLASS || node.comfyClass === NODE_CLASS || node.title === NODE_CLASS);
 }
 
+function getGraphNodeById(graph, rawId) {
+  if (!graph || typeof graph.getNodeById !== "function" || rawId == null) {
+    return null;
+  }
+
+  const direct = graph.getNodeById(rawId);
+  if (direct) return direct;
+
+  const numericId = Number(rawId);
+  return Number.isFinite(numericId) ? graph.getNodeById(numericId) : null;
+}
+
+function resolveExecutionNode(rootGraph, executionId) {
+  const parts = String(executionId ?? "")
+    .split(":")
+    .filter(Boolean);
+
+  if (!parts.length) return null;
+
+  let graph = rootGraph;
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    const containerNode = getGraphNodeById(graph, parts[index]);
+    const subgraph = containerNode?.subgraph;
+    if (!subgraph || typeof subgraph.getNodeById !== "function") {
+      return null;
+    }
+    graph = subgraph;
+  }
+
+  return getGraphNodeById(graph, parts[parts.length - 1]);
+}
+
+function resolveReportTargetNode(rootGraph, detail) {
+  // The node field identifies the actual executing node. The display_node field
+  // may identify an enclosing subgraph or group, so use it only as a fallback.
+  const candidates = [detail?.node, detail?.display_node];
+  const seen = new Set();
+
+  for (const candidate of candidates) {
+    if (candidate == null) continue;
+
+    const executionId = String(candidate);
+    if (seen.has(executionId)) continue;
+    seen.add(executionId);
+
+    const node = resolveExecutionNode(rootGraph, executionId);
+    if (isTargetNodeInstance(node)) return node;
+  }
+
+  return null;
+}
+
 function applyExecutionReportToNode(node, reportJson, reportText) {
   if (!node) return;
   let parsed = null;
@@ -398,11 +450,8 @@ function installExecutionListener() {
     const reportText = parseExecutionOutputValue(output, "analysis_report");
     if (typeof reportJson !== "string" && typeof reportText !== "string") return;
 
-    const rawNodeId = detail?.display_node ?? detail?.node;
-    const nodeId = Number(rawNodeId);
-    const graph = app.graph;
-    const node = Number.isFinite(nodeId) && graph?.getNodeById ? graph.getNodeById(nodeId) : null;
-    if (!isTargetNodeInstance(node)) return;
+    const node = resolveReportTargetNode(app.graph, detail);
+    if (!node) return;
 
     applyExecutionReportToNode(node, reportJson, reportText);
   });
