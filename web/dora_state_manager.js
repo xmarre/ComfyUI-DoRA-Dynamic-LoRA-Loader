@@ -19,9 +19,9 @@ const UI_STATE_WIDGET = "ui_state_json";
 const SELECTED_CHARACTER_WIDGET = "selected_character_id";
 const SELECTED_PROMPT_WIDGET = "selected_prompt_id";
 const STYLE_ID = "dora-state-manager-style";
-const MIN_WIDGET_HEIGHT = 520;
-const MIN_NODE_WIDTH = 620;
-const MIN_NODE_HEIGHT = 680;
+const MIN_WIDGET_HEIGHT = 560;
+const MIN_NODE_WIDTH = 820;
+const MIN_NODE_HEIGHT = 720;
 const THUMBNAIL_SUBFOLDER = "dora_state_manager";
 const AUTO_STRENGTH_DEVICE_CHOICES = ["auto", "cpu", "gpu"];
 const OUTPUT_NAMES = {
@@ -590,7 +590,7 @@ function normalizeUiState(raw) {
   const parsed = safeJsonParse(raw, defaultUiState());
   return {
     version: 2,
-    panel: ["prompts", "loras", "settings"].includes(parsed.panel) ? parsed.panel : "prompts",
+    panel: ["prompts", "character", "loras", "settings", "queue"].includes(parsed.panel) ? parsed.panel : "prompts",
     status: String(parsed.status ?? ""),
     queue_prompt_wildcard: normalizeBoolean(parsed.queue_prompt_wildcard ?? parsed.prompt_wildcard_enabled, false),
     queue_character_wildcard: normalizeBoolean(parsed.queue_character_wildcard ?? parsed.character_wildcard_enabled, false),
@@ -2213,7 +2213,7 @@ function queueSettingsSummary(state, uiState, currentCharacterId) {
   return lines.join(" ");
 }
 
-function renderCharacterTile(node, state, uiState, character, selectedId) {
+function renderCharacterTile(node, state, uiState, character, selectedId, selectedPromptId = "") {
   const queueIds = queueCharacterIdsExplicit(state, uiState);
   const queueIndex = queueIds.indexOf(character.id);
   const isSelected = character.id === selectedId;
@@ -2223,6 +2223,10 @@ function renderCharacterTile(node, state, uiState, character, selectedId) {
   const tile = document.createElement("div");
   tile.tabIndex = 0;
   tile.role = "button";
+  tile.dataset.libraryItem = "character";
+  tile.dataset.characterId = character.id;
+  tile.dataset.search = librarySearchText(character);
+  if (isSelected) tile.setAttribute("aria-current", "true");
   tile.className = `dsm-character-tile${isSelected ? " selected" : ""}${isActiveQueueChunk ? " queued" : ""}${isQueued && !isActiveQueueChunk ? " prepared" : ""}`;
 
   const thumb = document.createElement("div");
@@ -2232,6 +2236,8 @@ function renderCharacterTile(node, state, uiState, character, selectedId) {
     const img = document.createElement("img");
     img.src = url;
     img.alt = character.name;
+    img.loading = "lazy";
+    img.decoding = "async";
     thumb.appendChild(img);
   } else {
     thumb.textContent = character.name.trim().slice(0, 2).toUpperCase() || "?";
@@ -2250,15 +2256,18 @@ function renderCharacterTile(node, state, uiState, character, selectedId) {
   const queueRow = document.createElement("label");
   queueRow.className = "dsm-character-queue";
   const queueCheckbox = makeCheckbox(isQueued, (checked) => {
-    const ids = toggleQueueCharacterId(state, uiState, character.id, checked);
+    const current = getRenderableState(node);
+    const ids = toggleQueueCharacterId(current.state, current.uiState, character.id, checked);
     const nextUiState = {
-      ...uiState,
+      ...current.uiState,
       queue_character_ids: ids,
-      queue_character_wildcard: checked ? true : uiState.queue_character_wildcard,
+      queue_character_wildcard: checked ? true : current.uiState.queue_character_wildcard,
     };
-    updateState(node, state, nextUiState, {
-      characterId: selectedId || character.id,
-      status: queueSettingsSummary(state, nextUiState, selectedId || character.id),
+    const selected = ensureSelection(node, current.state);
+    updateState(node, current.state, nextUiState, {
+      characterId: selected.character.id,
+      promptId: selected.prompt.id,
+      status: queueSettingsSummary(current.state, nextUiState, selected.character.id),
     });
   });
   queueRow.addEventListener("click", (event) => event.stopPropagation());
@@ -2271,8 +2280,13 @@ function renderCharacterTile(node, state, uiState, character, selectedId) {
   tile.append(thumb, name, meta, queueRow);
 
   const selectCharacter = () => {
-    const promptId = character.prompts[0]?.id || "";
-    updateState(node, state, uiState, { characterId: character.id, promptId, status: `Editing ${character.name}. Use Load/Apply to push it into connected nodes.` });
+    const current = getRenderableState(node);
+    const currentSelection = ensureSelection(node, current.state);
+    const nextCharacter = current.state.characters.find((item) => item.id === character.id) || currentSelection.character;
+    const promptId = nextCharacter.id === currentSelection.character.id && nextCharacter.prompts.some((item) => item.id === currentSelection.prompt.id)
+      ? currentSelection.prompt.id
+      : nextCharacter.prompts[0]?.id || "";
+    updateState(node, current.state, current.uiState, { characterId: nextCharacter.id, promptId, status: `Editing ${nextCharacter.name}. Use Load/Apply to push it into connected nodes.` });
   };
   tile.addEventListener("click", selectCharacter);
   tile.addEventListener("keydown", (event) => {
@@ -2284,15 +2298,149 @@ function renderCharacterTile(node, state, uiState, character, selectedId) {
   return tile;
 }
 
+function characterLibrarySearchBase(character) {
+  const stacks = normalizeLoaderStacks(character);
+  const loraNames = stacks.flatMap((stack) => (stack.loras || []).map((row) => row.name));
+  return [character.name, ...loraNames]
+    .filter(Boolean)
+    .join(" ")
+    .normalize("NFKD")
+    .toLocaleLowerCase();
+}
+
+function librarySearchText(character, prompt = null) {
+  const base = characterLibrarySearchBase(character);
+  const promptNames = prompt
+    ? [prompt.name, prompt.fileimage_prefix]
+    : (character.prompts || []).flatMap((item) => [item.name, item.fileimage_prefix]);
+  return [base, ...promptNames]
+    .filter(Boolean)
+    .join(" ")
+    .normalize("NFKD")
+    .toLocaleLowerCase();
+}
+
+function renderPresetTile(node, character, prompt, selectedCharacterId, selectedPromptId, searchText = "") {
+  const isSelected = character.id === selectedCharacterId && prompt.id === selectedPromptId;
+  const tile = document.createElement("div");
+  tile.tabIndex = 0;
+  tile.role = "button";
+  tile.dataset.libraryItem = "preset";
+  tile.dataset.characterId = character.id;
+  tile.dataset.promptId = prompt.id;
+  tile.dataset.search = searchText || librarySearchText(character, prompt);
+  tile.className = `dsm-preset-tile${isSelected ? " selected" : ""}`;
+  if (isSelected) tile.setAttribute("aria-current", "true");
+
+  const thumb = document.createElement("div");
+  thumb.className = "dsm-preset-thumb";
+  const url = thumbnailUrl(prompt.reference_image) || thumbnailUrl(character.thumbnail);
+  if (url) {
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = `${prompt.name} — ${character.name}`;
+    img.loading = "lazy";
+    img.decoding = "async";
+    thumb.appendChild(img);
+  } else {
+    thumb.textContent = prompt.name.trim().slice(0, 2).toUpperCase() || "?";
+  }
+
+  const body = document.createElement("div");
+  body.className = "dsm-preset-body";
+  const name = document.createElement("div");
+  name.className = "dsm-preset-name";
+  name.textContent = prompt.name;
+  name.title = prompt.name;
+  const owner = document.createElement("div");
+  owner.className = "dsm-preset-character";
+  owner.textContent = character.name;
+  owner.title = character.name;
+  const meta = document.createElement("div");
+  meta.className = "dsm-muted dsm-preset-meta";
+  const seed = extractSeedFromSettings(prompt.settings);
+  const textBoxCount = normalizePromptTextBoxes(prompt).length;
+  meta.textContent = `${textBoxCount} text box${textBoxCount === 1 ? "" : "es"}${seed == null ? "" : ` · seed ${seed}`}`;
+  body.append(name, owner, meta);
+  tile.append(thumb, body);
+
+  const selectPreset = () => {
+    const current = getRenderableState(node);
+    const nextCharacter = current.state.characters.find((item) => item.id === character.id);
+    const nextPrompt = nextCharacter?.prompts.find((item) => item.id === prompt.id);
+    if (!nextCharacter || !nextPrompt) return;
+    updateState(node, current.state, current.uiState, {
+      characterId: character.id,
+      promptId: prompt.id,
+      status: `Selected ${nextCharacter.name} / ${nextPrompt.name}. Use Load/Apply to push it into graph nodes.`,
+    });
+  };
+  tile.addEventListener("click", selectPreset);
+  tile.addEventListener("keydown", (event) => {
+    if (event.target !== tile || (event.key !== "Enter" && event.key !== " ")) return;
+    event.preventDefault();
+    selectPreset();
+  });
+  return tile;
+}
+
+function normalizeLibraryQuery(value) {
+  return String(value ?? "").normalize("NFKD").trim().toLocaleLowerCase();
+}
+
+function applyLibraryFilter(library, query) {
+  if (!library) return;
+  const terms = normalizeLibraryQuery(query).split(/\s+/g).filter(Boolean);
+  const items = [...library.querySelectorAll("[data-library-item]")];
+  let visible = 0;
+  for (const item of items) {
+    const haystack = item.dataset.search || "";
+    const matches = terms.every((term) => haystack.includes(term));
+    item.hidden = !matches;
+    if (matches) visible += 1;
+  }
+  const count = library.querySelector("[data-library-count]");
+  if (count) {
+    const noun = library.dataset.libraryMode === "characters" ? "character" : "preset";
+    count.textContent = `${visible} of ${items.length} ${noun}${items.length === 1 ? "" : "s"}`;
+  }
+  const empty = library.querySelector("[data-library-empty]");
+  if (empty) empty.hidden = visible !== 0;
+}
+
+function rememberLibraryScroll(node, element, key) {
+  const ctx = node.__dsm;
+  if (!ctx || !element) return;
+  ctx.scrollPositions = ctx.scrollPositions || {};
+  element.addEventListener("scroll", () => {
+    ctx.scrollPositions[key] = element.scrollTop;
+  }, { passive: true });
+  requestAnimationFrame(() => {
+    if (!element.isConnected) return;
+    element.scrollTop = Number(ctx.scrollPositions[key] || 0);
+    if (ctx.focusLibrarySelection) {
+      ctx.focusLibrarySelection = false;
+      element.querySelector('[aria-current="true"]:not([hidden])')?.scrollIntoView?.({ block: "nearest" });
+    }
+  });
+}
+
 function renderHeader(node, state, uiState, character, prompt) {
   const section = document.createElement("div");
-  section.className = "dsm-section dsm-top";
+  section.className = "dsm-section dsm-global-header";
 
   const toolbar = document.createElement("div");
-  toolbar.className = "dsm-toolbar";
+  toolbar.className = "dsm-toolbar dsm-global-toolbar";
+  const heading = document.createElement("div");
+  heading.className = "dsm-heading";
   const title = document.createElement("div");
   title.className = "dsm-title";
   title.textContent = "State Manager";
+  const selection = document.createElement("div");
+  selection.className = "dsm-selection-path";
+  selection.textContent = `${character.name} / ${prompt.name}`;
+  selection.title = selection.textContent;
+  heading.append(title, selection);
 
   const importInput = document.createElement("input");
   importInput.type = "file";
@@ -2310,31 +2458,30 @@ function renderHeader(node, state, uiState, character, prompt) {
     }
   });
 
+  const saveConnected = makeButton("Save connected", () => {
+    const changes = saveConnectedState(node, character, prompt);
+    updateState(node, state, uiState, {
+      characterId: character.id,
+      promptId: prompt.id,
+      status: changes.length ? `Saved ${changes.join(", ")} from connected nodes.` : "No connected downstream nodes had capturable state.",
+    });
+  }, "Capture current values from nodes connected to this manager's outputs");
+  saveConnected.classList.add("dsm-primary");
+
+  const loadConnected = makeButton("Load connected", () => {
+    const changes = applyConnectedState(node, character, prompt);
+    updateState(node, state, uiState, {
+      characterId: character.id,
+      promptId: prompt.id,
+      status: changes.length ? `Loaded ${changes.join(", ")} into connected nodes.` : "No connected downstream nodes accepted this state.",
+    });
+  }, "Push the selected character/preset into nodes connected to this manager's outputs");
+  loadConnected.classList.add("dsm-primary");
+
   toolbar.append(
-    title,
-    makeButton("Export State JSON", () => {
-      exportStateJson(node, state, uiState, character.id, prompt.id);
-      setStatus(node, "Exported State Manager JSON.");
-    }, "Download the selected State Manager data as a JSON backup"),
-    makeButton("Import State JSON", () => {
-      importInput.click();
-    }, "Import a State Manager JSON backup into this node"),
-    makeButton("Save connected", () => {
-      const changes = saveConnectedState(node, character, prompt);
-      updateState(node, state, uiState, {
-        characterId: character.id,
-        promptId: prompt.id,
-        status: changes.length ? `Saved ${changes.join(", ")} from connected nodes.` : "No connected downstream nodes had capturable state.",
-      });
-    }, "Capture current values from nodes connected to this manager's outputs"),
-    makeButton("Load connected", () => {
-      const changes = applyConnectedState(node, character, prompt);
-      updateState(node, state, uiState, {
-        characterId: character.id,
-        promptId: prompt.id,
-        status: changes.length ? `Loaded ${changes.join(", ")} into connected nodes.` : "No connected downstream nodes accepted this state.",
-      });
-    }, "Push the selected character/preset into nodes connected to this manager's outputs"),
+    heading,
+    saveConnected,
+    loadConnected,
     makeButton("Save selected", () => {
       const changes = saveSelectedState(node, character, prompt);
       updateState(node, state, uiState, {
@@ -2350,25 +2497,182 @@ function renderHeader(node, state, uiState, character, prompt) {
         promptId: prompt.id,
         status: changes.length ? `Applied ${changes.join(", ")} to selected nodes.` : "Selected nodes did not match this state.",
       });
-    }, "Apply the current character/preset to selected graph nodes")
+    }, "Apply the current character/preset to selected graph nodes"),
+    makeButton("Export", () => {
+      exportStateJson(node, state, uiState, character.id, prompt.id);
+      setStatus(node, "Exported State Manager JSON.");
+    }, "Download the complete State Manager data as JSON"),
+    makeButton("Import", () => importInput.click(), "Import a State Manager JSON backup")
   );
 
-  const queueBox = document.createElement("div");
-  queueBox.className = "dsm-queue-box";
+  section.append(toolbar, importInput);
+  if (node.__dsmBackupWarning) {
+    const warning = document.createElement("div");
+    warning.className = "dsm-warning";
+    const warningText = document.createElement("span");
+    warningText.textContent = node.__dsmBackupWarning;
+    warning.append(warningText, makeButton("Dismiss", () => {
+      clearBackupWarning(node);
+      scheduleRender(node);
+    }));
+    section.appendChild(warning);
+  }
+  return section;
+}
 
-  const queueHeader = document.createElement("div");
-  queueHeader.className = "dsm-queue-header";
-  const queueTitle = document.createElement("div");
-  queueTitle.className = "dsm-section-title";
-  queueTitle.textContent = "Queued generation wildcarding";
-  const queueBadge = document.createElement("div");
-  queueBadge.className = "dsm-queue-badge";
-  const explicitQueueIds = queueCharacterIdsExplicit(state, uiState);
-  queueBadge.textContent = uiState.queue_character_wildcard
-    ? `${explicitQueueIds.length || 1} character chunk${(explicitQueueIds.length || 1) === 1 ? "" : "s"}`
-    : "single character";
-  queueHeader.append(queueTitle, queueBadge);
+function renderLibrary(node, state, uiState, character, prompt) {
+  const ctx = node.__dsm;
+  const mode = ctx.libraryMode === "characters" ? "characters" : "presets";
+  const section = document.createElement("section");
+  section.className = "dsm-section dsm-library";
+  section.dataset.libraryMode = mode;
 
+  const header = document.createElement("div");
+  header.className = "dsm-library-header";
+  const titleGroup = document.createElement("div");
+  titleGroup.className = "dsm-library-title-group";
+  const title = document.createElement("div");
+  title.className = "dsm-section-title";
+  title.textContent = "State library";
+  const count = document.createElement("div");
+  count.className = "dsm-library-count";
+  count.dataset.libraryCount = "";
+  titleGroup.append(title, count);
+
+  const modes = document.createElement("div");
+  modes.className = "dsm-tabs dsm-library-tabs";
+  for (const [value, label] of [["presets", "All presets"], ["characters", "Characters"]]) {
+    const button = makeButton(label, () => {
+      ctx.libraryMode = value;
+      scheduleRender(node);
+    });
+    if (mode === value) button.classList.add("selected");
+    modes.appendChild(button);
+  }
+  header.append(titleGroup, modes);
+
+  const search = document.createElement("input");
+  search.type = "search";
+  search.className = "dsm-library-search";
+  search.placeholder = mode === "presets"
+    ? "Search presets, characters, filename prefixes, or LoRAs…"
+    : "Search characters, presets, or LoRAs…";
+  search.value = ctx.searchQuery || "";
+  search.autocomplete = "off";
+  search.spellcheck = false;
+  search.addEventListener("input", () => {
+    ctx.searchQuery = search.value;
+    applyLibraryFilter(section, search.value);
+  });
+  search.addEventListener("keydown", (event) => event.stopPropagation());
+
+  const grid = document.createElement("div");
+  grid.className = mode === "presets" ? "dsm-library-grid dsm-preset-grid" : "dsm-library-grid dsm-character-grid";
+  grid.dataset.scrollKey = mode;
+  const fragment = document.createDocumentFragment();
+  if (mode === "presets") {
+    for (const item of state.characters) {
+      const characterSearch = characterLibrarySearchBase(item);
+      for (const itemPrompt of item.prompts) {
+        const presetSearch = `${characterSearch} ${String(itemPrompt.name || "")} ${String(itemPrompt.fileimage_prefix || "")}`
+          .normalize("NFKD")
+          .toLocaleLowerCase();
+        fragment.appendChild(renderPresetTile(node, item, itemPrompt, character.id, prompt.id, presetSearch));
+      }
+    }
+  } else {
+    for (const item of state.characters) {
+      fragment.appendChild(renderCharacterTile(node, state, uiState, item, character.id, prompt.id));
+    }
+  }
+  grid.appendChild(fragment);
+
+  const empty = document.createElement("div");
+  empty.className = "dsm-library-empty";
+  empty.dataset.libraryEmpty = "";
+  empty.textContent = "No saved states match this search.";
+  grid.appendChild(empty);
+
+  const controls = document.createElement("div");
+  controls.className = "dsm-toolbar dsm-library-actions";
+  const currentLibrarySelection = () => {
+    const current = getRenderableState(node);
+    const selected = ensureSelection(node, current.state);
+    return { ...current, ...selected };
+  };
+  if (mode === "presets") {
+    controls.append(
+      makeButton("New preset", () => {
+        const current = currentLibrarySelection();
+        const next = defaultPrompt();
+        next.id = makeId("prompt");
+        next.name = `Prompt ${current.character.prompts.length + 1}`;
+        current.character.prompts.push(next);
+        ctx.focusLibrarySelection = true;
+        updateState(node, current.state, current.uiState, { characterId: current.character.id, promptId: next.id, status: `Created preset for ${current.character.name}.` });
+      }),
+      makeButton("Duplicate preset", () => {
+        const current = currentLibrarySelection();
+        const copy = { ...structuredCloneCompat(current.prompt), id: makeId("prompt"), name: `${current.prompt.name} Copy` };
+        current.character.prompts.push(copy);
+        ctx.focusLibrarySelection = true;
+        updateState(node, current.state, current.uiState, { characterId: current.character.id, promptId: copy.id, status: "Duplicated prompt preset." });
+      }),
+      makeButton("Delete preset", () => {
+        const current = currentLibrarySelection();
+        if (current.character.prompts.length <= 1) {
+          setStatus(node, "At least one prompt preset must remain for this character.");
+          return;
+        }
+        const index = current.character.prompts.findIndex((item) => item.id === current.prompt.id);
+        if (index >= 0) current.character.prompts.splice(index, 1);
+        const next = current.character.prompts[Math.max(0, Math.min(index, current.character.prompts.length - 1))];
+        updateState(node, current.state, current.uiState, { characterId: current.character.id, promptId: next.id, status: "Deleted prompt preset." });
+      })
+    );
+  } else {
+    controls.append(
+      makeButton("New character", () => {
+        const current = currentLibrarySelection();
+        const next = defaultCharacter();
+        next.id = makeId("character");
+        next.name = `Character ${current.state.characters.length + 1}`;
+        next.prompts[0].id = makeId("prompt");
+        current.state.characters.push(next);
+        ctx.focusLibrarySelection = true;
+        updateState(node, current.state, current.uiState, { characterId: next.id, promptId: next.prompts[0].id, status: "Created character." });
+      }),
+      makeButton("Duplicate character", () => {
+        const current = currentLibrarySelection();
+        const copy = structuredCloneCompat(current.character);
+        copy.id = makeId("character");
+        copy.name = `${copy.name} Copy`;
+        copy.prompts = copy.prompts.map((item) => ({ ...item, id: makeId("prompt") }));
+        current.state.characters.push(copy);
+        ctx.focusLibrarySelection = true;
+        updateState(node, current.state, current.uiState, { characterId: copy.id, promptId: copy.prompts[0]?.id || "", status: "Duplicated character." });
+      }),
+      makeButton("Delete character", () => {
+        const current = currentLibrarySelection();
+        if (current.state.characters.length <= 1) {
+          setStatus(node, "At least one character must remain.");
+          return;
+        }
+        const index = current.state.characters.findIndex((item) => item.id === current.character.id);
+        if (index >= 0) current.state.characters.splice(index, 1);
+        const next = current.state.characters[Math.max(0, Math.min(index, current.state.characters.length - 1))];
+        updateState(node, current.state, current.uiState, { characterId: next.id, promptId: next.prompts[0]?.id || "", status: "Deleted character." });
+      })
+    );
+  }
+
+  section.append(header, search, grid, controls);
+  applyLibraryFilter(section, ctx.searchQuery || "");
+  rememberLibraryScroll(node, grid, mode);
+  return section;
+}
+
+function renderQueuePanelContent(section, node, state, uiState, character, prompt) {
   const queueRows = document.createElement("div");
   queueRows.className = "dsm-queue-options";
   queueRows.append(
@@ -2379,7 +2683,7 @@ function renderHeader(node, state, uiState, character, prompt) {
         const nextUiState = { ...uiState, queue_prompt_wildcard: checked };
         updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
       },
-      "Each queued job samples one saved prompt preset from whichever character is active for that job."
+      "Each queued job samples one saved prompt preset from the active character."
     ),
     makeInlineCheckbox(
       "Randomize saved prompt seed when live seed is random",
@@ -2388,7 +2692,7 @@ function renderHeader(node, state, uiState, character, prompt) {
         const nextUiState = { ...uiState, queue_randomize_saved_seed: checked };
         updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
       },
-      "If a connected State Seed node is set to -1, the resolved queued seed is used. A fixed live State Seed takes precedence over saved prompt seeds."
+      "A fixed connected State Seed keeps precedence."
     ),
     makeInlineCheckbox(
       "Split queued images into contiguous character chunks",
@@ -2402,84 +2706,56 @@ function renderHeader(node, state, uiState, character, prompt) {
         };
         updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
       },
-      "Tick chunk characters on the cards below. Example: 15 queued jobs with 3 checked characters runs 5 jobs per character before switching."
+      "Choose the participating characters below."
     )
   );
 
-  const queueActions = document.createElement("div");
-  queueActions.className = "dsm-toolbar dsm-queue-actions";
-  queueActions.append(
+  const picker = document.createElement("div");
+  picker.className = "dsm-queue-character-picker";
+  const queueIds = queueCharacterIdsExplicit(state, uiState);
+  for (const item of state.characters) {
+    const row = document.createElement("label");
+    row.className = "dsm-queue-character-row";
+    const checked = queueIds.includes(item.id);
+    const checkbox = makeCheckbox(checked, (enabled) => {
+      const ids = toggleQueueCharacterId(state, uiState, item.id, enabled);
+      const nextUiState = {
+        ...uiState,
+        queue_character_ids: ids,
+        queue_character_wildcard: enabled ? true : uiState.queue_character_wildcard,
+      };
+      updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
+    });
+    const name = document.createElement("span");
+    name.textContent = item.name;
+    const order = document.createElement("small");
+    const index = queueIds.indexOf(item.id);
+    order.textContent = index >= 0 ? `Chunk ${index + 1}` : "";
+    row.append(checkbox, name, order);
+    picker.appendChild(row);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "dsm-toolbar";
+  actions.append(
     makeButton("Use current character", () => {
       const nextUiState = { ...uiState, queue_character_wildcard: true, queue_character_ids: [character.id] };
       updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
-    }, "Use only the currently selected character for character chunking"),
+    }),
     makeButton("Use all characters", () => {
-      const ids = state.characters.map((item) => item.id);
-      const nextUiState = { ...uiState, queue_character_wildcard: true, queue_character_ids: ids };
+      const nextUiState = { ...uiState, queue_character_wildcard: true, queue_character_ids: state.characters.map((item) => item.id) };
       updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
-    }, "Add every saved character to the character chunk list"),
-    makeButton("Clear character chunks", () => {
+    }),
+    makeButton("Clear", () => {
       const nextUiState = { ...uiState, queue_character_wildcard: false, queue_character_ids: [] };
       updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
-    }, "Disable character chunking and clear the checked chunk list")
-  );
-
-  const queueSummary = document.createElement("div");
-  queueSummary.className = "dsm-queue-summary";
-  queueSummary.textContent = queueSettingsSummary(state, uiState, character.id);
-
-  queueBox.append(queueHeader, queueRows, queueActions, queueSummary);
-
-  const grid = document.createElement("div");
-  grid.className = "dsm-character-grid";
-  for (const item of state.characters) grid.appendChild(renderCharacterTile(node, state, uiState, item, character.id));
-
-  const controls = document.createElement("div");
-  controls.className = "dsm-toolbar";
-  controls.append(
-    makeButton("New character", () => {
-      const c = defaultCharacter();
-      c.id = makeId("character");
-      c.name = `Character ${state.characters.length + 1}`;
-      c.prompts[0].id = makeId("prompt");
-      state.characters.push(c);
-      updateState(node, state, uiState, { characterId: c.id, promptId: c.prompts[0].id, status: "Created character." });
-    }),
-    makeButton("Duplicate", () => {
-      const copy = structuredCloneCompat(character);
-      copy.id = makeId("character");
-      copy.name = `${copy.name} Copy`;
-      copy.prompts = copy.prompts.map((p) => ({ ...p, id: makeId("prompt") }));
-      state.characters.push(copy);
-      updateState(node, state, uiState, { characterId: copy.id, promptId: copy.prompts[0]?.id || "", status: "Duplicated character." });
-    }),
-    makeButton("Delete", () => {
-      if (state.characters.length <= 1) {
-        setStatus(node, "At least one character must remain.");
-        return;
-      }
-      const index = state.characters.findIndex((c) => c.id === character.id);
-      if (index >= 0) state.characters.splice(index, 1);
-      const next = state.characters[Math.max(0, Math.min(index, state.characters.length - 1))];
-      updateState(node, state, uiState, { characterId: next.id, promptId: next.prompts[0]?.id || "", status: "Deleted character." });
     })
   );
 
-  section.append(toolbar, importInput, queueBox);
-  if (node.__dsmBackupWarning) {
-    const warning = document.createElement("div");
-    warning.className = "dsm-warning";
-    const warningText = document.createElement("span");
-    warningText.textContent = node.__dsmBackupWarning;
-    const dismissButton = makeButton("Dismiss", () => {
-      clearBackupWarning(node);
-      scheduleRender(node);
-    });
-    warning.append(warningText, dismissButton);
-    section.appendChild(warning);
-  }
-  section.append(grid, controls);
-  return section;
+  const summary = document.createElement("div");
+  summary.className = "dsm-queue-summary";
+  summary.textContent = queueSettingsSummary(state, uiState, character.id);
+  section.append(queueRows, labelledControl("Character chunks", picker), actions, summary);
 }
 
 function renderCharacterPanel(node, state, uiState, character) {
@@ -2581,21 +2857,33 @@ function renderCharacterPanel(node, state, uiState, character) {
 
 function renderPromptPanel(node, state, uiState, character, prompt) {
   const section = document.createElement("div");
-  section.className = "dsm-section dsm-panel";
+  section.className = "dsm-section dsm-panel dsm-editor";
 
   const tabs = document.createElement("div");
   tabs.className = "dsm-tabs";
-  for (const [panel, label] of [["prompts", "Prompts"], ["loras", "LoRA stack"], ["settings", "Settings/seed"]]) {
+  for (const [panel, label] of [
+    ["prompts", "Preset"],
+    ["character", "Character"],
+    ["loras", "LoRA stacks"],
+    ["settings", "Settings / seed"],
+    ["queue", "Queue"],
+  ]) {
     const btn = makeButton(label, () => setPanel(node, panel));
     if (uiState.panel === panel) btn.classList.add("selected");
     tabs.appendChild(btn);
   }
   section.appendChild(tabs);
 
-  if (uiState.panel === "loras") {
+  if (uiState.panel === "character") {
+    const characterPanel = renderCharacterPanel(node, state, uiState, character);
+    characterPanel.className = "dsm-editor-content";
+    section.appendChild(characterPanel);
+  } else if (uiState.panel === "loras") {
     renderLoraPanelContent(section, node, state, uiState, character, prompt);
   } else if (uiState.panel === "settings") {
     renderSettingsPanelContent(section, node, state, uiState, character, prompt);
+  } else if (uiState.panel === "queue") {
+    renderQueuePanelContent(section, node, state, uiState, character, prompt);
   } else {
     renderPromptPanelContent(section, node, state, uiState, character, prompt);
   }
@@ -3074,17 +3362,51 @@ function renderSettingsPanelContent(section, node, state, uiState, character, pr
   section.append(grid, labelledControl("Seed output / saved seed", seedInput), settingsToolbar, labelledControl("Settings summary", summary), labelledControl("Settings JSON", settingsJson));
 }
 
+function libraryRenderKey(node, state, uiState, mode) {
+  const rawState = widgetValue(getWidgets(node).stateWidget, "");
+  const stateKey = typeof rawState === "string" && rawState ? rawState : serializeState(state);
+  return [
+    mode,
+    stateKey,
+    uiState.queue_character_wildcard ? "1" : "0",
+    queueCharacterIdsExplicit(state, uiState).join(","),
+  ].join("\u0000");
+}
+
+function updateLibrarySelection(library, characterId, promptId) {
+  if (!library) return;
+  for (const item of library.querySelectorAll("[data-library-item]")) {
+    const selected = item.dataset.libraryItem === "preset"
+      ? item.dataset.characterId === characterId && item.dataset.promptId === promptId
+      : item.dataset.characterId === characterId;
+    item.classList.toggle("selected", selected);
+    if (selected) item.setAttribute("aria-current", "true");
+    else item.removeAttribute("aria-current");
+  }
+}
+
 function renderNode(node) {
   const ctx = node.__dsm;
   if (!ctx?.root) return;
   const { state, uiState } = getRenderableState(node);
   const { character, prompt } = ensureSelection(node, state);
-  ctx.root.innerHTML = "";
+  const mode = ctx.libraryMode === "characters" ? "characters" : "presets";
+  const key = libraryRenderKey(node, state, uiState, mode);
+  let library = ctx.libraryElement;
+  if (!library || ctx.libraryKey !== key) {
+    library = renderLibrary(node, state, uiState, character, prompt);
+    ctx.libraryElement = library;
+    ctx.libraryKey = key;
+  } else {
+    library.remove();
+    updateLibrarySelection(library, character.id, prompt.id);
+  }
+  ctx.root.replaceChildren();
   ctx.root.className = "dsm-root";
   ctx.root.append(renderHeader(node, state, uiState, character, prompt));
   const main = document.createElement("div");
   main.className = "dsm-main";
-  main.append(renderCharacterPanel(node, state, uiState, character), renderPromptPanel(node, state, uiState, character, prompt));
+  main.append(library, renderPromptPanel(node, state, uiState, character, prompt));
   ctx.root.appendChild(main);
 }
 
@@ -3104,36 +3426,132 @@ function ensureStyles() {
       flex-direction: column;
       gap: 8px;
       color: var(--input-text, #ddd);
-      background: rgba(20, 20, 20, 0.18);
+      background: rgba(20, 20, 20, .18);
       font: 12px/1.35 system-ui, sans-serif;
     }
-    .dsm-root * { box-sizing: border-box; }
+    .dsm-root *, .dsm-root *::before, .dsm-root *::after { box-sizing: border-box; }
     .dsm-section {
       border: 1px solid rgba(128,128,128,.35);
       border-radius: 8px;
       padding: 8px;
       background: rgba(0,0,0,.10);
     }
-    .dsm-top { flex: 0 0 auto; min-height: 0; }
-    .dsm-main { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: minmax(200px, .8fr) minmax(300px, 1.2fr); gap: 8px; overflow: hidden; }
-    .dsm-panel { min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+    .dsm-global-header { flex: 0 0 auto; min-width: 0; padding: 7px 8px; }
+    .dsm-global-toolbar { margin: 0; }
+    .dsm-heading { flex: 1 1 180px; min-width: 130px; overflow: hidden; }
+    .dsm-title, .dsm-section-title { font-weight: 700; opacity: .96; }
+    .dsm-title { font-size: 13px; }
+    .dsm-selection-path { margin-top: 1px; opacity: .66; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dsm-main {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(390px, 1.35fr) minmax(340px, .9fr);
+      gap: 8px;
+      overflow: hidden;
+    }
+    .dsm-library {
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      border-color: rgba(150,175,220,.46);
+      background: rgba(20,30,48,.16);
+    }
+    .dsm-library-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 0; }
+    .dsm-library-title-group { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
+    .dsm-library-count { opacity: .62; white-space: nowrap; }
+    .dsm-library-tabs { flex: 0 0 auto; }
+    .dsm-library-search { width: 100%; flex: 0 0 auto; }
+    .dsm-library-grid {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: auto;
+      overscroll-behavior: contain;
+      display: grid;
+      align-content: start;
+      gap: 6px;
+      padding: 1px 3px 2px 1px;
+      scrollbar-gutter: stable;
+    }
+    .dsm-preset-grid { grid-template-columns: repeat(auto-fill, minmax(184px, 1fr)); }
+    .dsm-character-grid { grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); }
+    .dsm-library-actions { flex: 0 0 auto; margin: 0; padding-top: 1px; }
+    .dsm-library-empty { grid-column: 1 / -1; padding: 24px 10px; text-align: center; opacity: .6; }
+    .dsm-library [hidden] { display: none !important; }
+    .dsm-preset-tile, .dsm-character-tile {
+      color: var(--input-text, #ddd);
+      background: var(--comfy-input-bg, #222);
+      border: 1px solid rgba(128,128,128,.42);
+      border-radius: 7px;
+      cursor: pointer;
+      min-width: 0;
+      content-visibility: auto;
+      contain-intrinsic-size: 80px;
+    }
+    .dsm-preset-tile {
+      display: grid;
+      grid-template-columns: 58px minmax(0, 1fr);
+      gap: 7px;
+      min-height: 72px;
+      padding: 6px;
+      align-items: stretch;
+    }
+    .dsm-preset-body { min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 2px; }
+    .dsm-preset-name, .dsm-preset-character, .dsm-character-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dsm-preset-name, .dsm-character-name { font-weight: 650; }
+    .dsm-preset-character { opacity: .74; }
+    .dsm-preset-meta { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dsm-preset-thumb, .dsm-thumb, .dsm-large-thumb {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid rgba(128,128,128,.32);
+      border-radius: 6px;
+      overflow: hidden;
+      background: rgba(0,0,0,.22);
+      color: rgba(220,220,220,.72);
+    }
+    .dsm-preset-thumb { width: 58px; min-height: 58px; font-size: 16px; font-weight: 700; }
+    .dsm-preset-thumb img, .dsm-thumb img, .dsm-large-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .dsm-character-tile {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 4px;
+      text-align: left;
+      min-height: 132px;
+      padding: 6px;
+      contain-intrinsic-size: 132px;
+    }
+    .dsm-thumb { height: 62px; font-size: 20px; font-weight: 700; }
+    .dsm-character-tile:focus, .dsm-preset-tile:focus { outline: 1px solid rgba(180,210,255,.75); outline-offset: 1px; }
+    .dsm-root button.selected, .dsm-character-tile.selected, .dsm-preset-tile.selected {
+      border-color: rgba(180,210,255,.86);
+      background: rgba(100,140,220,.22);
+    }
+    .dsm-character-tile.queued:not(.selected) { border-color: rgba(180,210,255,.55); background: rgba(100,140,220,.12); }
+    .dsm-character-tile.prepared:not(.selected) { border-color: rgba(128,128,128,.62); background: rgba(255,255,255,.035); }
+    .dsm-character-queue { display: flex; align-items: center; gap: 5px; margin-top: auto; opacity: .86; cursor: pointer; }
+    .dsm-character-queue input { margin: 0; }
+    .dsm-editor {
+      min-height: 0;
+      min-width: 0;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      scrollbar-gutter: stable;
+    }
+    .dsm-editor > .dsm-tabs { position: sticky; top: -8px; z-index: 2; padding: 1px 0 7px; background: var(--comfy-menu-bg, #1b1b1b); background: color-mix(in srgb, var(--comfy-menu-bg, #1b1b1b) 92%, transparent); }
+    .dsm-editor-content { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
     .dsm-toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
-    .dsm-title, .dsm-section-title { font-weight: 650; opacity: .95; }
-    .dsm-title { flex: 1 1 auto; font-size: 13px; }
+    .dsm-tabs { display: flex; gap: 5px; flex-wrap: wrap; }
     .dsm-muted { opacity: .68; white-space: pre-wrap; }
-    .dsm-queue-box { border: 1px solid rgba(128,128,128,.28); border-radius: 7px; padding: 7px; margin: 2px 0 8px; background: rgba(0,0,0,.14); display: flex; flex-direction: column; gap: 7px; }
-    .dsm-queue-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-    .dsm-queue-badge { border: 1px solid rgba(128,128,128,.38); border-radius: 999px; padding: 2px 8px; opacity: .82; white-space: nowrap; background: rgba(255,255,255,.04); }
-    .dsm-queue-options { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px; }
-    .dsm-queue-actions { margin-bottom: 0; }
-    .dsm-queue-summary { opacity: .78; white-space: pre-wrap; border-top: 1px solid rgba(128,128,128,.22); padding-top: 6px; }
-    .dsm-checkline { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px; align-items: start; border: 1px solid rgba(128,128,128,.24); border-radius: 6px; padding: 6px; background: rgba(255,255,255,.025); }
-    .dsm-checkline input { margin-top: 2px; }
-    .dsm-checkline-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-    .dsm-checkline-text strong { font-weight: 650; }
-    .dsm-checkline-text small { opacity: .68; line-height: 1.3; }
     .dsm-status { border-top: 1px solid rgba(128,128,128,.25); padding-top: 6px; opacity: .78; }
-    .dsm-warning { border: 1px solid rgba(255, 190, 90, .7); border-radius: 6px; padding: 6px; background: rgba(255, 170, 0, .12); color: var(--input-text, #f2e6cc); display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; }
+    .dsm-warning { margin-top: 6px; border: 1px solid rgba(255,190,90,.7); border-radius: 6px; padding: 6px; background: rgba(255,170,0,.12); color: var(--input-text, #f2e6cc); display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; }
     .dsm-warning span { min-width: 0; }
     .dsm-flex { flex: 1 1 auto; min-width: 0; }
     .dsm-root input, .dsm-root select, .dsm-root textarea, .dsm-root button {
@@ -3146,32 +3564,37 @@ function ensureStyles() {
       min-width: 0;
     }
     .dsm-root button { cursor: pointer; white-space: nowrap; }
-    .dsm-root button.selected, .dsm-character-tile.selected { border-color: rgba(180, 210, 255, .8); background: rgba(100, 140, 220, .22); }
-    .dsm-character-tile.queued:not(.selected) { border-color: rgba(180, 210, 255, .55); background: rgba(100, 140, 220, .12); }
-    .dsm-character-tile.prepared:not(.selected) { border-color: rgba(128,128,128,.62); background: rgba(255,255,255,.035); }
+    .dsm-root button.dsm-primary { border-color: rgba(145,180,240,.66); background: rgba(70,110,185,.24); }
     .dsm-root textarea { width: 100%; min-height: 86px; resize: vertical; }
     .dsm-root input[type="checkbox"] { width: auto; }
     .dsm-labelled { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
     .dsm-labelled > span { opacity: .68; }
-    .dsm-character-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 6px; max-height: 218px; overflow: auto; padding-right: 2px; }
-    .dsm-character-tile { display: flex; flex-direction: column; align-items: stretch; gap: 4px; text-align: left; min-height: 150px; color: var(--input-text, #ddd); background: var(--comfy-input-bg, #222); border: 1px solid rgba(128,128,128,.45); border-radius: 6px; padding: 6px; cursor: pointer; min-width: 0; }
-    .dsm-character-tile:focus { outline: 1px solid rgba(180, 210, 255, .7); outline-offset: 1px; }
-    .dsm-character-queue { display: flex; align-items: center; gap: 5px; margin-top: auto; opacity: .88; cursor: pointer; }
-    .dsm-character-queue input { margin: 0; }
-    .dsm-thumb, .dsm-large-thumb { display: flex; align-items: center; justify-content: center; border: 1px solid rgba(128,128,128,.35); border-radius: 7px; overflow: hidden; background: rgba(0,0,0,.22); color: rgba(220,220,220,.72); }
-    .dsm-thumb { height: 76px; font-size: 22px; font-weight: 700; }
-    .dsm-large-thumb { min-height: 170px; cursor: pointer; }
-    .dsm-large-thumb.dragging { border-color: rgba(180, 210, 255, .9); }
-    .dsm-thumb img, .dsm-large-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
-    .dsm-character-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-    .dsm-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+    .dsm-large-thumb { min-height: 170px; max-height: 320px; cursor: pointer; }
+    .dsm-large-thumb.dragging { border-color: rgba(180,210,255,.9); }
     .dsm-grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
     .dsm-stack-box { border: 1px solid rgba(128,128,128,.28); border-radius: 7px; padding: 7px; display: flex; flex-direction: column; gap: 7px; background: rgba(0,0,0,.10); }
     .dsm-lora-row { display: grid; grid-template-columns: auto minmax(110px, 1fr) 76px 76px auto; gap: 6px; align-items: center; }
     .dsm-prompt-box { display: grid; grid-template-columns: 94px minmax(90px, .8fr) minmax(110px, 1fr) auto; gap: 6px; align-items: end; }
     .dsm-prompt-box .dsm-labelled:last-child { grid-column: 1 / -1; }
     .dsm-lora-summary { white-space: pre-wrap; border: 1px solid rgba(128,128,128,.35); border-radius: 6px; padding: 6px; min-height: 58px; max-height: 190px; overflow: auto; background: rgba(0,0,0,.16); }
-    @media (max-width: 720px) { .dsm-main { grid-template-columns: 1fr; } .dsm-queue-options { grid-template-columns: 1fr; } }
+    .dsm-queue-options { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; }
+    .dsm-checkline { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px; align-items: start; border: 1px solid rgba(128,128,128,.24); border-radius: 6px; padding: 6px; background: rgba(255,255,255,.025); }
+    .dsm-checkline input { margin-top: 2px; }
+    .dsm-checkline-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .dsm-checkline-text strong { font-weight: 650; }
+    .dsm-checkline-text small { opacity: .68; line-height: 1.3; }
+    .dsm-queue-character-picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 5px; max-height: 260px; overflow: auto; padding: 2px; }
+    .dsm-queue-character-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 6px; padding: 5px 6px; border: 1px solid rgba(128,128,128,.24); border-radius: 6px; }
+    .dsm-queue-character-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dsm-queue-character-row small { opacity: .62; }
+    .dsm-queue-summary { opacity: .78; white-space: pre-wrap; border-top: 1px solid rgba(128,128,128,.22); padding-top: 6px; }
+    @media (max-width: 760px) {
+      .dsm-root { overflow: auto; }
+      .dsm-main { grid-template-columns: 1fr; grid-template-rows: minmax(360px, 1fr) minmax(320px, auto); overflow: visible; }
+      .dsm-editor { overflow: visible; }
+      .dsm-library { min-height: 360px; }
+      .dsm-grid2 { grid-template-columns: 1fr; }
+    }
   `;
   document.head.appendChild(style);
 }
@@ -3925,7 +4348,18 @@ app.registerExtension({
         ensureStyles();
         if (node.__dsmWidget) return { widget: node.__dsmWidget, minHeight: MIN_WIDGET_HEIGHT, minWidth: MIN_NODE_WIDTH };
         const root = document.createElement("div");
-        node.__dsm = { root, renderFrame: 0, state: null, uiState: null };
+        node.__dsm = {
+          root,
+          renderFrame: 0,
+          state: null,
+          uiState: null,
+          libraryMode: "presets",
+          searchQuery: "",
+          scrollPositions: {},
+          focusLibrarySelection: false,
+          libraryElement: null,
+          libraryKey: "",
+        };
         const widget = node.addDOMWidget(inputName, CUSTOM_WIDGET_TYPE, root, {
           getMinHeight: () => MIN_WIDGET_HEIGHT,
           getHeight: () => "100%",
