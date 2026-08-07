@@ -2226,6 +2226,7 @@ function renderCharacterTile(node, state, uiState, character, selectedId, select
   tile.dataset.libraryItem = "character";
   tile.dataset.characterId = character.id;
   tile.dataset.search = librarySearchText(character);
+  tile.setAttribute("aria-label", character.name);
   if (isSelected) tile.setAttribute("aria-current", "true");
   tile.className = `dsm-character-tile${isSelected ? " selected" : ""}${isActiveQueueChunk ? " queued" : ""}${isQueued && !isActiveQueueChunk ? " prepared" : ""}`;
 
@@ -2246,6 +2247,7 @@ function renderCharacterTile(node, state, uiState, character, selectedId, select
   const name = document.createElement("div");
   name.className = "dsm-character-name";
   name.textContent = character.name;
+  name.title = character.name;
 
   const meta = document.createElement("div");
   meta.className = "dsm-muted";
@@ -2330,6 +2332,7 @@ function renderPresetTile(node, character, prompt, selectedCharacterId, selected
   tile.dataset.promptId = prompt.id;
   tile.dataset.search = searchText || librarySearchText(character, prompt);
   tile.className = `dsm-preset-tile${isSelected ? " selected" : ""}`;
+  tile.setAttribute("aria-label", `${character.name} — ${prompt.name}`);
   if (isSelected) tile.setAttribute("aria-current", "true");
 
   const thumb = document.createElement("div");
@@ -2338,12 +2341,12 @@ function renderPresetTile(node, character, prompt, selectedCharacterId, selected
   if (url) {
     const img = document.createElement("img");
     img.src = url;
-    img.alt = `${prompt.name} — ${character.name}`;
+    img.alt = `${character.name} — ${prompt.name}`;
     img.loading = "lazy";
     img.decoding = "async";
     thumb.appendChild(img);
   } else {
-    thumb.textContent = prompt.name.trim().slice(0, 2).toUpperCase() || "?";
+    thumb.textContent = character.name.trim().slice(0, 2).toUpperCase() || "?";
   }
 
   const body = document.createElement("div");
@@ -2361,7 +2364,7 @@ function renderPresetTile(node, character, prompt, selectedCharacterId, selected
   const seed = extractSeedFromSettings(prompt.settings);
   const textBoxCount = normalizePromptTextBoxes(prompt).length;
   meta.textContent = `${textBoxCount} text box${textBoxCount === 1 ? "" : "es"}${seed == null ? "" : ` · seed ${seed}`}`;
-  body.append(name, owner, meta);
+  body.append(owner, name, meta);
   tile.append(thumb, body);
 
   const selectPreset = () => {
@@ -3500,9 +3503,20 @@ function ensureStyles() {
       align-items: stretch;
     }
     .dsm-preset-body { min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 2px; }
-    .dsm-preset-name, .dsm-preset-character, .dsm-character-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .dsm-preset-name, .dsm-character-name { font-weight: 650; }
-    .dsm-preset-character { opacity: .74; }
+    .dsm-preset-character, .dsm-character-name {
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      white-space: normal;
+    }
+    .dsm-preset-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      opacity: .72;
+    }
     .dsm-preset-meta { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .dsm-preset-thumb, .dsm-thumb, .dsm-large-thumb {
       display: flex;
