@@ -2416,6 +2416,7 @@ function rememberLibraryScroll(node, element, key) {
   if (!ctx || !element) return;
   ctx.scrollPositions = ctx.scrollPositions || {};
   element.addEventListener("scroll", () => {
+    if (!element.isConnected) return;
     ctx.scrollPositions[key] = element.scrollTop;
   }, { passive: true });
   requestAnimationFrame(() => {
@@ -3396,11 +3397,17 @@ function renderNode(node) {
   const mode = ctx.libraryMode === "characters" ? "characters" : "presets";
   const key = libraryRenderKey(node, state, uiState, mode);
   let library = ctx.libraryElement;
+  let preservedScroll = null;
   if (!library || ctx.libraryKey !== key) {
     library = renderLibrary(node, state, uiState, character, prompt);
     ctx.libraryElement = library;
     ctx.libraryKey = key;
   } else {
+    const grid = library.querySelector(`[data-scroll-key="${mode}"]`);
+    if (grid) {
+      preservedScroll = { element: grid, top: grid.scrollTop };
+      ctx.scrollPositions[mode] = preservedScroll.top;
+    }
     library.remove();
     updateLibrarySelection(library, character.id, prompt.id);
   }
@@ -3411,6 +3418,15 @@ function renderNode(node) {
   main.className = "dsm-main";
   main.append(library, renderPromptPanel(node, state, uiState, character, prompt));
   ctx.root.appendChild(main);
+  if (preservedScroll) {
+    const restoreScroll = () => {
+      if (!preservedScroll.element.isConnected) return;
+      preservedScroll.element.scrollTop = preservedScroll.top;
+      ctx.scrollPositions[mode] = preservedScroll.element.scrollTop;
+    };
+    restoreScroll();
+    requestAnimationFrame(restoreScroll);
+  }
 }
 
 function ensureStyles() {
