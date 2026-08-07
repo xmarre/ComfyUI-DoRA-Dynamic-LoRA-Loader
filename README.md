@@ -523,6 +523,20 @@ Use it to save:
 - seed state, including rgthree-style seed nodes
 - one character image / thumbnail reference; the UI preview is CSS-scaled, while the `character_image` output loads the original uploaded image file
 
+### Library-first UI
+
+The State Manager opens with the saved-state library as its largest pane:
+
+- **All presets** shows prompt presets from every character in one dense, scrollable grid.
+- **Characters** switches to the character/LoRA-state library.
+- Search matches character names, preset names, `fileimage_prefix` values, and saved LoRA filenames.
+- The result count updates while typing, and the search is applied in place without dirtying the workflow.
+- Library scroll position and search text survive selection changes.
+- Preset, character, LoRA, settings/seed, and queue editing live in tabs in the detail pane.
+- Resizing the node gives the library the additional space; the collection has no fixed-height cap.
+
+The UI-only redesign does not change node class names, widget names/order, state JSON, selection widgets, outputs, or the legacy **DoRA State Manager** alias. Existing workflows continue through the same normalization and migration paths.
+
 ### Basic wiring
 
 Recommended connected save/load wiring:
