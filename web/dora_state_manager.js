@@ -7,6 +7,7 @@ const NODE_CLASS = "State Manager";
 const LEGACY_NODE_CLASS = "DoRA State Manager";
 const DORA_LOADER_CLASS = "DoRA Power LoRA Loader";
 const DORA_STATE_KIND = "dora_state_manager_state";
+const STATE_SCHEMA_VERSION = 3;
 const STATE_MANAGER_CONTROL_KIND = "state_manager_control";
 const STATE_TEXT_CLASS = "State Manager Text Box";
 const STATE_TEXT_DISPLAY_CLASS = "State Text Box";
@@ -99,10 +100,10 @@ function cleanId(value, fallback) {
   return text || fallback;
 }
 
-function defaultPrompt() {
+function defaultPrompt(name = "Default Character") {
   return {
     id: "default_prompt",
-    name: "Default Prompt",
+    name: String(name || "Default Character"),
     positive: "",
     negative: "",
     text_boxes: [
@@ -279,12 +280,12 @@ function defaultCharacter() {
     // Legacy/default stack mirror. Kept for old workflows and old consumers.
     loras: stack.loras,
     loader_globals: stack.loader_globals,
-    prompts: [defaultPrompt()],
+    prompts: [defaultPrompt("Default Character")],
   };
 }
 
 function defaultState() {
-  return { version: 2, characters: [defaultCharacter()] };
+  return { version: STATE_SCHEMA_VERSION, characters: [defaultCharacter()] };
 }
 
 function defaultUiState() {
@@ -543,11 +544,12 @@ function normalizeLoraRow(row) {
   };
 }
 
-function normalizePrompt(prompt, index) {
+function normalizePrompt(prompt, index, nameOverride = "") {
   const p = prompt && typeof prompt === "object" ? prompt : {};
+  const fallbackName = `Character ${index + 1}`;
   return syncPromptTextMirror({
     id: cleanId(p.id, `prompt_${index + 1}`),
-    name: String(p.name ?? `Prompt ${index + 1}`).trim() || `Prompt ${index + 1}`,
+    name: String(nameOverride || p.name || fallbackName).trim() || fallbackName,
     positive: String(p.positive ?? p.positive_prompt ?? ""),
     negative: String(p.negative ?? p.negative_prompt ?? ""),
     text_boxes: normalizePromptTextBoxes(p),
@@ -557,15 +559,18 @@ function normalizePrompt(prompt, index) {
   });
 }
 
-function normalizeCharacter(character, index) {
+function normalizeCharacter(character, index, { migrateLegacyPresetNames = false } = {}) {
   const c = character && typeof character === "object" ? character : {};
-  const prompts = Array.isArray(c.prompts) ? c.prompts.map(normalizePrompt).filter(Boolean) : [];
+  const name = String(c.name ?? `Character ${index + 1}`).trim() || `Character ${index + 1}`;
+  const prompts = Array.isArray(c.prompts)
+    ? c.prompts.map((prompt, promptIndex) => normalizePrompt(prompt, promptIndex, migrateLegacyPresetNames ? name : "")).filter(Boolean)
+    : [];
   const normalized = {
     id: cleanId(c.id, `character_${index + 1}`),
-    name: String(c.name ?? `Character ${index + 1}`).trim() || `Character ${index + 1}`,
+    name,
     thumbnail: normalizeThumbnail(c.thumbnail),
     loader_stacks: normalizeLoaderStacks(c),
-    prompts: prompts.length ? prompts : [defaultPrompt()],
+    prompts: prompts.length ? prompts : [defaultPrompt(name)],
   };
   return syncLegacyLoaderMirror(normalized);
 }
@@ -574,8 +579,11 @@ function normalizeCharacter(character, index) {
 function normalizeState(raw) {
   const parsed = safeJsonParse(raw, defaultState());
   const charsIn = Array.isArray(parsed.characters) ? parsed.characters : [];
-  const characters = charsIn.map(normalizeCharacter).filter(Boolean);
-  return { version: 2, characters: characters.length ? characters : [defaultCharacter()] };
+  const migrateLegacyPresetNames = Number(parsed.version ?? 0) < STATE_SCHEMA_VERSION;
+  const characters = charsIn
+    .map((character, index) => normalizeCharacter(character, index, { migrateLegacyPresetNames }))
+    .filter(Boolean);
+  return { version: STATE_SCHEMA_VERSION, characters: characters.length ? characters : [defaultCharacter()] };
 }
 
 function updatePromptName(state, characterId, promptId, value) {
@@ -2616,9 +2624,8 @@ function renderLibrary(node, state, uiState, character, prompt) {
     controls.append(
       makeButton("New preset", () => {
         const current = currentLibrarySelection();
-        const next = defaultPrompt();
+        const next = defaultPrompt(current.prompt.name);
         next.id = makeId("prompt");
-        next.name = `Prompt ${current.character.prompts.length + 1}`;
         current.character.prompts.push(next);
         ctx.focusLibrarySelection = true;
         updateState(node, current.state, current.uiState, { characterId: current.character.id, promptId: next.id, status: `Created preset for ${current.character.name}.` });
@@ -2650,6 +2657,7 @@ function renderLibrary(node, state, uiState, character, prompt) {
         next.id = makeId("character");
         next.name = `Character ${current.state.characters.length + 1}`;
         next.prompts[0].id = makeId("prompt");
+        next.prompts[0].name = next.name;
         current.state.characters.push(next);
         ctx.focusLibrarySelection = true;
         updateState(node, current.state, current.uiState, { characterId: next.id, promptId: next.prompts[0].id, status: "Created character." });
@@ -2659,7 +2667,7 @@ function renderLibrary(node, state, uiState, character, prompt) {
         const copy = structuredCloneCompat(current.character);
         copy.id = makeId("character");
         copy.name = `${copy.name} Copy`;
-        copy.prompts = copy.prompts.map((item) => ({ ...item, id: makeId("prompt") }));
+        copy.prompts = copy.prompts.map((item) => ({ ...item, id: makeId("prompt"), name: `${item.name} Copy` }));
         current.state.characters.push(copy);
         ctx.focusLibrarySelection = true;
         updateState(node, current.state, current.uiState, { characterId: copy.id, promptId: copy.prompts[0]?.id || "", status: "Duplicated character." });
@@ -2919,9 +2927,8 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
   header.append(
     select,
     makeButton("New", () => {
-      const p = defaultPrompt();
+      const p = defaultPrompt(prompt.name);
       p.id = makeId("prompt");
-      p.name = `Prompt ${character.prompts.length + 1}`;
       character.prompts.push(p);
       updateState(node, state, uiState, { characterId: character.id, promptId: p.id, status: "Created prompt preset." });
     }),
@@ -3882,7 +3889,7 @@ function buildQueuedDoraStatePayload(character, prompt) {
     kind: "dora_state_manager_state",
     character: {
       id: String(character?.id ?? ""),
-      name: String(character?.name ?? ""),
+      name: String(prompt?.name ?? character?.name ?? ""),
       thumbnail: normalizeThumbnail(character?.thumbnail),
     },
     prompt: {
