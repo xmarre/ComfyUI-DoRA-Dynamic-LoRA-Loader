@@ -578,6 +578,18 @@ function normalizeState(raw) {
   return { version: 2, characters: characters.length ? characters : [defaultCharacter()] };
 }
 
+function updatePromptName(state, characterId, promptId, value) {
+  const nextState = normalizeState(state);
+  const character = nextState.characters.find((item) => item.id === characterId);
+  const promptIndex = character?.prompts.findIndex((item) => item.id === promptId) ?? -1;
+  if (!character || promptIndex < 0) return nextState;
+
+  const prompt = { ...character.prompts[promptIndex] };
+  prompt.name = String(value ?? "").trim() || prompt.name;
+  character.prompts[promptIndex] = prompt;
+  return nextState;
+}
+
 function normalizeIdList(value) {
   if (Array.isArray(value)) return value.map((item) => cleanId(item, "")).filter(Boolean);
   if (typeof value === "string") {
@@ -2332,7 +2344,7 @@ function renderPresetTile(node, character, prompt, selectedCharacterId, selected
   tile.dataset.promptId = prompt.id;
   tile.dataset.search = searchText || librarySearchText(character, prompt);
   tile.className = `dsm-preset-tile${isSelected ? " selected" : ""}`;
-  tile.setAttribute("aria-label", `${character.name} — ${prompt.name}`);
+  tile.setAttribute("aria-label", prompt.name);
   if (isSelected) tile.setAttribute("aria-current", "true");
 
   const thumb = document.createElement("div");
@@ -2341,12 +2353,12 @@ function renderPresetTile(node, character, prompt, selectedCharacterId, selected
   if (url) {
     const img = document.createElement("img");
     img.src = url;
-    img.alt = `${character.name} — ${prompt.name}`;
+    img.alt = prompt.name;
     img.loading = "lazy";
     img.decoding = "async";
     thumb.appendChild(img);
   } else {
-    thumb.textContent = character.name.trim().slice(0, 2).toUpperCase() || "?";
+    thumb.textContent = prompt.name.trim().slice(0, 2).toUpperCase() || "?";
   }
 
   const body = document.createElement("div");
@@ -2355,16 +2367,12 @@ function renderPresetTile(node, character, prompt, selectedCharacterId, selected
   name.className = "dsm-preset-name";
   name.textContent = prompt.name;
   name.title = prompt.name;
-  const owner = document.createElement("div");
-  owner.className = "dsm-preset-character";
-  owner.textContent = character.name;
-  owner.title = character.name;
   const meta = document.createElement("div");
   meta.className = "dsm-muted dsm-preset-meta";
   const seed = extractSeedFromSettings(prompt.settings);
   const textBoxCount = normalizePromptTextBoxes(prompt).length;
   meta.textContent = `${textBoxCount} text box${textBoxCount === 1 ? "" : "es"}${seed == null ? "" : ` · seed ${seed}`}`;
-  body.append(owner, name, meta);
+  body.append(name, meta);
   tile.append(thumb, body);
 
   const selectPreset = () => {
@@ -2375,7 +2383,7 @@ function renderPresetTile(node, character, prompt, selectedCharacterId, selected
     updateState(node, current.state, current.uiState, {
       characterId: character.id,
       promptId: prompt.id,
-      status: `Selected ${nextCharacter.name} / ${nextPrompt.name}. Use Load/Apply to push it into graph nodes.`,
+      status: `Selected ${nextPrompt.name}. Use Load/Apply to push it into graph nodes.`,
     });
   };
   tile.addEventListener("click", selectPreset);
@@ -2442,7 +2450,7 @@ function renderHeader(node, state, uiState, character, prompt) {
   title.textContent = "State Manager";
   const selection = document.createElement("div");
   selection.className = "dsm-selection-path";
-  selection.textContent = `${character.name} / ${prompt.name}`;
+  selection.textContent = prompt.name;
   selection.title = selection.textContent;
   heading.append(title, selection);
 
@@ -2855,7 +2863,7 @@ function renderCharacterPanel(node, state, uiState, character) {
   imageNote.className = "dsm-muted";
   imageNote.textContent = "The State Manager image output loads the original uploaded file, not the CSS-scaled preview.";
 
-  section.append(title, labelledControl("Name", nameInput), preview, fileInput, thumbnailButtons, imageNote, labelledControl("Saved LoRA stacks", loraSummary));
+  section.append(title, labelledControl("Shared group name (all states)", nameInput), preview, fileInput, thumbnailButtons, imageNote, labelledControl("Saved LoRA stacks", loraSummary));
   return section;
 }
 
@@ -2935,8 +2943,9 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
   );
 
   const name = makeInput(prompt.name, (value) => {
-    prompt.name = value.trim() || prompt.name;
-    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    const current = getRenderableState(node);
+    const nextState = updatePromptName(current.state, character.id, prompt.id, value);
+    updateState(node, nextState, current.uiState, { characterId: character.id, promptId: prompt.id });
   });
 
   const positive = makeTextarea(getPromptText(prompt, "positive", "default"), (value) => {
@@ -3097,7 +3106,7 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
 
   section.append(
     header,
-    labelledControl("Preset name", name),
+    labelledControl("Character name", name),
     labelledControl("fileimage_prefix", fileimagePrefix),
     referencePreview,
     referenceInput,
@@ -3519,19 +3528,13 @@ function ensureStyles() {
       align-items: stretch;
     }
     .dsm-preset-body { min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 2px; }
-    .dsm-preset-character, .dsm-character-name {
+    .dsm-preset-name, .dsm-character-name {
       font-size: 13px;
       font-weight: 700;
       line-height: 1.25;
       overflow-wrap: anywhere;
       word-break: break-word;
       white-space: normal;
-    }
-    .dsm-preset-name {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      opacity: .72;
     }
     .dsm-preset-meta { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .dsm-preset-thumb, .dsm-thumb, .dsm-large-thumb {
