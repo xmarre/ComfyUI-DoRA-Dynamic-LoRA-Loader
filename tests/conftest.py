@@ -13,6 +13,16 @@ COMFYUI_PATH = pathlib.Path(os.environ.get("COMFYUI_PATH", ROOT / "ComfyUI")).re
 if str(COMFYUI_PATH) not in sys.path:
     sys.path.insert(0, str(COMFYUI_PATH))
 
+# GitHub's hosted runners use the CPU-only PyTorch wheel. ComfyUI's CLI parser
+# intentionally parses an empty argv when imported as a library, so its default
+# device remains CUDA unless a caller changes the parsed args before importing
+# comfy.model_management. Force CPU mode for these pure adapter tests; this is
+# the same supported ComfyUI --cpu execution mode, without letting ComfyUI parse
+# pytest's own command-line arguments.
+import comfy.cli_args as comfy_cli_args
+
+comfy_cli_args.args.cpu = True
+
 
 @pytest.fixture(scope="session")
 def dora_modules():
