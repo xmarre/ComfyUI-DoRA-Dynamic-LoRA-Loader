@@ -88,7 +88,8 @@ jobs:
           python -m pip install pytest numpy psutil safetensors einops tqdm pyyaml pillow packaging aiohttp comfy-kitchen==0.2.26 comfy-aimdo==0.4.13
 
       - name: Run compatibility and runtime-bypass tests
+        working-directory: tests
         env:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
           PYTHONPATH: ${{ github.workspace }}/ComfyUI
-        run: python -m pytest -q --rootdir=tests --import-mode=importlib tests
+        run: python -m pytest -q --import-mode=importlib .
