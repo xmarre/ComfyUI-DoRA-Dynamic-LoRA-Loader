@@ -87,9 +87,16 @@ jobs:
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install pytest numpy psutil safetensors einops tqdm pyyaml pillow packaging aiohttp comfy-kitchen==0.2.26 comfy-aimdo==0.4.13
 
+      - name: Stage compatibility tests outside package tree
+        shell: bash
+        run: |
+          rm -rf /tmp/dora-loader-tests
+          cp -R tests /tmp/dora-loader-tests
+
       - name: Run compatibility and runtime-bypass tests
-        working-directory: tests
+        working-directory: /tmp/dora-loader-tests
         env:
+          DORA_REPO_ROOT: ${{ github.workspace }}
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
           PYTHONPATH: ${{ github.workspace }}/ComfyUI
         run: python -m pytest -q --import-mode=importlib .
