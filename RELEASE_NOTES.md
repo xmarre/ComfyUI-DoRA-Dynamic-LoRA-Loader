@@ -4,8 +4,9 @@ Adds an opt-in runtime LoRA path for reducing the large persistent VRAM cost of 
 
 ## Runtime bypass LoRA
 
-- Adds `Runtime bypass LoRA (low VRAM; standard LoRA only)` to the DoRA Power LoRA Loader.
+- Adds `Runtime bypass LoRA (low VRAM)` to the DoRA Power LoRA Loader.
 - Keeps the option disabled by default so existing workflows retain the current materialized-weight behavior.
+- For supported standard LoRAs, this is intended to preserve the same LoRA effect while changing how it is executed: instead of materializing `W + ΔW`, the loader keeps the base weight `W` untouched and evaluates the low-rank `ΔW` path during the forward pass.
 - Applies supported standard LoRA adapters in the module forward pass rather than permanently materializing LoRA-patched base weights.
 - Supports multiple stacked LoRAs targeting the same module and removes nested forward wrappers in reverse order during ejection.
 - Keeps LoRA strength as a runtime adapter multiplier, avoiding a full base-weight rematerialization solely because the strength changes.
@@ -34,6 +35,7 @@ DoRA is checked from raw file keys before application and again from the constru
 - Adds an automated GitHub release workflow gated on a successful `tests` run from `main`.
 - GitHub releases contain a versioned repository ZIP and `SHA256SUMS` manifest and use this file as the release notes.
 - Aligns Comfy Registry publishing with the pinned action revisions used by Spectrum MiniMax H3.
+- Manual MiniMax-H3 VRAM validation confirmed that repeated LoRA strength changes return to the same settled live-allocation baseline rather than accumulating another materialized model-sized copy each time.
 
 ## Compatibility
 
