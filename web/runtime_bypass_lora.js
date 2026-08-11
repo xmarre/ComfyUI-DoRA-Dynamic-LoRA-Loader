@@ -39,7 +39,7 @@ function ensureRuntimeWidget(node) {
     }
   );
 
-  widget.label = "Runtime bypass LoRA (low VRAM; standard LoRA only)";
+  widget.label = "Runtime bypass LoRA (low VRAM)";
   widget.tooltip =
     "Keeps base model weights untouched and evaluates standard LoRA adapters during forward passes. " +
     "Avoids the full materialized patched-weight copy on very large models. DoRA and unsupported " +
