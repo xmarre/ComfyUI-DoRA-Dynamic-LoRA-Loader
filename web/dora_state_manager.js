@@ -7,6 +7,7 @@ const NODE_CLASS = "State Manager";
 const LEGACY_NODE_CLASS = "DoRA State Manager";
 const DORA_LOADER_CLASS = "DoRA Power LoRA Loader";
 const DORA_STATE_KIND = "dora_state_manager_state";
+const STATE_SCHEMA_VERSION = 3;
 const STATE_MANAGER_CONTROL_KIND = "state_manager_control";
 const STATE_TEXT_CLASS = "State Manager Text Box";
 const STATE_TEXT_DISPLAY_CLASS = "State Text Box";
@@ -99,10 +100,10 @@ function cleanId(value, fallback) {
   return text || fallback;
 }
 
-function defaultPrompt() {
+function defaultPrompt(name = "Default Character") {
   return {
     id: "default_prompt",
-    name: "Default Prompt",
+    name: String(name || "Default Character"),
     positive: "",
     negative: "",
     text_boxes: [
@@ -279,12 +280,12 @@ function defaultCharacter() {
     // Legacy/default stack mirror. Kept for old workflows and old consumers.
     loras: stack.loras,
     loader_globals: stack.loader_globals,
-    prompts: [defaultPrompt()],
+    prompts: [defaultPrompt("Default Character")],
   };
 }
 
 function defaultState() {
-  return { version: 2, characters: [defaultCharacter()] };
+  return { version: STATE_SCHEMA_VERSION, characters: [defaultCharacter()] };
 }
 
 function defaultUiState() {
@@ -543,11 +544,12 @@ function normalizeLoraRow(row) {
   };
 }
 
-function normalizePrompt(prompt, index) {
+function normalizePrompt(prompt, index, nameOverride = "") {
   const p = prompt && typeof prompt === "object" ? prompt : {};
+  const fallbackName = `Character ${index + 1}`;
   return syncPromptTextMirror({
     id: cleanId(p.id, `prompt_${index + 1}`),
-    name: String(p.name ?? `Prompt ${index + 1}`).trim() || `Prompt ${index + 1}`,
+    name: String(nameOverride || p.name || fallbackName).trim() || fallbackName,
     positive: String(p.positive ?? p.positive_prompt ?? ""),
     negative: String(p.negative ?? p.negative_prompt ?? ""),
     text_boxes: normalizePromptTextBoxes(p),
@@ -557,15 +559,18 @@ function normalizePrompt(prompt, index) {
   });
 }
 
-function normalizeCharacter(character, index) {
+function normalizeCharacter(character, index, { migrateLegacyPresetNames = false } = {}) {
   const c = character && typeof character === "object" ? character : {};
-  const prompts = Array.isArray(c.prompts) ? c.prompts.map(normalizePrompt).filter(Boolean) : [];
+  const name = String(c.name ?? `Character ${index + 1}`).trim() || `Character ${index + 1}`;
+  const prompts = Array.isArray(c.prompts)
+    ? c.prompts.map((prompt, promptIndex) => normalizePrompt(prompt, promptIndex, migrateLegacyPresetNames ? name : "")).filter(Boolean)
+    : [];
   const normalized = {
     id: cleanId(c.id, `character_${index + 1}`),
-    name: String(c.name ?? `Character ${index + 1}`).trim() || `Character ${index + 1}`,
+    name,
     thumbnail: normalizeThumbnail(c.thumbnail),
     loader_stacks: normalizeLoaderStacks(c),
-    prompts: prompts.length ? prompts : [defaultPrompt()],
+    prompts: prompts.length ? prompts : [defaultPrompt(name)],
   };
   return syncLegacyLoaderMirror(normalized);
 }
@@ -574,8 +579,23 @@ function normalizeCharacter(character, index) {
 function normalizeState(raw) {
   const parsed = safeJsonParse(raw, defaultState());
   const charsIn = Array.isArray(parsed.characters) ? parsed.characters : [];
-  const characters = charsIn.map(normalizeCharacter).filter(Boolean);
-  return { version: 2, characters: characters.length ? characters : [defaultCharacter()] };
+  const migrateLegacyPresetNames = Number(parsed.version ?? 0) < STATE_SCHEMA_VERSION;
+  const characters = charsIn
+    .map((character, index) => normalizeCharacter(character, index, { migrateLegacyPresetNames }))
+    .filter(Boolean);
+  return { version: STATE_SCHEMA_VERSION, characters: characters.length ? characters : [defaultCharacter()] };
+}
+
+function updatePromptName(state, characterId, promptId, value) {
+  const nextState = normalizeState(state);
+  const character = nextState.characters.find((item) => item.id === characterId);
+  const promptIndex = character?.prompts.findIndex((item) => item.id === promptId) ?? -1;
+  if (!character || promptIndex < 0) return nextState;
+
+  const prompt = { ...character.prompts[promptIndex] };
+  prompt.name = String(value ?? "").trim() || prompt.name;
+  character.prompts[promptIndex] = prompt;
+  return nextState;
 }
 
 function normalizeIdList(value) {
@@ -2226,6 +2246,7 @@ function renderCharacterTile(node, state, uiState, character, selectedId, select
   tile.dataset.libraryItem = "character";
   tile.dataset.characterId = character.id;
   tile.dataset.search = librarySearchText(character);
+  tile.setAttribute("aria-label", character.name);
   if (isSelected) tile.setAttribute("aria-current", "true");
   tile.className = `dsm-character-tile${isSelected ? " selected" : ""}${isActiveQueueChunk ? " queued" : ""}${isQueued && !isActiveQueueChunk ? " prepared" : ""}`;
 
@@ -2246,6 +2267,7 @@ function renderCharacterTile(node, state, uiState, character, selectedId, select
   const name = document.createElement("div");
   name.className = "dsm-character-name";
   name.textContent = character.name;
+  name.title = character.name;
 
   const meta = document.createElement("div");
   meta.className = "dsm-muted";
@@ -2330,6 +2352,7 @@ function renderPresetTile(node, character, prompt, selectedCharacterId, selected
   tile.dataset.promptId = prompt.id;
   tile.dataset.search = searchText || librarySearchText(character, prompt);
   tile.className = `dsm-preset-tile${isSelected ? " selected" : ""}`;
+  tile.setAttribute("aria-label", prompt.name);
   if (isSelected) tile.setAttribute("aria-current", "true");
 
   const thumb = document.createElement("div");
@@ -2338,7 +2361,7 @@ function renderPresetTile(node, character, prompt, selectedCharacterId, selected
   if (url) {
     const img = document.createElement("img");
     img.src = url;
-    img.alt = `${prompt.name} — ${character.name}`;
+    img.alt = prompt.name;
     img.loading = "lazy";
     img.decoding = "async";
     thumb.appendChild(img);
@@ -2352,16 +2375,12 @@ function renderPresetTile(node, character, prompt, selectedCharacterId, selected
   name.className = "dsm-preset-name";
   name.textContent = prompt.name;
   name.title = prompt.name;
-  const owner = document.createElement("div");
-  owner.className = "dsm-preset-character";
-  owner.textContent = character.name;
-  owner.title = character.name;
   const meta = document.createElement("div");
   meta.className = "dsm-muted dsm-preset-meta";
   const seed = extractSeedFromSettings(prompt.settings);
   const textBoxCount = normalizePromptTextBoxes(prompt).length;
   meta.textContent = `${textBoxCount} text box${textBoxCount === 1 ? "" : "es"}${seed == null ? "" : ` · seed ${seed}`}`;
-  body.append(name, owner, meta);
+  body.append(name, meta);
   tile.append(thumb, body);
 
   const selectPreset = () => {
@@ -2372,7 +2391,7 @@ function renderPresetTile(node, character, prompt, selectedCharacterId, selected
     updateState(node, current.state, current.uiState, {
       characterId: character.id,
       promptId: prompt.id,
-      status: `Selected ${nextCharacter.name} / ${nextPrompt.name}. Use Load/Apply to push it into graph nodes.`,
+      status: `Selected ${nextPrompt.name}. Use Load/Apply to push it into graph nodes.`,
     });
   };
   tile.addEventListener("click", selectPreset);
@@ -2413,6 +2432,7 @@ function rememberLibraryScroll(node, element, key) {
   if (!ctx || !element) return;
   ctx.scrollPositions = ctx.scrollPositions || {};
   element.addEventListener("scroll", () => {
+    if (!element.isConnected) return;
     ctx.scrollPositions[key] = element.scrollTop;
   }, { passive: true });
   requestAnimationFrame(() => {
@@ -2438,7 +2458,7 @@ function renderHeader(node, state, uiState, character, prompt) {
   title.textContent = "State Manager";
   const selection = document.createElement("div");
   selection.className = "dsm-selection-path";
-  selection.textContent = `${character.name} / ${prompt.name}`;
+  selection.textContent = prompt.name;
   selection.title = selection.textContent;
   heading.append(title, selection);
 
@@ -2604,9 +2624,8 @@ function renderLibrary(node, state, uiState, character, prompt) {
     controls.append(
       makeButton("New preset", () => {
         const current = currentLibrarySelection();
-        const next = defaultPrompt();
+        const next = defaultPrompt(current.prompt.name);
         next.id = makeId("prompt");
-        next.name = `Prompt ${current.character.prompts.length + 1}`;
         current.character.prompts.push(next);
         ctx.focusLibrarySelection = true;
         updateState(node, current.state, current.uiState, { characterId: current.character.id, promptId: next.id, status: `Created preset for ${current.character.name}.` });
@@ -2638,6 +2657,7 @@ function renderLibrary(node, state, uiState, character, prompt) {
         next.id = makeId("character");
         next.name = `Character ${current.state.characters.length + 1}`;
         next.prompts[0].id = makeId("prompt");
+        next.prompts[0].name = next.name;
         current.state.characters.push(next);
         ctx.focusLibrarySelection = true;
         updateState(node, current.state, current.uiState, { characterId: next.id, promptId: next.prompts[0].id, status: "Created character." });
@@ -2647,7 +2667,7 @@ function renderLibrary(node, state, uiState, character, prompt) {
         const copy = structuredCloneCompat(current.character);
         copy.id = makeId("character");
         copy.name = `${copy.name} Copy`;
-        copy.prompts = copy.prompts.map((item) => ({ ...item, id: makeId("prompt") }));
+        copy.prompts = copy.prompts.map((item) => ({ ...item, id: makeId("prompt"), name: `${item.name} Copy` }));
         current.state.characters.push(copy);
         ctx.focusLibrarySelection = true;
         updateState(node, current.state, current.uiState, { characterId: copy.id, promptId: copy.prompts[0]?.id || "", status: "Duplicated character." });
@@ -2851,7 +2871,7 @@ function renderCharacterPanel(node, state, uiState, character) {
   imageNote.className = "dsm-muted";
   imageNote.textContent = "The State Manager image output loads the original uploaded file, not the CSS-scaled preview.";
 
-  section.append(title, labelledControl("Name", nameInput), preview, fileInput, thumbnailButtons, imageNote, labelledControl("Saved LoRA stacks", loraSummary));
+  section.append(title, labelledControl("Shared group name (all states)", nameInput), preview, fileInput, thumbnailButtons, imageNote, labelledControl("Saved LoRA stacks", loraSummary));
   return section;
 }
 
@@ -2907,9 +2927,8 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
   header.append(
     select,
     makeButton("New", () => {
-      const p = defaultPrompt();
+      const p = defaultPrompt(prompt.name);
       p.id = makeId("prompt");
-      p.name = `Prompt ${character.prompts.length + 1}`;
       character.prompts.push(p);
       updateState(node, state, uiState, { characterId: character.id, promptId: p.id, status: "Created prompt preset." });
     }),
@@ -2931,8 +2950,9 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
   );
 
   const name = makeInput(prompt.name, (value) => {
-    prompt.name = value.trim() || prompt.name;
-    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    const current = getRenderableState(node);
+    const nextState = updatePromptName(current.state, character.id, prompt.id, value);
+    updateState(node, nextState, current.uiState, { characterId: character.id, promptId: prompt.id });
   });
 
   const positive = makeTextarea(getPromptText(prompt, "positive", "default"), (value) => {
@@ -3093,7 +3113,7 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
 
   section.append(
     header,
-    labelledControl("Preset name", name),
+    labelledControl("Character name", name),
     labelledControl("fileimage_prefix", fileimagePrefix),
     referencePreview,
     referenceInput,
@@ -3393,11 +3413,17 @@ function renderNode(node) {
   const mode = ctx.libraryMode === "characters" ? "characters" : "presets";
   const key = libraryRenderKey(node, state, uiState, mode);
   let library = ctx.libraryElement;
+  let preservedScroll = null;
   if (!library || ctx.libraryKey !== key) {
     library = renderLibrary(node, state, uiState, character, prompt);
     ctx.libraryElement = library;
     ctx.libraryKey = key;
   } else {
+    const grid = library.querySelector(`[data-scroll-key="${mode}"]`);
+    if (grid) {
+      preservedScroll = { element: grid, top: grid.scrollTop };
+      ctx.scrollPositions[mode] = preservedScroll.top;
+    }
     library.remove();
     updateLibrarySelection(library, character.id, prompt.id);
   }
@@ -3408,6 +3434,15 @@ function renderNode(node) {
   main.className = "dsm-main";
   main.append(library, renderPromptPanel(node, state, uiState, character, prompt));
   ctx.root.appendChild(main);
+  if (preservedScroll) {
+    const restoreScroll = () => {
+      if (!preservedScroll.element.isConnected) return;
+      preservedScroll.element.scrollTop = preservedScroll.top;
+      ctx.scrollPositions[mode] = preservedScroll.element.scrollTop;
+    };
+    restoreScroll();
+    requestAnimationFrame(restoreScroll);
+  }
 }
 
 function ensureStyles() {
@@ -3500,9 +3535,14 @@ function ensureStyles() {
       align-items: stretch;
     }
     .dsm-preset-body { min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 2px; }
-    .dsm-preset-name, .dsm-preset-character, .dsm-character-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .dsm-preset-name, .dsm-character-name { font-weight: 650; }
-    .dsm-preset-character { opacity: .74; }
+    .dsm-preset-name, .dsm-character-name {
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.25;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      white-space: normal;
+    }
     .dsm-preset-meta { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .dsm-preset-thumb, .dsm-thumb, .dsm-large-thumb {
       display: flex;
@@ -3849,7 +3889,7 @@ function buildQueuedDoraStatePayload(character, prompt) {
     kind: "dora_state_manager_state",
     character: {
       id: String(character?.id ?? ""),
-      name: String(character?.name ?? ""),
+      name: String(prompt?.name ?? character?.name ?? ""),
       thumbnail: normalizeThumbnail(character?.thumbnail),
     },
     prompt: {

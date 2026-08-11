@@ -1111,7 +1111,9 @@ def _resolve_dora_state_payload(
         "kind": _DORA_STATE_KIND,
         "character": {
             "id": character.get("id", ""),
-            "name": character.get("name", ""),
+            # The UI's per-state character name is stored in the legacy prompt-name
+            # slot so sibling states remain independently renameable.
+            "name": prompt.get("name", character.get("name", "")),
             "thumbnail": character.get("thumbnail", {}),
         },
         "prompt": {
