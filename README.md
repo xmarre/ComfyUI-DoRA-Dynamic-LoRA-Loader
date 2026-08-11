@@ -19,6 +19,45 @@ This implementation was reworked for the unified DoRA + standard LoRA path in th
 
 ---
 
+## Runtime bypass LoRA (low VRAM)
+
+The loader includes an optional **Runtime bypass LoRA (low VRAM)** mode for supported standard LoRAs.
+
+The word **bypass** refers to bypassing **weight materialization**, not bypassing or weakening the LoRA effect. For a normal additive LoRA, the regular merged path evaluates a layer with `W + ΔW`, while the runtime path keeps `W` untouched and evaluates the equivalent low-rank contribution during the forward pass:
+
+```text
+regular: (W + ΔW)x
+runtime: Wx + ΔWx
+```
+
+For supported standard LoRAs these are mathematically equivalent. Small floating-point differences can still occur because the operations are executed in a different order/dtype path, and runtime bypass adds the low-rank operations on every forward instead of paying the full merge/materialization cost up front.
+
+This follows ComfyUI's own bypass adapter design: ComfyUI describes it as loading LoRA **without modifying base model weights** and injecting the LoRA computation into the forward pass (`base_forward(x) + lora_path(x)`).
+
+### Why it saves so much VRAM
+
+Normal materialized patching may need to retain the original model weights while also holding the fully patched replacement weights. On very large HIGH_VRAM models this can mean tens of GiB of additional live VRAM even when the LoRA file itself is only a few hundred MiB.
+
+Runtime bypass keeps the base model weights unchanged and stores/evaluates the low-rank adapter tensors directly, avoiding that full patched-model copy for supported adapters.
+
+### Important limitation: DoRA is not runtime-bypassed
+
+Current ComfyUI bypass LoRA math implements the additive LoRA path, but not DoRA magnitude normalization/rescaling. Treating a DoRA as ordinary bypass LoRA would therefore change its mathematics.
+
+This loader deliberately **fails closed** when runtime bypass encounters DoRA or another unsupported adapter form. It does not silently approximate it. Disable Runtime bypass LoRA for those files and use the normal materialized path instead.
+
+Runtime bypass currently refuses:
+
+- DoRA / magnitude-vector LoRAs (`dora_scale`, Diffusers/PEFT `lora_magnitude_vector`, `w_norm`, `b_norm`)
+- non-LoRA weight-adapter types
+- LoRA reshape metadata
+- sliced / offset / transformed adapter targets
+- non-default `strength_model` patch semantics
+
+The option is **OFF by default**, so existing workflows retain the previous materialized LoRA/DoRA behavior unless you explicitly enable it.
+
+---
+
 ## Auto-strength
 
 This node includes optional **auto-strength** redistribution for loaded LoRAs / DoRAs.
@@ -343,6 +382,7 @@ Each row has:
 ### Global options
 
 - Stack Enabled
+- Runtime bypass LoRA (low VRAM)
 - Verbose
 - Log Unloaded Keys
 - Auto-strength enabled
@@ -381,8 +421,9 @@ For each enabled row:
 9. if enabled, compute per-base auto-strength redistribution ratios  
    on the selected analysis device and bake only those ratios into the LoRA tensors
 10. call `comfy.lora.load_lora(...)`
-11. apply patches via `model.add_patches(...)` / `clip.add_patches(...)`  
-    using the normal outer Model / CLIP strengths
+11. apply supported standard LoRA adapters either:
+    - through the normal `model.add_patches(...)` / `clip.add_patches(...)` materialized path when Runtime bypass LoRA is OFF, or
+    - through runtime forward-pass adapter injection when Runtime bypass LoRA is ON
 
 ---
 
@@ -399,6 +440,12 @@ These patches affect DoRA / LoRA application in the running ComfyUI process, not
 ---
 
 ## Troubleshooting
+
+### Runtime bypass rejects a LoRA
+
+Runtime bypass only takes adapters for which the supported forward-pass path preserves the normal patch semantics. In particular, current ComfyUI bypass LoRA does **not** implement DoRA magnitude normalization.
+
+If the loader reports DoRA/magnitude-vector, reshape, offset/transform, or another unsupported adapter form, disable **Runtime bypass LoRA (low VRAM)** for that file rather than trying to force it through the runtime path.
 
 ### Flux2 DoRA instability
 
