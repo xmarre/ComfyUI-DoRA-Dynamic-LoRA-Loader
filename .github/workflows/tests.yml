@@ -1,0 +1,133 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  package-and-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out custom node
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Compile Python sources
+        run: python -m py_compile __init__.py nodes.py runtime_bypass.py
+
+      - name: Check frontend JavaScript syntax
+        shell: bash
+        run: |
+          while IFS= read -r -d '' file; do
+            echo "Checking ${file}"
+            node --check "${file}"
+          done < <(find web -type f -name '*.js' -print0)
+
+      - name: Build package wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip wheel --no-deps --wheel-dir /tmp/dora-loader-wheel .
+
+      - name: Verify wheel was produced
+        shell: bash
+        run: |
+          shopt -s nullglob
+          wheels=(/tmp/dora-loader-wheel/*.whl)
+          test "${#wheels[@]}" -eq 1
+          echo "Built ${wheels[0]}"
+
+  compatibility-and-runtime-bypass:
+    name: ComfyUI ${{ matrix.comfy_version }} compatibility/runtime tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - comfy_version: v0.29.2
+            comfy_ref: 322122449c9d2ba8b8df1bb517364527dd0615f1
+            torch_version: "2.7.1"
+            torchvision_version: "0.22.1"
+            torchaudio_version: "2.7.1"
+          - comfy_version: v0.30.2
+            comfy_ref: dec5d9450a5290bcf63430409ea41018e67f41c3
+            torch_version: "2.8.0"
+            torchvision_version: "0.23.0"
+            torchaudio_version: "2.8.0"
+          - comfy_version: v0.31.1
+            comfy_ref: fe4195f7f4275f2626cbafc703acc3ddde1e5490
+            torch_version: "2.10.0"
+            torchvision_version: "0.25.0"
+            torchaudio_version: "2.10.0"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out custom node
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check out reviewed ComfyUI source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          repository: Comfy-Org/ComfyUI
+          ref: ${{ matrix.comfy_ref }}
+          path: ComfyUI
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pinned ComfyUI runtime and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Pin a known CPU-only PyTorch family for every reviewed ComfyUI
+          # revision. This keeps the compatibility matrix reproducible instead
+          # of silently changing when PyTorch publishes a new stable wheel.
+          python -m pip install \
+            "torch==${{ matrix.torch_version }}" \
+            "torchvision==${{ matrix.torchvision_version }}" \
+            "torchaudio==${{ matrix.torchaudio_version }}" \
+            --index-url https://download.pytorch.org/whl/cpu
+          # Each matrix entry still owns the rest of its runtime dependency set.
+          python -m pip install -r ComfyUI/requirements.txt
+          python -m pip install pytest
+
+      - name: Report pinned runtime versions
+        shell: bash
+        run: |
+          python - <<'PY'
+          import importlib.metadata as metadata
+          for package in ("torch", "torchvision", "torchaudio"):
+              print(f"{package}={metadata.version(package)}")
+          PY
+
+      - name: Stage compatibility tests outside package tree
+        shell: bash
+        run: |
+          rm -rf /tmp/dora-loader-tests
+          cp -R tests /tmp/dora-loader-tests
+
+      - name: Run compatibility and runtime-bypass tests
+        working-directory: /tmp/dora-loader-tests
+        env:
+          DORA_REPO_ROOT: ${{ github.workspace }}
+          COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
+          PYTHONPATH: ${{ github.workspace }}/ComfyUI
+        run: python -m pytest -q --import-mode=importlib .

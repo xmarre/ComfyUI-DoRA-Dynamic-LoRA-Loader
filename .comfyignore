@@ -1,0 +1,4 @@
+# Development-only files must not be shipped in Comfy Registry archives.
+
+.github/
+tests/
