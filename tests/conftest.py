@@ -15,6 +15,13 @@ ROOT = pathlib.Path(
 ).resolve()
 COMFYUI_PATH = pathlib.Path(os.environ.get("COMFYUI_PATH", ROOT / "ComfyUI")).resolve()
 
+comfy_cli_args_path = COMFYUI_PATH / "comfy" / "cli_args.py"
+if not comfy_cli_args_path.is_file():
+    pytest.skip(
+        f"ComfyUI checkout not found at {COMFYUI_PATH}; set COMFYUI_PATH to a valid checkout.",
+        allow_module_level=True,
+    )
+
 if str(COMFYUI_PATH) not in sys.path:
     sys.path.insert(0, str(COMFYUI_PATH))
 
@@ -24,8 +31,10 @@ if str(COMFYUI_PATH) not in sys.path:
 # comfy.model_management. Force CPU mode for these pure adapter tests; this is
 # the same supported ComfyUI --cpu execution mode, without letting ComfyUI parse
 # pytest's own command-line arguments.
-import comfy.cli_args as comfy_cli_args
-
+comfy_cli_args = pytest.importorskip(
+    "comfy.cli_args",
+    reason=f"Could not import comfy.cli_args from ComfyUI checkout at {COMFYUI_PATH}.",
+)
 comfy_cli_args.args.cpu = True
 
 
