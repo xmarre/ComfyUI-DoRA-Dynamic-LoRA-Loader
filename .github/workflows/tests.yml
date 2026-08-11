@@ -53,13 +53,26 @@ jobs:
           echo "Built ${wheels[0]}"
 
   compatibility-and-runtime-bypass:
+    name: ComfyUI ${{ matrix.comfy_version }} compatibility/runtime tests
     strategy:
       fail-fast: false
       matrix:
-        comfy_ref:
-          - 322122449c9d2ba8b8df1bb517364527dd0615f1 # v0.29.2
-          - dec5d9450a5290bcf63430409ea41018e67f41c3 # v0.30.2
-          - fe4195f7f4275f2626cbafc703acc3ddde1e5490 # v0.31.1
+        include:
+          - comfy_version: v0.29.2
+            comfy_ref: 322122449c9d2ba8b8df1bb517364527dd0615f1
+            torch_version: "2.7.1"
+            torchvision_version: "0.22.1"
+            torchaudio_version: "2.7.1"
+          - comfy_version: v0.30.2
+            comfy_ref: dec5d9450a5290bcf63430409ea41018e67f41c3
+            torch_version: "2.8.0"
+            torchvision_version: "0.23.0"
+            torchaudio_version: "2.8.0"
+          - comfy_version: v0.31.1
+            comfy_ref: fe4195f7f4275f2626cbafc703acc3ddde1e5490
+            torch_version: "2.10.0"
+            torchvision_version: "0.25.0"
+            torchaudio_version: "2.10.0"
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node
@@ -84,14 +97,26 @@ jobs:
       - name: Install pinned ComfyUI runtime and test dependencies
         run: |
           python -m pip install --upgrade pip
-          # Install the CPU builds first so the hosted runner never pulls CUDA
-          # PyTorch packages just to exercise pure loader/adapter behavior.
-          python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-          # Each matrix entry owns its runtime dependency set. Installing the
-          # checked-out requirements keeps this compatibility test faithful to
-          # that exact ComfyUI release instead of maintaining a partial duplicate.
+          # Pin a known CPU-only PyTorch family for every reviewed ComfyUI
+          # revision. This keeps the compatibility matrix reproducible instead
+          # of silently changing when PyTorch publishes a new stable wheel.
+          python -m pip install \
+            "torch==${{ matrix.torch_version }}" \
+            "torchvision==${{ matrix.torchvision_version }}" \
+            "torchaudio==${{ matrix.torchaudio_version }}" \
+            --index-url https://download.pytorch.org/whl/cpu
+          # Each matrix entry still owns the rest of its runtime dependency set.
           python -m pip install -r ComfyUI/requirements.txt
           python -m pip install pytest
+
+      - name: Report pinned runtime versions
+        shell: bash
+        run: |
+          python - <<'PY'
+          import importlib.metadata as metadata
+          for package in ("torch", "torchvision", "torchaudio"):
+              print(f"{package}={metadata.version(package)}")
+          PY
 
       - name: Stage compatibility tests outside package tree
         shell: bash
