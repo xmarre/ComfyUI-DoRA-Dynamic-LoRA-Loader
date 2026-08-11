@@ -1,4 +1,5 @@
-from .nodes import DoraPowerLoraLoader, DoraStateManager, StateManager, StateManagerSeed, StateManagerTextBox
+from .nodes import DoraStateManager, StateManager, StateManagerSeed, StateManagerTextBox
+from .runtime_bypass import RuntimeBypassDoraPowerLoraLoader
 
 # Backend API for frontend LoRA dropdown (avoids relying on /object_info variants).
 import folder_paths
@@ -16,7 +17,7 @@ async def dora_dynamic_lora_list_loras(request):
 WEB_DIRECTORY = "./web"
 
 NODE_CLASS_MAPPINGS = {
-    "DoRA Power LoRA Loader": DoraPowerLoraLoader,
+    "DoRA Power LoRA Loader": RuntimeBypassDoraPowerLoraLoader,
     "State Manager": StateManager,
     "State Manager Text Box": StateManagerTextBox,
     "State Manager Seed": StateManagerSeed,
