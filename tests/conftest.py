@@ -7,7 +7,12 @@ import types
 import pytest
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
+# CI copies this test directory outside the custom-node package tree so pytest
+# cannot auto-import the node's root __init__.py. DORA_REPO_ROOT points back to
+# the actual checkout; local runs still fall back to the parent directory.
+ROOT = pathlib.Path(
+    os.environ.get("DORA_REPO_ROOT", pathlib.Path(__file__).resolve().parents[1])
+).resolve()
 COMFYUI_PATH = pathlib.Path(os.environ.get("COMFYUI_PATH", ROOT / "ComfyUI")).resolve()
 
 if str(COMFYUI_PATH) not in sys.path:
