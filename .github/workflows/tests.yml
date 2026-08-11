@@ -29,7 +29,23 @@ jobs:
           node-version: "22"
 
       - name: Compile Python sources
-        run: python -m py_compile __init__.py nodes.py runtime_bypass.py
+        run: python -m py_compile __init__.py nodes.py runtime_bypass.py frontend_guard.py
+
+      - name: Verify required frontend assets and registry includes
+        shell: bash
+        run: |
+          test -s web/dora_power_lora_loader.js
+          test -s web/index.js
+          python - <<'PY'
+          import pathlib
+          import tomllib
+
+          config = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          includes = set(config.get("tool", {}).get("comfy", {}).get("includes", []))
+          missing = {"frontend_guard.py", "web"} - includes
+          if missing:
+              raise SystemExit(f"Missing required Comfy Registry include(s): {sorted(missing)}")
+          PY
 
       - name: Check frontend JavaScript syntax
         shell: bash
