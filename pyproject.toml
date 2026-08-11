@@ -13,4 +13,4 @@ Documentation = "https://github.com/xmarre/ComfyUI-DoRA-Dynamic-LoRA-Loader#read
 PublisherId = "xmarre"
 DisplayName = "ComfyUI-DoRA-Dynamic-LoRA-Loader"
 Icon = ""
-includes = ["__init__.py", "nodes.py", "runtime_bypass.py", "web"]
+includes = ["__init__.py", "nodes.py", "runtime_bypass.py", "frontend_guard.py", "web"]
