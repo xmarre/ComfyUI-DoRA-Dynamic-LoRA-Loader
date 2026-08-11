@@ -193,25 +193,44 @@ def _make_stacked_injection(
             )
             hooks.append(hook)
 
+    active_hooks: List[Any] = []
+
     def inject_all(_model_patcher):
-        injected: List[Any] = []
+        # ModelPatcher normally prevents duplicate injection, but keep this
+        # injection idempotent when exercised directly as well.
+        if active_hooks:
+            return
         try:
             for hook in hooks:
                 hook.inject()
-                injected.append(hook)
+                active_hooks.append(hook)
         except Exception:
-            for hook in reversed(injected):
+            while active_hooks:
+                hook = active_hooks.pop()
                 try:
                     hook.eject()
                 except Exception:
-                    pass
+                    _LOG.exception(
+                        "[DoRA Power LoRA Loader] runtime bypass: rollback eject failed."
+                    )
             raise
 
     def eject_all(_model_patcher):
         # Multiple LoRAs on one module form nested forward wrappers. They MUST be
         # removed in reverse order or an older wrapper can be restored accidentally.
-        for hook in reversed(hooks):
-            hook.eject()
+        first_error = None
+        while active_hooks:
+            hook = active_hooks.pop()
+            try:
+                hook.eject()
+            except Exception as exc:
+                _LOG.exception(
+                    "[DoRA Power LoRA Loader] runtime bypass: hook eject failed."
+                )
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     injection = comfy.patcher_extension.PatcherInjection(
         inject=inject_all,
@@ -291,7 +310,8 @@ class RuntimeBypassDoraPowerLoraLoader(_base.DoraPowerLoraLoader):
             signature = (str(path), None, None)
 
         if signature not in cache:
-            cache.clear()
+            if len(cache) >= 32:
+                cache.pop(next(iter(cache)))
             cache[signature] = _raw_dora_keys(lora_name)
 
         dora_keys = cache[signature]
@@ -433,10 +453,27 @@ class RuntimeBypassDoraPowerLoraLoader(_base.DoraPowerLoraLoader):
 
         try:
             output = super().load_loras(model, clip, **kwargs)
+            captured = bool(
+                self._runtime_bypass_capture["model"]
+                or self._runtime_bypass_capture["clip"]
+            )
             if not isinstance(output, dict) or "result" not in output:
+                if captured:
+                    raise RuntimeBypassUnsupportedError(
+                        "Runtime bypass captured LoRA adapters, but the loader output shape is unsupported, "
+                        "so the adapters cannot be injected. Disable Runtime bypass LoRA."
+                    )
                 return output
 
-            result = list(output["result"])
+            result = output["result"]
+            if not isinstance(result, (tuple, list)):
+                if captured:
+                    raise RuntimeBypassUnsupportedError(
+                        "Runtime bypass captured LoRA adapters, but the loader result is not a sequence, "
+                        "so the adapters cannot be injected. Disable Runtime bypass LoRA."
+                    )
+                return output
+
             new_model = result[0] if len(result) > 0 else None
             new_clip = result[1] if len(result) > 1 else None
 
@@ -461,7 +498,6 @@ class RuntimeBypassDoraPowerLoraLoader(_base.DoraPowerLoraLoader):
                 clip_count,
             )
 
-            output["result"] = tuple(result)
             return output
         finally:
             self._runtime_bypass_active = False
