@@ -57,28 +57,7 @@ function normalizeWidgetRow(value) {
   };
 }
 
-function rowsFromNodeWidgets(node) {
-  const rows = [];
-  for (const widget of Array.isArray(node?.widgets) ? node.widgets : []) {
-    const match = /^LORA_(\d+)$/.exec(String(widget?.name ?? ""));
-    if (!match) continue;
-
-    let raw = isObject(widget?.row) ? widget.row : null;
-    if (!raw && typeof widget?.serializeValue === "function") {
-      try {
-        const serialized = widget.serializeValue();
-        if (isObject(serialized)) raw = serialized;
-      } catch (_) {}
-    }
-
-    const row = normalizeWidgetRow(raw);
-    if (row) rows.push({ index: Number(match[1]), row });
-  }
-  rows.sort((a, b) => a.index - b.index);
-  return rows.map((entry) => entry.row);
-}
-
-function snapshotStoredLiveState(node) {
+function snapshotCanonicalState(node) {
   const stored = isObject(node?.properties?.dora_power_lora)
     ? node.properties.dora_power_lora
     : null;
@@ -93,26 +72,6 @@ function snapshotStoredLiveState(node) {
     rows: liveRows ?? (Array.isArray(stored?.rows) ? stored.rows : []),
     globals: liveGlobals ?? (isObject(stored?.globals) ? stored.globals : {}),
   });
-}
-
-function snapshotVisibleState(node) {
-  const base = snapshotStoredLiveState(node) || { rows: [], globals: {} };
-  const widgets = Array.isArray(node?.widgets) ? node.widgets : [];
-  const widgetRows = rowsFromNodeWidgets(node);
-  const globals = isObject(base.globals) ? { ...base.globals } : {};
-  const globalKeys = new Set([...GLOBAL_WIDGET_KEYS, ...Object.keys(globals)]);
-
-  for (const widget of widgets) {
-    const name = String(widget?.name ?? "");
-    if (!globalKeys.has(name) || widget?.value === undefined) continue;
-    globals[name] = cloneJson(widget.value);
-  }
-
-  const rows = widgetRows.length
-    ? widgetRows
-    : (Array.isArray(base.rows) ? base.rows : []);
-  if (!rows.length && !Object.keys(globals).length) return null;
-  return cloneJson({ rows, globals });
 }
 
 function stateFromNamedWidgetValues(named, baseGlobals = null) {
@@ -144,29 +103,8 @@ function stateFromNamedWidgetValues(named, baseGlobals = null) {
   return { rows, globals };
 }
 
-function mergeState(baseState, overlayState) {
-  if (!baseState && !overlayState) return null;
-  const base = isObject(baseState) ? baseState : {};
-  const overlay = isObject(overlayState) ? overlayState : {};
-  const baseRows = Array.isArray(base.rows) ? base.rows : [];
-  const overlayRows = Array.isArray(overlay.rows) ? overlay.rows : [];
-  return cloneJson({
-    rows: overlayRows.length ? overlayRows : baseRows,
-    globals: {
-      ...(isObject(base.globals) ? base.globals : {}),
-      ...(isObject(overlay.globals) ? overlay.globals : {}),
-    },
-  });
-}
-
 function validStateSlot(value) {
   return typeof value === "string" && value.trim() ? value : null;
-}
-
-function currentStateSlot(node) {
-  const widget = (Array.isArray(node?.widgets) ? node.widgets : [])
-    .find((item) => item?.name === "state_slot");
-  return validStateSlot(widget?.value) || validStateSlot(node?.properties?.dora_state_slot);
 }
 
 function prepareConfigureInfo(node, info) {
@@ -180,28 +118,39 @@ function prepareConfigureInfo(node, info) {
     : null;
   const hasLegacyWidgetValues = Array.isArray(info.widgets_values) && info.widgets_values.length > 0;
 
-  // Incoming workflow data always outranks the freshly-created loader widgets.
-  // widgets_values_named is accepted only as migration data from frontend builds
-  // that previously stored loader controls there. Never derive configure state
-  // from the current widget set: on a tab reload those widgets are bootstrap
-  // defaults created before configure() runs.
-  const namedState = stateFromNamedWidgetValues(
-    info.widgets_values_named,
-    serializedState?.globals ?? node?._doraGlobals
-  );
-
-  if (serializedState || namedState) {
-    properties.dora_power_lora = mergeState(serializedState, namedState);
+  // Canonical workflow state always wins when present. widgets_values_named is
+  // migration-only for old workflows that do not contain dora_power_lora.
+  // In particular, never let stale/default named widget shadows overwrite an
+  // existing property-backed loader state during graph reconstruction.
+  if (serializedState) {
+    properties.dora_power_lora = serializedState;
   } else if (!hasLegacyWidgetValues) {
-    const liveState = snapshotStoredLiveState(node);
-    if (liveState) properties.dora_power_lora = liveState;
+    const liveState = snapshotCanonicalState(node);
+    const namedState = stateFromNamedWidgetValues(
+      info.widgets_values_named,
+      liveState?.globals
+    );
+
+    if (namedState) {
+      properties.dora_power_lora = cloneJson({
+        rows: namedState.rows.length
+          ? namedState.rows
+          : (Array.isArray(liveState?.rows) ? liveState.rows : []),
+        globals: {
+          ...(isObject(liveState?.globals) ? liveState.globals : {}),
+          ...(isObject(namedState.globals) ? namedState.globals : {}),
+        },
+      });
+    } else if (liveState) {
+      properties.dora_power_lora = liveState;
+    }
   }
 
-  const namedSlot = isObject(info.widgets_values_named)
+  const incomingSlot = validStateSlot(properties.dora_state_slot);
+  const namedSlot = !incomingSlot && !serializedState && isObject(info.widgets_values_named)
     ? validStateSlot(info.widgets_values_named.state_slot)
     : null;
-  const incomingSlot = validStateSlot(properties.dora_state_slot);
-  const slot = namedSlot || incomingSlot || validStateSlot(node?.properties?.dora_state_slot);
+  const slot = incomingSlot || namedSlot || validStateSlot(node?.properties?.dora_state_slot);
   if (slot) properties.dora_state_slot = slot;
 
   if (originalProperties || Object.keys(properties).length) next.properties = properties;
@@ -213,15 +162,17 @@ function prepareConfigureInfo(node, info) {
 }
 
 function prepareCanonicalSerialization(node) {
+  // Every loader control callback updates _doraRows/_doraGlobals and persists
+  // them into dora_power_lora. Those live objects are therefore the node-owned
+  // authority. Do not read widget.value here: alternate frontend renderers may
+  // keep a widget facade whose value lags the callback-owned loader state.
   node.serialize_widgets = false;
   node.properties = isObject(node.properties) ? node.properties : {};
 
-  const state = snapshotVisibleState(node);
+  const state = snapshotCanonicalState(node);
   if (state) node.properties.dora_power_lora = cloneJson(state);
 
-  const slot = currentStateSlot(node);
-  if (slot) node.properties.dora_state_slot = slot;
-
+  const slot = validStateSlot(node.properties.dora_state_slot);
   return { state, slot };
 }
 
@@ -274,8 +225,6 @@ app.registerExtension({
 
     const previousOnSerialize = nodeType.prototype.onSerialize;
     nodeType.prototype.onSerialize = function (output) {
-      // Reconcile the current visible controls into the canonical property
-      // before the loader/base serializer reads node.properties.
       const prepared = prepareCanonicalSerialization(this);
       const result = previousOnSerialize?.call(this, output);
       finalizeCanonicalSerialization(this, output, prepared);
