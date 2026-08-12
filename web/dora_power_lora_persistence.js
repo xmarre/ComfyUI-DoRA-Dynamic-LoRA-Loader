@@ -161,18 +161,20 @@ function mergeState(baseState, overlayState) {
   });
 }
 
+function validStateSlot(value) {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
 function snapshotStateSlot(node, named = null) {
-  const namedSlot = isObject(named) ? named.state_slot : null;
-  if (typeof namedSlot === "string" && namedSlot.trim()) return namedSlot;
+  const namedSlot = isObject(named) ? validStateSlot(named.state_slot) : null;
+  if (namedSlot) return namedSlot;
 
   const stateSlotWidget = (Array.isArray(node?.widgets) ? node.widgets : [])
     .find((widget) => widget?.name === "state_slot");
-  if (typeof stateSlotWidget?.value === "string" && stateSlotWidget.value.trim()) {
-    return stateSlotWidget.value;
-  }
+  const widgetSlot = validStateSlot(stateSlotWidget?.value);
+  if (widgetSlot) return widgetSlot;
 
-  const storedSlot = node?.properties?.dora_state_slot;
-  return typeof storedSlot === "string" && storedSlot.trim() ? storedSlot : null;
+  return validStateSlot(node?.properties?.dora_state_slot);
 }
 
 function prepareConfigureInfo(node, info) {
@@ -201,7 +203,11 @@ function prepareConfigureInfo(node, info) {
     if (reconciledState) properties.dora_power_lora = reconciledState;
   }
 
-  const slot = snapshotStateSlot(node, info.widgets_values_named);
+  const namedSlot = isObject(info.widgets_values_named)
+    ? validStateSlot(info.widgets_values_named.state_slot)
+    : null;
+  const incomingSlot = validStateSlot(properties.dora_state_slot);
+  const slot = namedSlot || incomingSlot || snapshotStateSlot(node);
   if (slot) properties.dora_state_slot = slot;
 
   if (originalProperties || Object.keys(properties).length) next.properties = properties;
