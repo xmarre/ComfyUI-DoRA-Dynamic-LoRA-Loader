@@ -102,8 +102,8 @@ function makeNodeType() {
   class FakeNode {}
   FakeNode.comfyClass = NODE_CLASS;
 
-  // Model the loader's onNodeCreated bootstrap: dynamic controls exist with
-  // defaults before workflow configure() restores a serialized node.
+  // Model the loader bootstrap: a fresh graph node owns default controls and
+  // default live state before configure() receives workflow data.
   FakeNode.prototype.onNodeCreated = function () {
     this.serialize_widgets = true;
     this.properties = {
@@ -116,7 +116,6 @@ function makeNodeType() {
     return this;
   };
 
-  // Model the existing loader configure contract.
   FakeNode.prototype.configure = function (info) {
     this.lastConfigureInfo = clone(info ?? {});
     let state;
@@ -142,16 +141,14 @@ function makeNodeType() {
     return this;
   };
 
-  // Model the loader's existing onSerialize hook.
   FakeNode.prototype.onSerialize = function (output) {
     output.properties = { ...(output.properties || {}) };
     output.properties.dora_power_lora = clone(this.properties.dora_power_lora);
     output.widgets_values = [];
   };
 
-  // Model the relevant current LiteGraph serialize ordering: generic widget
-  // serialization happens before onSerialize(), and is skipped when
-  // serialize_widgets is false.
+  // Relevant LiteGraph ordering: generic widget values are captured before the
+  // onSerialize hook, but only when serialize_widgets remains enabled.
   FakeNode.prototype.serialize = function () {
     const output = { properties: clone(this.properties || {}) };
     if (this.serialize_widgets && Array.isArray(this.widgets)) {
@@ -184,10 +181,14 @@ function makeFreshNode(NodeType) {
   return node;
 }
 
-function applyVisibleUserState(node, state, slot = "loader_42") {
+function applyUserState(node, state, slot = "loader_42", { staleWidgetFacade = false } = {}) {
+  // Model the actual loader callbacks: _doraRows/_doraGlobals are updated and
+  // persistNodeState mirrors them into dora_power_lora immediately.
   node._doraRows = clone(state.rows);
   node._doraGlobals = clone(state.globals);
-  node.widgets = makeVisibleWidgets(state, slot);
+  node.properties.dora_power_lora = clone(state);
+  node.properties.dora_state_slot = slot;
+  node.widgets = makeVisibleWidgets(staleWidgetFacade ? DEFAULT_STATE : state, staleWidgetFacade ? "loader_default" : slot);
 }
 
 test("loader disables generic LiteGraph widget workflow serialization", async () => {
@@ -218,7 +219,26 @@ test("fresh bootstrap defaults never override incoming serialized loader state",
   assert.equal(node.properties.dora_state_slot, "saved_slot");
 });
 
-test("workflow-tab round trip preserves visible auto-strength and LoRA state", async () => {
+test("canonical serialized state beats conflicting legacy named defaults", async () => {
+  const NodeType = await patchedNodeType();
+  const saved = customState("canonical.safetensors");
+  saved.globals.auto_strength_device = "auto";
+  saved.globals.auto_strength_ratio_floor = 0.64;
+  saved.globals.auto_strength_ratio_ceiling = 1.97;
+  const node = makeFreshNode(NodeType);
+
+  node.configure({
+    properties: { dora_power_lora: clone(saved), dora_state_slot: "canonical_slot" },
+    widgets_values_named: makeNamedWidgetSnapshot(DEFAULT_STATE, "stale_named_slot", { includeRow: true }),
+  });
+
+  assert.deepEqual(node.properties.dora_power_lora, saved);
+  assert.deepEqual(node._doraGlobals, saved.globals);
+  assert.equal(node.properties.dora_state_slot, "canonical_slot");
+  assert.equal(node.lastConfigureInfo.widgets_values_named, undefined);
+});
+
+test("#14897-style one-shot tab round trip preserves loader state", async () => {
   const NodeType = await patchedNodeType();
   const edited = customState("roundtrip.safetensors");
   edited.globals.auto_strength_enabled = true;
@@ -226,18 +246,16 @@ test("workflow-tab round trip preserves visible auto-strength and LoRA state", a
   edited.globals.auto_strength_ratio_floor = 0.63;
   edited.globals.auto_strength_ratio_ceiling = 1.92;
 
-  // Active workflow: loader was created, user changed controls, then #14897's
-  // tab transition freezes the graph with one synchronous serialize().
   const outgoing = makeFreshNode(NodeType);
-  applyVisibleUserState(outgoing, edited, "roundtrip_slot");
-  const frozenWorkflowNode = outgoing.serialize();
+  applyUserState(outgoing, edited, "roundtrip_slot");
 
+  // PR #14897 relies on this synchronous graph serialization before replacing
+  // the canvas rather than a later debounced draft flush.
+  const frozenWorkflowNode = outgoing.serialize();
   assert.deepEqual(frozenWorkflowNode.properties.dora_power_lora, edited);
   assert.equal(frozenWorkflowNode.properties.dora_state_slot, "roundtrip_slot");
   assert.equal(Object.prototype.hasOwnProperty.call(frozenWorkflowNode, "widgets_values_named"), false);
 
-  // Returning to the tab constructs a brand-new loader with defaults first,
-  // then configures it from the workflow's frozen activeState.
   const restored = makeFreshNode(NodeType);
   assert.deepEqual(restored._doraGlobals, DEFAULT_STATE.globals);
   restored.configure(frozenWorkflowNode);
@@ -248,24 +266,26 @@ test("workflow-tab round trip preserves visible auto-strength and LoRA state", a
   assert.equal(restored.properties.dora_state_slot, "roundtrip_slot");
 });
 
-test("serialization reconciles visible widgets before canonical property output", async () => {
+test("stale frontend widget facade cannot overwrite callback-owned live state", async () => {
   const NodeType = await patchedNodeType();
-  const visible = customState("visible-at-save.safetensors");
-  visible.globals.auto_strength_ratio_floor = 0.72;
-  visible.globals.auto_strength_ratio_ceiling = 2.11;
+  const edited = customState("live-wins.safetensors");
+  edited.globals.auto_strength_device = "auto";
+  edited.globals.auto_strength_ratio_floor = 0.72;
+  edited.globals.auto_strength_ratio_ceiling = 2.11;
   const node = makeFreshNode(NodeType);
 
-  // Deliberately leave properties/live globals stale to reproduce a visual
-  // control that is newer than canonical state at the serialization boundary.
-  node.widgets = makeVisibleWidgets(visible, "visible_slot");
+  // This models an alternate/new frontend renderer where the visual/widget
+  // facade still exposes bootstrap defaults even though the loader callbacks
+  // already updated _doraGlobals and dora_power_lora.
+  applyUserState(node, edited, "live_slot", { staleWidgetFacade: true });
   const output = node.serialize();
 
-  assert.deepEqual(output.properties.dora_power_lora, visible);
-  assert.deepEqual(node.properties.dora_power_lora, visible);
-  assert.equal(output.properties.dora_state_slot, "visible_slot");
+  assert.deepEqual(output.properties.dora_power_lora, edited);
+  assert.deepEqual(node.properties.dora_power_lora, edited);
+  assert.equal(output.properties.dora_state_slot, "live_slot");
 });
 
-test("named widget workflow data is accepted only as migration input", async () => {
+test("named widget workflow data is accepted only when canonical state is absent", async () => {
   const NodeType = await patchedNodeType();
   const migrated = customState("named-migration.safetensors");
   migrated.globals.auto_strength_device = "auto";
@@ -274,6 +294,7 @@ test("named widget workflow data is accepted only as migration input", async () 
   const node = makeFreshNode(NodeType);
 
   node.configure({
+    properties: { unrelated: true },
     widgets_values_named: makeNamedWidgetSnapshot(migrated, "named_slot", { includeRow: true }),
   });
 
@@ -282,35 +303,11 @@ test("named widget workflow data is accepted only as migration input", async () 
   assert.equal(node.lastConfigureInfo.widgets_values_named, undefined);
 });
 
-test("named globals can repair stale serialized globals without deleting serialized rows", async () => {
-  const NodeType = await patchedNodeType();
-  const serialized = customState("keep-row.safetensors");
-  serialized.globals = clone(DEFAULT_STATE.globals);
-  const newer = customState("ignored-row.safetensors");
-  newer.globals.auto_strength_ratio_floor = 0.55;
-  newer.globals.auto_strength_ratio_ceiling = 1.88;
-  const node = makeFreshNode(NodeType);
-
-  node.configure({
-    properties: { dora_power_lora: clone(serialized), dora_state_slot: "serialized_slot" },
-    widgets_values_named: makeNamedWidgetSnapshot(newer, "named_slot", { includeRow: false }),
-  });
-
-  assert.deepEqual(node.properties.dora_power_lora.rows, serialized.rows);
-  assert.equal(node.properties.dora_power_lora.globals.auto_strength_enabled, true);
-  assert.equal(node.properties.dora_power_lora.globals.auto_strength_ratio_floor, 0.55);
-  assert.equal(node.properties.dora_power_lora.globals.auto_strength_ratio_ceiling, 1.88);
-  assert.equal(node.properties.dora_state_slot, "named_slot");
-});
-
 test("partial configure preserves existing live state", async () => {
   const NodeType = await patchedNodeType();
   const live = customState("partial.safetensors");
   const node = makeFreshNode(NodeType);
-  node.properties.dora_power_lora = clone(live);
-  node.properties.dora_state_slot = "partial_slot";
-  node._doraRows = clone(live.rows);
-  node._doraGlobals = clone(live.globals);
+  applyUserState(node, live, "partial_slot");
 
   node.configure({ size: [420, 640] });
 
@@ -322,9 +319,7 @@ test("null serialized state is treated as missing and recovered", async () => {
   const NodeType = await patchedNodeType();
   const live = customState("recover-null.safetensors");
   const node = makeFreshNode(NodeType);
-  node.properties.dora_power_lora = clone(live);
-  node._doraRows = clone(live.rows);
-  node._doraGlobals = clone(live.globals);
+  applyUserState(node, live, "recover_slot");
 
   node.configure({ properties: { dora_power_lora: null } });
 
