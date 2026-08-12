@@ -39,6 +39,9 @@ jobs:
             node --check "${file}"
           done < <(find web -type f -name '*.js' -print0)
 
+      - name: Run frontend persistence regression tests
+        run: node --test tests/test_frontend_state_persistence.mjs
+
       - name: Build package wheel
         run: |
           python -m pip install --upgrade pip
