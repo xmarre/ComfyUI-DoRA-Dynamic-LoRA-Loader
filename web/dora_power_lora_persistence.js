@@ -53,7 +53,7 @@ function snapshotLiveState(node) {
   });
 }
 
-function stateFromNamedWidgetValues(named) {
+function stateFromNamedWidgetValues(named, liveGlobals = null) {
   if (!isObject(named)) return null;
 
   const rows = Object.entries(named)
@@ -80,7 +80,11 @@ function stateFromNamedWidgetValues(named) {
 
   const globals = {};
   let hasGlobals = false;
-  for (const key of GLOBAL_WIDGET_KEYS) {
+  const globalKeys = new Set(GLOBAL_WIDGET_KEYS);
+  if (isObject(liveGlobals)) {
+    for (const key of Object.keys(liveGlobals)) globalKeys.add(key);
+  }
+  for (const key of globalKeys) {
     if (!Object.prototype.hasOwnProperty.call(named, key)) continue;
     globals[key] = cloneJson(named[key]);
     hasGlobals = true;
@@ -88,6 +92,18 @@ function stateFromNamedWidgetValues(named) {
 
   if (!rows.length && !hasGlobals) return null;
   return { rows, globals };
+}
+
+function mergeNamedStateWithLive(namedState, liveState) {
+  if (!namedState) return liveState ? cloneJson(liveState) : null;
+  if (!liveState) return cloneJson(namedState);
+  return cloneJson({
+    rows: namedState.rows.length ? namedState.rows : (Array.isArray(liveState.rows) ? liveState.rows : []),
+    globals: {
+      ...(isObject(liveState.globals) ? liveState.globals : {}),
+      ...(isObject(namedState.globals) ? namedState.globals : {}),
+    },
+  });
 }
 
 function prepareConfigureInfo(node, info) {
@@ -98,10 +114,11 @@ function prepareConfigureInfo(node, info) {
   const properties = originalProperties ? { ...originalProperties } : {};
   const hasSerializedState = Object.prototype.hasOwnProperty.call(properties, "dora_power_lora");
   const hasLegacyWidgetValues = Array.isArray(info.widgets_values) && info.widgets_values.length > 0;
-  const namedState = stateFromNamedWidgetValues(info.widgets_values_named);
+  const liveState = snapshotLiveState(node);
+  const namedState = stateFromNamedWidgetValues(info.widgets_values_named, liveState?.globals);
 
   if (!hasSerializedState && !hasLegacyWidgetValues) {
-    const fallbackState = namedState ?? snapshotLiveState(node);
+    const fallbackState = mergeNamedStateWithLive(namedState, liveState);
     if (fallbackState) properties.dora_power_lora = fallbackState;
   }
 
