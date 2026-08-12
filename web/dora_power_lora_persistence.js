@@ -2,6 +2,9 @@ import { app } from "../../scripts/app.js";
 
 const NODE_CLASS = "DoRA Power LoRA Loader";
 const EXT_NAME = "comfyui_dora_dynamic_lora.power_lora_persistence";
+const TRACE_LIMIT = 240;
+const TRACE_STORE_KEY = "__doraPowerLoraPersistenceTrace";
+const TRACE_API_KEY = "__doraPowerLoraPersistenceDebug";
 
 const GLOBAL_WIDGET_KEYS = [
   "stack_enabled",
@@ -34,6 +37,15 @@ function cloneJson(value) {
 
 function isObject(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function isTargetNode(node) {
+  return !!node && (
+    node.type === NODE_CLASS ||
+    node.comfyClass === NODE_CLASS ||
+    node.constructor?.comfyClass === NODE_CLASS ||
+    node.title === NODE_CLASS
+  );
 }
 
 function normalizeWidgetRow(value) {
@@ -72,6 +84,82 @@ function snapshotCanonicalState(node) {
     rows: liveRows ?? (Array.isArray(stored?.rows) ? stored.rows : []),
     globals: liveGlobals ?? (isObject(stored?.globals) ? stored.globals : {}),
   });
+}
+
+function snapshotWidgetFacade(node) {
+  const out = {};
+  for (const widget of Array.isArray(node?.widgets) ? node.widgets : []) {
+    const name = String(widget?.name ?? "");
+    if (GLOBAL_WIDGET_KEYS.includes(name) || name === "state_slot") {
+      out[name] = cloneJson(widget?.value);
+      continue;
+    }
+    if (!/^LORA_\d+$/.test(name)) continue;
+    let row = null;
+    if (isObject(widget?.row)) row = normalizeWidgetRow(widget.row);
+    if (!row && typeof widget?.serializeValue === "function") {
+      try { row = normalizeWidgetRow(widget.serializeValue()); } catch (_) {}
+    }
+    out[name] = row;
+  }
+  return out;
+}
+
+function getTraceStore() {
+  let trace = globalThis[TRACE_STORE_KEY];
+  if (!Array.isArray(trace)) {
+    trace = [];
+    globalThis[TRACE_STORE_KEY] = trace;
+  }
+  return trace;
+}
+
+function traceLifecycle(stage, node, extra = null) {
+  if (!isTargetNode(node)) return;
+  const trace = getTraceStore();
+  const entry = {
+    time: new Date().toISOString(),
+    stage,
+    node_id: node?.id ?? null,
+    graph_id: node?.graph?.id ?? null,
+    serialize_widgets: node?.serialize_widgets,
+    property_state: cloneJson(node?.properties?.dora_power_lora ?? null),
+    live_state: cloneJson({
+      rows: Array.isArray(node?._doraRows) ? node._doraRows : null,
+      globals: isObject(node?._doraGlobals) ? node._doraGlobals : null,
+    }),
+    state_slot: node?.properties?.dora_state_slot ?? null,
+    widget_facade: snapshotWidgetFacade(node),
+    extra: cloneJson(extra),
+  };
+  trace.push(entry);
+  if (trace.length > TRACE_LIMIT) trace.splice(0, trace.length - TRACE_LIMIT);
+  if (globalThis[TRACE_API_KEY]?.logToConsole === true) {
+    console.debug(`[${EXT_NAME}]`, stage, entry);
+  }
+}
+
+function installTraceApi() {
+  const existing = isObject(globalThis[TRACE_API_KEY]) ? globalThis[TRACE_API_KEY] : {};
+  globalThis[TRACE_API_KEY] = {
+    ...existing,
+    logToConsole: existing.logToConsole === true,
+    clear() {
+      const trace = getTraceStore();
+      trace.length = 0;
+      return true;
+    },
+    dump() {
+      return JSON.stringify(getTraceStore(), null, 2);
+    },
+    snapshot() {
+      return cloneJson(getTraceStore());
+    },
+    setConsoleLogging(enabled = true) {
+      this.logToConsole = !!enabled;
+      return this.logToConsole;
+    },
+  };
 }
 
 function stateFromNamedWidgetValues(named, baseGlobals = null) {
@@ -195,6 +283,8 @@ function finalizeCanonicalSerialization(node, output, prepared) {
   delete output.widgets_values_named;
 }
 
+installTraceApi();
+
 app.registerExtension({
   name: EXT_NAME,
   async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -207,28 +297,58 @@ app.registerExtension({
 
     const previousOnNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
+      traceLifecycle("onNodeCreated:before", this);
       const result = previousOnNodeCreated?.apply(this, arguments);
       // Workflow persistence is property-backed. Generic LiteGraph widget
       // serialization creates a competing representation and is unnecessary.
       this.serialize_widgets = false;
+      traceLifecycle("onNodeCreated:after", this);
       return result;
     };
 
     const previousConfigure = nodeType.prototype.configure;
     nodeType.prototype.configure = function (info) {
       this.serialize_widgets = false;
+      traceLifecycle("configure:incoming", this, {
+        incoming_property_state: cloneJson(info?.properties?.dora_power_lora ?? null),
+        incoming_state_slot: info?.properties?.dora_state_slot ?? null,
+        incoming_widgets_values_named: cloneJson(info?.widgets_values_named ?? null),
+        incoming_widgets_values: cloneJson(info?.widgets_values ?? null),
+      });
       const guardedInfo = prepareConfigureInfo(this, info);
+      traceLifecycle("configure:guarded", this, {
+        guarded_property_state: cloneJson(guardedInfo?.properties?.dora_power_lora ?? null),
+        guarded_state_slot: guardedInfo?.properties?.dora_state_slot ?? null,
+        has_named_values: Object.prototype.hasOwnProperty.call(guardedInfo ?? {}, "widgets_values_named"),
+      });
       const result = previousConfigure?.call(this, guardedInfo);
       this.serialize_widgets = false;
+      traceLifecycle("configure:after", this);
+      queueMicrotask(() => traceLifecycle("configure:microtask", this));
+      setTimeout(() => traceLifecycle("configure:timeout-250ms", this), 250);
       return result;
     };
 
     const previousOnSerialize = nodeType.prototype.onSerialize;
     nodeType.prototype.onSerialize = function (output) {
+      traceLifecycle("serialize:before", this, {
+        output_property_state_before: cloneJson(output?.properties?.dora_power_lora ?? null),
+        output_named_before: cloneJson(output?.widgets_values_named ?? null),
+      });
       const prepared = prepareCanonicalSerialization(this);
       const result = previousOnSerialize?.call(this, output);
       finalizeCanonicalSerialization(this, output, prepared);
+      traceLifecycle("serialize:after", this, {
+        output_property_state_after: cloneJson(output?.properties?.dora_power_lora ?? null),
+        output_state_slot_after: output?.properties?.dora_state_slot ?? null,
+        output_widgets_values_after: cloneJson(output?.widgets_values ?? null),
+        has_named_values_after: Object.prototype.hasOwnProperty.call(output ?? {}, "widgets_values_named"),
+      });
       return result;
     };
+  },
+  loadedGraphNode(node) {
+    traceLifecycle("loadedGraphNode", node);
+    setTimeout(() => traceLifecycle("loadedGraphNode:timeout-500ms", node), 500);
   },
 });
