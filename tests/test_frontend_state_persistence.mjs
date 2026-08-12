@@ -157,6 +157,28 @@ test("named widget-only workflow data migrates into authoritative loader state",
   assert.equal(node.lastConfigureInfo.widgets_values_named, undefined);
 });
 
+test("named global recovery preserves live LoRA rows when custom row values are absent", async () => {
+  const NodeType = await patchedNodeType();
+  const live = customState("keep-this-row.safetensors");
+  const node = makeNode(NodeType, live);
+
+  node.configure({
+    widgets_values_named: {
+      auto_strength_enabled: true,
+      auto_strength_device: "auto",
+      auto_strength_ratio_floor: 0.52,
+      auto_strength_ratio_ceiling: 1.74,
+    },
+  });
+
+  const state = node.properties.dora_power_lora;
+  assert.deepEqual(state.rows, live.rows);
+  assert.equal(state.globals.auto_strength_device, "auto");
+  assert.equal(state.globals.auto_strength_ratio_floor, 0.52);
+  assert.equal(state.globals.auto_strength_ratio_ceiling, 1.74);
+  assert.equal(state.globals.broadcast_scale, live.globals.broadcast_scale);
+});
+
 test("explicit serialized state remains authoritative over named widget shadows", async () => {
   const NodeType = await patchedNodeType();
   const node = makeNode(NodeType, customState("live.safetensors"));
