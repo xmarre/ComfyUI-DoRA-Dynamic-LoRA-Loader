@@ -359,7 +359,6 @@ app.registerExtension({
       // Workflow persistence is property-backed. Generic LiteGraph widget
       // serialization creates a competing representation and is unnecessary.
       this.serialize_widgets = false;
-      syncKnownWidgetFacade(this);
       traceLifecycle("onNodeCreated:after", this);
       return result;
     };
@@ -384,14 +383,8 @@ app.registerExtension({
       this.serialize_widgets = false;
       syncKnownWidgetFacade(this);
       traceLifecycle("configure:after", this);
-      queueMicrotask(() => {
-        syncKnownWidgetFacade(this);
-        traceLifecycle("configure:microtask", this);
-      });
-      setTimeout(() => {
-        syncKnownWidgetFacade(this);
-        traceLifecycle("configure:timeout-250ms", this);
-      }, 250);
+      queueMicrotask(() => traceLifecycle("configure:microtask", this));
+      setTimeout(() => traceLifecycle("configure:timeout-250ms", this), 250);
       return result;
     };
 
@@ -414,11 +407,7 @@ app.registerExtension({
     };
   },
   loadedGraphNode(node) {
-    syncKnownWidgetFacade(node);
     traceLifecycle("loadedGraphNode", node);
-    setTimeout(() => {
-      syncKnownWidgetFacade(node);
-      traceLifecycle("loadedGraphNode:timeout-500ms", node);
-    }, 500);
+    setTimeout(() => traceLifecycle("loadedGraphNode:timeout-500ms", node), 500);
   },
 });
