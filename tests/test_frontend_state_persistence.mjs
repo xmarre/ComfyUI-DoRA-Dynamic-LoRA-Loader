@@ -102,6 +102,13 @@ function makeNodeType() {
   class FakeNode {}
   FakeNode.comfyClass = NODE_CLASS;
 
+  FakeNode.prototype.addWidget = function (type, name, value, callback, options = {}) {
+    const widget = { type, name, value: clone(value), callback, options };
+    this.widgets ??= [];
+    this.widgets.push(widget);
+    return widget;
+  };
+
   // Model the loader bootstrap: a fresh graph node owns default controls and
   // default live state before configure() receives workflow data.
   FakeNode.prototype.onNodeCreated = function () {
@@ -264,6 +271,31 @@ test("#14897-style one-shot tab round trip preserves loader state", async () => 
   assert.deepEqual(restored._doraGlobals, edited.globals);
   assert.deepEqual(restored._doraRows, edited.rows);
   assert.equal(restored.properties.dora_state_slot, "roundtrip_slot");
+});
+
+test("recreated same-name widgets are forced to canonical values after frontend registration", async () => {
+  const NodeType = await patchedNodeType();
+  const saved = customState("widget-store.safetensors");
+  saved.globals.auto_strength_device = "auto";
+  saved.globals.auto_strength_ratio_floor = 0.95;
+  saved.globals.auto_strength_ratio_ceiling = 2.0;
+  const node = makeFreshNode(NodeType);
+  node.configure({ properties: { dora_power_lora: clone(saved), dora_state_slot: "store_slot" } });
+
+  // Model the #14897-era WidgetValueStore behavior observed in the browser:
+  // addWidget receives a stale/default initial value for a same-name widget.
+  // The persistence shim must overwrite the returned widget with the canonical
+  // property-backed value after frontend registration.
+  node.widgets = [];
+  const floor = node.addWidget("number", "auto_strength_ratio_floor", 0.30, () => {});
+  const ceiling = node.addWidget("number", "auto_strength_ratio_ceiling", 1.50, () => {});
+  const device = node.addWidget("combo", "auto_strength_device", "gpu", () => {});
+  const slot = node.addWidget("text", "state_slot", "loader_default", () => {});
+
+  assert.equal(floor.value, 0.95);
+  assert.equal(ceiling.value, 2.0);
+  assert.equal(device.value, "auto");
+  assert.equal(slot.value, "store_slot");
 });
 
 test("stale frontend widget facade cannot overwrite callback-owned live state", async () => {
