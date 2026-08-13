@@ -195,6 +195,62 @@ function validStateSlot(value) {
   return typeof value === "string" && value.trim() ? value : null;
 }
 
+function canonicalWidgetValue(node, name, fallback) {
+  if (GLOBAL_WIDGET_KEYS.includes(name)) {
+    const storedGlobals = isObject(node?.properties?.dora_power_lora?.globals)
+      ? node.properties.dora_power_lora.globals
+      : null;
+    if (storedGlobals && Object.prototype.hasOwnProperty.call(storedGlobals, name)) {
+      return cloneJson(storedGlobals[name]);
+    }
+    if (isObject(node?._doraGlobals) && Object.prototype.hasOwnProperty.call(node._doraGlobals, name)) {
+      return cloneJson(node._doraGlobals[name]);
+    }
+  }
+  if (name === "state_slot") {
+    return validStateSlot(node?.properties?.dora_state_slot) ?? fallback;
+  }
+  return fallback;
+}
+
+function syncKnownWidgetFacade(node) {
+  if (!node) return;
+  for (const widget of Array.isArray(node.widgets) ? node.widgets : []) {
+    const name = String(widget?.name ?? "");
+    if (!GLOBAL_WIDGET_KEYS.includes(name) && name !== "state_slot") continue;
+    const desired = canonicalWidgetValue(node, name, widget?.value);
+    try { widget.value = cloneJson(desired); } catch (_) {}
+  }
+}
+
+function installDynamicWidgetValueSync(node) {
+  if (!node || node.__doraPowerLoraWidgetValueSyncInstalled) return;
+  if (typeof node.addWidget !== "function") return;
+
+  const originalAddWidget = node.addWidget;
+  Object.defineProperty(node, "__doraPowerLoraWidgetValueSyncInstalled", {
+    value: true,
+    configurable: true,
+  });
+
+  node.addWidget = function () {
+    const widget = originalAddWidget.apply(this, arguments);
+    if (!widget) return widget;
+
+    const name = String(arguments[1] ?? widget.name ?? "");
+    if (!GLOBAL_WIDGET_KEYS.includes(name) && name !== "state_slot") return widget;
+
+    // Newer ComfyUI frontends keep widget values in WidgetValueStore. Recreating
+    // a same-name/same-type widget can therefore return the existing bootstrap
+    // state instead of adopting addWidget(..., initialValue). Always push the
+    // loader's property-backed canonical value into the registered widget after
+    // creation. On older LiteGraph this is just an ordinary value assignment.
+    const desired = canonicalWidgetValue(this, name, arguments[2]);
+    try { widget.value = cloneJson(desired); } catch (_) {}
+    return widget;
+  };
+}
+
 function prepareConfigureInfo(node, info) {
   if (!isObject(info)) return info;
 
@@ -298,10 +354,12 @@ app.registerExtension({
     const previousOnNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       traceLifecycle("onNodeCreated:before", this);
+      installDynamicWidgetValueSync(this);
       const result = previousOnNodeCreated?.apply(this, arguments);
       // Workflow persistence is property-backed. Generic LiteGraph widget
       // serialization creates a competing representation and is unnecessary.
       this.serialize_widgets = false;
+      syncKnownWidgetFacade(this);
       traceLifecycle("onNodeCreated:after", this);
       return result;
     };
@@ -309,6 +367,7 @@ app.registerExtension({
     const previousConfigure = nodeType.prototype.configure;
     nodeType.prototype.configure = function (info) {
       this.serialize_widgets = false;
+      installDynamicWidgetValueSync(this);
       traceLifecycle("configure:incoming", this, {
         incoming_property_state: cloneJson(info?.properties?.dora_power_lora ?? null),
         incoming_state_slot: info?.properties?.dora_state_slot ?? null,
@@ -323,9 +382,16 @@ app.registerExtension({
       });
       const result = previousConfigure?.call(this, guardedInfo);
       this.serialize_widgets = false;
+      syncKnownWidgetFacade(this);
       traceLifecycle("configure:after", this);
-      queueMicrotask(() => traceLifecycle("configure:microtask", this));
-      setTimeout(() => traceLifecycle("configure:timeout-250ms", this), 250);
+      queueMicrotask(() => {
+        syncKnownWidgetFacade(this);
+        traceLifecycle("configure:microtask", this);
+      });
+      setTimeout(() => {
+        syncKnownWidgetFacade(this);
+        traceLifecycle("configure:timeout-250ms", this);
+      }, 250);
       return result;
     };
 
@@ -348,7 +414,11 @@ app.registerExtension({
     };
   },
   loadedGraphNode(node) {
+    syncKnownWidgetFacade(node);
     traceLifecycle("loadedGraphNode", node);
-    setTimeout(() => traceLifecycle("loadedGraphNode:timeout-500ms", node), 500);
+    setTimeout(() => {
+      syncKnownWidgetFacade(node);
+      traceLifecycle("loadedGraphNode:timeout-500ms", node);
+    }, 500);
   },
 });
