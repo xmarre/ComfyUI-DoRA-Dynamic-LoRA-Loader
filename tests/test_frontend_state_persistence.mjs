@@ -102,15 +102,6 @@ function makeNodeType() {
   class FakeNode {}
   FakeNode.comfyClass = NODE_CLASS;
 
-  FakeNode.prototype.addWidget = function (type, name, value, callback, options = {}) {
-    const widget = { type, name, value: clone(value), callback, options };
-    this.widgets ??= [];
-    this.widgets.push(widget);
-    return widget;
-  };
-
-  // Model the loader bootstrap: a fresh graph node owns default controls and
-  // default live state before configure() receives workflow data.
   FakeNode.prototype.onNodeCreated = function () {
     this.serialize_widgets = true;
     this.properties = {
@@ -154,8 +145,6 @@ function makeNodeType() {
     output.widgets_values = [];
   };
 
-  // Relevant LiteGraph ordering: generic widget values are captured before the
-  // onSerialize hook, but only when serialize_widgets remains enabled.
   FakeNode.prototype.serialize = function () {
     const output = { properties: clone(this.properties || {}) };
     if (this.serialize_widgets && Array.isArray(this.widgets)) {
@@ -184,13 +173,17 @@ async function patchedNodeType() {
 
 function makeFreshNode(NodeType) {
   const node = new NodeType();
+  node.addWidget = function (_type, name, value) {
+    const widget = { name, value: clone(value) };
+    this.widgets ||= [];
+    this.widgets.push(widget);
+    return widget;
+  };
   node.onNodeCreated();
   return node;
 }
 
 function applyUserState(node, state, slot = "loader_42", { staleWidgetFacade = false } = {}) {
-  // Model the actual loader callbacks: _doraRows/_doraGlobals are updated and
-  // persistNodeState mirrors them into dora_power_lora immediately.
   node._doraRows = clone(state.rows);
   node._doraGlobals = clone(state.globals);
   node.properties.dora_power_lora = clone(state);
@@ -256,8 +249,6 @@ test("#14897-style one-shot tab round trip preserves loader state", async () => 
   const outgoing = makeFreshNode(NodeType);
   applyUserState(outgoing, edited, "roundtrip_slot");
 
-  // PR #14897 relies on this synchronous graph serialization before replacing
-  // the canvas rather than a later debounced draft flush.
   const frozenWorkflowNode = outgoing.serialize();
   assert.deepEqual(frozenWorkflowNode.properties.dora_power_lora, edited);
   assert.equal(frozenWorkflowNode.properties.dora_state_slot, "roundtrip_slot");
@@ -273,31 +264,6 @@ test("#14897-style one-shot tab round trip preserves loader state", async () => 
   assert.equal(restored.properties.dora_state_slot, "roundtrip_slot");
 });
 
-test("recreated same-name widgets are forced to canonical values after frontend registration", async () => {
-  const NodeType = await patchedNodeType();
-  const saved = customState("widget-store.safetensors");
-  saved.globals.auto_strength_device = "auto";
-  saved.globals.auto_strength_ratio_floor = 0.95;
-  saved.globals.auto_strength_ratio_ceiling = 2.0;
-  const node = makeFreshNode(NodeType);
-  node.configure({ properties: { dora_power_lora: clone(saved), dora_state_slot: "store_slot" } });
-
-  // Model the #14897-era WidgetValueStore behavior observed in the browser:
-  // addWidget receives a stale/default initial value for a same-name widget.
-  // The persistence shim must overwrite the returned widget with the canonical
-  // property-backed value after frontend registration.
-  node.widgets = [];
-  const floor = node.addWidget("number", "auto_strength_ratio_floor", 0.30, () => {});
-  const ceiling = node.addWidget("number", "auto_strength_ratio_ceiling", 1.50, () => {});
-  const device = node.addWidget("combo", "auto_strength_device", "gpu", () => {});
-  const slot = node.addWidget("text", "state_slot", "loader_default", () => {});
-
-  assert.equal(floor.value, 0.95);
-  assert.equal(ceiling.value, 2.0);
-  assert.equal(device.value, "auto");
-  assert.equal(slot.value, "store_slot");
-});
-
 test("stale frontend widget facade cannot overwrite callback-owned live state", async () => {
   const NodeType = await patchedNodeType();
   const edited = customState("live-wins.safetensors");
@@ -306,15 +272,86 @@ test("stale frontend widget facade cannot overwrite callback-owned live state", 
   edited.globals.auto_strength_ratio_ceiling = 2.11;
   const node = makeFreshNode(NodeType);
 
-  // This models an alternate/new frontend renderer where the visual/widget
-  // facade still exposes bootstrap defaults even though the loader callbacks
-  // already updated _doraGlobals and dora_power_lora.
   applyUserState(node, edited, "live_slot", { staleWidgetFacade: true });
   const output = node.serialize();
 
   assert.deepEqual(output.properties.dora_power_lora, edited);
   assert.deepEqual(node.properties.dora_power_lora, edited);
   assert.equal(output.properties.dora_state_slot, "live_slot");
+});
+
+test("store-backed recreated widgets are synchronized to canonical state", async () => {
+  const extension = await loadPersistenceExtension();
+
+  class StoreBackedNode {}
+  StoreBackedNode.comfyClass = NODE_CLASS;
+
+  StoreBackedNode.prototype.onNodeCreated = function () {
+    this.serialize_widgets = true;
+    this.properties = {
+      dora_power_lora: clone(DEFAULT_STATE),
+      dora_state_slot: "loader_default",
+    };
+    this._doraRows = clone(DEFAULT_STATE.rows);
+    this._doraGlobals = clone(DEFAULT_STATE.globals);
+    this.widgets = [];
+    this.addWidget("number", "auto_strength_ratio_floor", 0.30);
+    this.addWidget("number", "auto_strength_ratio_ceiling", 1.50);
+    this.addWidget("combo", "auto_strength_device", "gpu");
+    this.addWidget("text", "state_slot", "loader_default");
+    return this;
+  };
+
+  StoreBackedNode.prototype.configure = function (info) {
+    const state = clone(info.properties.dora_power_lora);
+    this.properties = { ...(this.properties || {}), ...(info.properties || {}) };
+    this._doraRows = clone(state.rows);
+    this._doraGlobals = clone(state.globals);
+    this.widgets = [];
+    this.addWidget("number", "auto_strength_ratio_floor", 0.30);
+    this.addWidget("number", "auto_strength_ratio_ceiling", 1.50);
+    this.addWidget("combo", "auto_strength_device", "gpu");
+    this.addWidget("text", "state_slot", "loader_default");
+    return this;
+  };
+
+  await extension.beforeRegisterNodeDef(StoreBackedNode, { name: NODE_CLASS, display_name: NODE_CLASS });
+
+  const node = new StoreBackedNode();
+  node.widgets = [];
+  node.addWidget = function (_type, name, value) {
+    const staleDefaults = {
+      auto_strength_ratio_floor: 0.30,
+      auto_strength_ratio_ceiling: 1.50,
+      auto_strength_device: "gpu",
+      state_slot: "loader_default",
+    };
+    const widget = {
+      name,
+      value: Object.prototype.hasOwnProperty.call(staleDefaults, name) ? staleDefaults[name] : value,
+    };
+    this.widgets.push(widget);
+    return widget;
+  };
+
+  node.onNodeCreated();
+
+  const saved = customState("store-backed.safetensors");
+  saved.globals.auto_strength_device = "auto";
+  saved.globals.auto_strength_ratio_floor = 0.95;
+  saved.globals.auto_strength_ratio_ceiling = 2.0;
+  node.configure({
+    properties: {
+      dora_power_lora: clone(saved),
+      dora_state_slot: "store_slot",
+    },
+  });
+
+  const byName = Object.fromEntries(node.widgets.map((widget) => [widget.name, widget.value]));
+  assert.equal(byName.auto_strength_ratio_floor, 0.95);
+  assert.equal(byName.auto_strength_ratio_ceiling, 2.0);
+  assert.equal(byName.auto_strength_device, "auto");
+  assert.equal(byName.state_slot, "store_slot");
 });
 
 test("named widget workflow data is accepted only when canonical state is absent", async () => {
