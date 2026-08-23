@@ -17,9 +17,9 @@ import folder_paths
 import torch
 
 try:
-    from .state_manager_store import StatePresetNotFound, get_state_manager_store
+    from .state_manager_store import InvalidStateLibrary, StatePresetNotFound, get_state_manager_store, state_manager_library_path
 except ImportError:  # pragma: no cover - direct module loading outside the package
-    from state_manager_store import StatePresetNotFound, get_state_manager_store
+    from state_manager_store import InvalidStateLibrary, StatePresetNotFound, get_state_manager_store, state_manager_library_path
 
 _LOG = logging.getLogger(__name__)
 
@@ -548,14 +548,9 @@ def _state_manager_default_binding() -> Dict[str, Any]:
     }
 
 
-def _get_state_manager_store():
-    path = os.path.join(
-        folder_paths.get_user_directory(),
-        "dora_state_manager",
-        "state-library.json",
-    )
+def _get_state_manager_store(user_id: Any = "default"):
     return get_state_manager_store(
-        path=path,
+        path=state_manager_library_path(folder_paths, user_id),
         normalize_state=_normalize_state_manager_state,
         default_state=_state_manager_default_state,
     )
@@ -1175,20 +1170,22 @@ def _resolve_state_manager_selection(
     state_json: Any,
     selected_character_id: Any,
     selected_prompt_id: Any,
+    library_user_id: Any = "default",
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     character_id = str(selected_character_id or "").strip()
     prompt_id = str(selected_prompt_id or "").strip()
     legacy = _state_manager_legacy_state(state_json)
-    store = _get_state_manager_store()
+    store = _get_state_manager_store(library_user_id)
     if legacy is not None and not _state_manager_is_default_legacy_state(legacy):
         migration = store.migrate_legacy(legacy, character_id, prompt_id)
         mapped_character = str(migration.get("selected_character_id", "") or "")
         mapped_prompt = str(migration.get("selected_prompt_id", "") or "")
-        if not mapped_character or not mapped_prompt:
+        character_id = mapped_character or character_id
+        prompt_id = mapped_prompt or prompt_id
+        if not character_id or not prompt_id:
             raise StatePresetNotFound(
                 "Legacy State Manager data was imported, but its selected preset could not be mapped. Select a local character and prompt."
             )
-        character_id, prompt_id = mapped_character, mapped_prompt
     elif legacy is not None:
         character_id = character_id or "default_character"
         prompt_id = prompt_id or "default_prompt"
@@ -1199,11 +1196,13 @@ def _resolve_dora_state_payload(
     state_json: Any,
     selected_character_id: Any,
     selected_prompt_id: Any,
+    library_user_id: Any = "default",
 ) -> Dict[str, Any]:
     character, prompt = _resolve_state_manager_selection(
         state_json,
         selected_character_id,
         selected_prompt_id,
+        library_user_id,
     )
     state = {"version": _DORA_STATE_MANAGER_SCHEMA_VERSION, "characters": [character]}
     return _resolve_dora_state_payload_from_state(state, character.get("id"), prompt.get("id"))
@@ -1230,6 +1229,13 @@ def _queued_runtime_seed_from_ui_state(ui_state_json: Any) -> Optional[int]:
         return None
     seed = _coerce_state_manager_seed(parsed.get("__dsm_runtime_seed"), -1)
     return None if seed in _STATE_SEED_SPECIALS else seed
+
+
+def _queued_library_user_from_ui_state(ui_state_json: Any) -> str:
+    parsed = _safe_json_load(ui_state_json, {})
+    if not isinstance(parsed, dict):
+        return "default"
+    return str(parsed.get("__dsm_library_user_id", "default") or "default").strip() or "default"
 
 
 def _settings_with_runtime_seed(settings: Any, seed: int) -> Dict[str, Any]:
@@ -4741,16 +4747,22 @@ class StateManager:
             "selected_character_id": selected_character_id,
             "selected_prompt_id": selected_prompt_id,
         }
-        resolved = _resolve_dora_state_payload(
-            state_json,
-            selected_character_id,
-            selected_prompt_id,
-        )
-        queued_seed = _queued_runtime_seed_from_ui_state(ui_state_json)
-        if queued_seed is not None:
-            resolved = dict(resolved)
-            resolved["settings"] = _settings_with_runtime_seed(resolved.get("settings", {}), queued_seed)
-        payload["library_revision"] = _get_state_manager_store().revision()
+        library_user_id = _queued_library_user_from_ui_state(ui_state_json)
+        try:
+            resolved = _resolve_dora_state_payload(
+                state_json,
+                selected_character_id,
+                selected_prompt_id,
+                library_user_id,
+            )
+            queued_seed = _queued_runtime_seed_from_ui_state(ui_state_json)
+            if queued_seed is not None:
+                resolved = dict(resolved)
+                resolved["settings"] = _settings_with_runtime_seed(resolved.get("settings", {}), queued_seed)
+            payload["library_revision"] = _get_state_manager_store(library_user_id).revision()
+        except (InvalidStateLibrary, StatePresetNotFound, OSError) as exc:
+            resolved = {}
+            payload["library_error"] = type(exc).__name__
         if _extract_seed_from_settings(resolved.get("settings", {})) in _STATE_SEED_SPECIALS:
             payload["runtime_seed_nonce"] = _state_manager_new_random_seed()
         return json.dumps(payload, sort_keys=True, default=str)
@@ -4763,9 +4775,14 @@ class StateManager:
         selected_character_id: Any = "",
         selected_prompt_id: Any = "",
     ):
-        del ui_state_json
+        library_user_id = _queued_library_user_from_ui_state(ui_state_json)
         try:
-            _resolve_state_manager_selection(state_json, selected_character_id, selected_prompt_id)
+            _resolve_state_manager_selection(
+                state_json,
+                selected_character_id,
+                selected_prompt_id,
+                library_user_id,
+            )
         except StatePresetNotFound as exc:
             return f"State Manager: {exc}"
         except Exception as exc:
@@ -4779,10 +4796,12 @@ class StateManager:
         selected_character_id: Any = "",
         selected_prompt_id: Any = "",
     ):
+        library_user_id = _queued_library_user_from_ui_state(ui_state_json)
         character, prompt = _resolve_state_manager_selection(
             state_json,
             selected_character_id,
             selected_prompt_id,
+            library_user_id,
         )
         state = {"version": _DORA_STATE_MANAGER_SCHEMA_VERSION, "characters": [character]}
         payload = _resolve_dora_state_payload_from_state(state, character.get("id"), prompt.get("id"))

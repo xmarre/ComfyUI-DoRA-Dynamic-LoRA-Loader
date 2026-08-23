@@ -18,6 +18,9 @@ from state_manager_store import (
     StateLibraryStore,
     StatePresetNotFound,
     UnsupportedStateLibraryVersion,
+    get_state_manager_store,
+    reset_state_manager_store_for_tests,
+    state_manager_library_path,
 )
 
 
@@ -254,3 +257,35 @@ def test_image_references_reject_unsafe_paths(store, subfolder):
     character["thumbnail"]["subfolder"] = subfolder
     with pytest.raises(InvalidStateLibrary, match="relative|unsafe"):
         store.replace([character], 0)
+
+
+def test_malformed_character_cannot_normalize_into_default(store):
+    with pytest.raises(InvalidStateLibrary, match="characters are malformed"):
+        store.merge_library([None])
+
+
+def test_store_cache_and_paths_are_isolated_per_comfy_user(tmp_path):
+    class FolderPaths:
+        @staticmethod
+        def get_user_directory():
+            return str(tmp_path)
+
+        @staticmethod
+        def get_public_user_directory(user_id):
+            return str(tmp_path / user_id)
+
+    reset_state_manager_store_for_tests()
+    try:
+        first_path = state_manager_library_path(FolderPaths, "first")
+        second_path = state_manager_library_path(FolderPaths, "second")
+        first = get_state_manager_store(path=first_path, normalize_state=normalize_state, default_state=default_state)
+        first_again = get_state_manager_store(path=first_path, normalize_state=normalize_state, default_state=default_state)
+        second = get_state_manager_store(path=second_path, normalize_state=normalize_state, default_state=default_state)
+        assert first is first_again
+        assert first is not second
+        first.replace([make_character("First user")], 0)
+        assert second.snapshot()["characters"] == []
+        with pytest.raises(InvalidStateLibrary, match="user id is invalid"):
+            state_manager_library_path(FolderPaths, "../second")
+    finally:
+        reset_state_manager_store_for_tests()

@@ -1,3 +1,5 @@
+import logging
+
 from .nodes import (
     DoraStateManager,
     StateManager,
@@ -22,13 +24,18 @@ async def dora_dynamic_lora_list_loras(request):
     return web.json_response(folder_paths.get_filename_list("loras"))
 
 
-register_state_manager_routes(
-    folder_paths,
-    PromptServer,
-    web,
-    _normalize_state_manager_state,
-    _state_manager_default_state,
-)
+try:
+    register_state_manager_routes(
+        folder_paths,
+        PromptServer,
+        web,
+        _normalize_state_manager_state,
+        _state_manager_default_state,
+    )
+except Exception:
+    logging.getLogger(__name__).exception(
+        "State Manager library routes could not be registered; State Manager persistence will be unavailable."
+    )
 
 # Tell ComfyUI to load our frontend extension.
 WEB_DIRECTORY = "./web"

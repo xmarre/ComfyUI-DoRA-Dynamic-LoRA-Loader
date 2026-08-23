@@ -124,3 +124,84 @@ def test_two_managers_can_resolve_same_library_selection(configured_nodes):
     second = nodes.StateManager().resolve_state(*args)
     assert first[0] == second[0]
     assert first[1:4] == second[1:4]
+
+
+def test_legacy_migration_keeps_an_existing_persistent_uuid_selection(configured_nodes):
+    nodes = configured_nodes
+    selected = persistent_character()
+    legacy = persistent_character()
+    nodes._get_state_manager_store().replace([selected], 0)
+    character, prompt = nodes._resolve_state_manager_selection(
+        json.dumps({"version": 3, "characters": [legacy]}),
+        selected["id"],
+        selected["prompts"][0]["id"],
+    )
+    assert character["id"] == selected["id"]
+    assert prompt["id"] == selected["prompts"][0]["id"]
+
+
+def test_is_changed_returns_stable_marker_for_missing_preset(configured_nodes):
+    nodes = configured_nodes
+    marker = json.loads(nodes.StateManager.IS_CHANGED(
+        json.dumps(nodes._state_manager_default_binding()),
+        "",
+        str(uuid.uuid4()),
+        str(uuid.uuid4()),
+    ))
+    assert marker["library_error"] == "StatePresetNotFound"
+
+
+def test_is_changed_returns_stable_marker_for_library_io_error(configured_nodes, monkeypatch):
+    nodes = configured_nodes
+    store = nodes._get_state_manager_store()
+
+    def fail_resolve(*_args, **_kwargs):
+        raise OSError("sharing violation")
+
+    monkeypatch.setattr(store, "resolve", fail_resolve)
+    marker = json.loads(nodes.StateManager.IS_CHANGED(
+        json.dumps(nodes._state_manager_default_binding()),
+        "",
+        "default_character",
+        "default_prompt",
+    ))
+    assert marker["library_error"] == "OSError"
+
+
+def test_queued_user_id_selects_an_isolated_library(configured_nodes):
+    nodes = configured_nodes
+    first = persistent_character()
+    second = persistent_character()
+    nodes._get_state_manager_store("first-user").replace([first], 0)
+    nodes._get_state_manager_store("second-user").replace([second], 0)
+    result = nodes.StateManager().resolve_state(
+        json.dumps(nodes._state_manager_default_binding()),
+        json.dumps({"__dsm_library_user_id": "first-user"}),
+        first["id"],
+        first["prompts"][0]["id"],
+    )
+    assert result[0]["character"]["id"] == first["id"]
+
+
+def test_explicit_library_import_kind_wins_over_stray_character_field(dora_modules):
+    import dora_loader_testpkg.state_manager_api as api
+
+    calls = []
+
+    class Store:
+        def merge_library(self, characters):
+            calls.append(("library", characters))
+            return {"characters": characters}
+
+        def import_character(self, character):
+            calls.append(("character", character))
+            return {"character": character}
+
+    characters = [persistent_character()]
+    result = api._import_payload(Store(), {
+        "kind": "dora_state_manager_library_export",
+        "characters": characters,
+        "character": {"id": "stray"},
+    })
+    assert calls == [("library", characters)]
+    assert result["characters"] == characters

@@ -10,7 +10,7 @@ async function loadStateManagerHelpers() {
     .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
     .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi() { throw new Error('not used'); }, apiURL(value) { return value; } };")
     .replace('import "../../scripts/domWidget.js";', "");
-  source += `\nexport { capturedExtension, defaultBinding, defaultState, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState };\n`;
+  source += `\nexport { capturedExtension, defaultBinding, defaultState, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection };\n`;
   const encoded = Buffer.from(source, "utf8").toString("base64");
   return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
 }
@@ -84,6 +84,40 @@ test("the installed onSerialize hook scrubs private widget and property payloads
 });
 
 
+test("failed legacy migration remains serialized for a lossless retry", async () => {
+  const helpers = await loadStateManagerHelpers();
+  class StateManagerNode {
+    onSerialize(output) {
+      output.widgets_values = this.widgets.map((widget) => widget.value);
+      output.widgets_values_named = Object.fromEntries(this.widgets.map((widget) => [widget.name, widget.value]));
+      output.properties = {};
+    }
+  }
+  StateManagerNode.comfyClass = "State Manager";
+  await helpers.capturedExtension.beforeRegisterNodeDef(StateManagerNode, {
+    name: "State Manager",
+    input: { required: {} },
+  });
+  const legacy = { version: 3, characters: [privateCharacter("legacy", "Legacy", "recover me")] };
+  const node = new StateManagerNode();
+  node.properties = {};
+  node.widgets = [
+    { name: "state_json", value: helpers.serializeBinding() },
+    { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+    { name: "selected_character_id", value: "legacy" },
+    { name: "selected_prompt_id", value: "legacy-prompt" },
+  ];
+  node.__dsm = { state: helpers.defaultState(), uiState: {} };
+  node.__dsmPendingLegacyState = legacy;
+  const output = {};
+  node.onSerialize(output);
+  const preserved = JSON.parse(output.widgets_values[0]);
+  assert.equal(preserved.characters[0].id, "legacy");
+  assert.equal(preserved.characters[0].prompts[0].positive, "recover me");
+  assert.deepEqual(JSON.parse(node.widgets[0].value), helpers.defaultBinding());
+});
+
+
 test("an untouched ephemeral default is never materialized by selection or queue UI updates", async () => {
   const helpers = await loadStateManagerHelpers();
   const result = helpers.materializeEditedDefault(
@@ -149,6 +183,18 @@ test("same-character concurrent edits are surfaced instead of overwritten", asyn
 });
 
 
+test("a stale prompt binding creates one ephemeral prompt without duplicating its character", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const character = privateCharacter("character-a", "A", "A0");
+  helpers.stateLibraryClient.state = { version: 2, characters: [character] };
+  const state = helpers.stateViewForSelection("character-a", "deleted-prompt");
+  assert.equal(state.characters.filter((entry) => entry.id === "character-a").length, 1);
+  const missing = state.characters[0].prompts.find((prompt) => prompt.id === "deleted-prompt");
+  assert.equal(missing.__dsm_ephemeral, true);
+  assert.equal(helpers.persistentCharacters(state)[0].prompts.some((prompt) => prompt.id === "deleted-prompt"), false);
+});
+
+
 test("workflow UI serialization drops disposable status and panel state", async () => {
   const helpers = await loadStateManagerHelpers();
   const serialized = helpers.serializeWorkflowUiState({
@@ -162,6 +208,7 @@ test("workflow UI serialization drops disposable status and panel state", async 
   const parsed = JSON.parse(serialized);
   assert.equal(Object.prototype.hasOwnProperty.call(parsed, "status"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(parsed, "panel"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, "__dsm_library_user_id"), false);
   assert.deepEqual(parsed.queue_character_ids, ["9aa1ddfd-a018-4f42-9ca5-e8c05d558729"]);
 });
 
@@ -178,6 +225,7 @@ test("queued manager override carries a runtime seed and selection metadata only
   );
   const parsed = JSON.parse(serialized);
   assert.equal(parsed.__dsm_runtime_seed, 1234);
+  assert.equal(parsed.__dsm_library_user_id, "default");
   assert.equal(parsed.__dsm_queued_runtime_character_id, "8e7dd506-439d-4040-b5ba-d9e258259abc");
   assert.equal(parsed.__dsm_queued_runtime_prompt_id, "0a4f988a-4f17-4df6-9d2f-5f0042e9306b");
   assert.equal(Object.prototype.hasOwnProperty.call(parsed, "__dsm_queued_runtime_state"), false);
@@ -201,17 +249,24 @@ test("browser persistence code cannot resurrect a private library", async () => 
   assert.equal(source.includes("dora_state_manager_backup_workflow_id"), true, "legacy metadata should only appear in the serialization scrubber");
   assert.match(source, /delete app\.graph\.extra\.dora_state_manager_backup_workflow_id/);
   assert.equal(source.includes("setWidgetValue(widgets.uiStateWidget, serializeUiState"), false);
-  assert.match(source, /setWidgetValue\(currentWidgets\.stateWidget, serializeBinding\(\)\)/);
+  const stashIndex = source.indexOf("node.__dsmPendingLegacyState = structuredCloneCompat(embeddedLegacy)");
+  const scrubIndex = source.indexOf("setWidgetValue(currentWidgets.stateWidget, serializeBinding())");
+  const successIndex = source.indexOf("if (loaded) delete node.__dsmPendingLegacyState");
+  assert.ok(stashIndex >= 0 && scrubIndex > stashIndex && successIndex > scrubIndex);
+  assert.match(source, /this\.__dsmPendingLegacyState\s*\?\s*serializeState\(this\.__dsmPendingLegacyState\)/);
 });
 
 
 test("queued library values never synchronize into the workflow copy", async () => {
   const source = await readFile(new URL("../web/dora_state_manager.js", import.meta.url), "utf8");
-  const stateManagerCalls = source.match(/setQueuedInput\([^;]+\);/gs) || [];
-  for (const call of stateManagerCalls) {
-    if (/function setQueuedInput/.test(call)) continue;
-    if (/mutatePromptForStateSeedNode/.test(call)) continue;
-    assert.equal(/syncWidget:\s*true/.test(call), false, call);
-  }
+  assert.equal(/syncWidget:\s*true/.test(source), false);
+  assert.equal((source.match(/syncWidget\s*=\s*true/g) || []).length, 1);
   assert.equal(source.includes("__dsm_queued_runtime_state"), false);
+});
+
+
+test("blocked writes clear pending work and restore the persisted view", async () => {
+  const source = await readFile(new URL("../web/dora_state_manager.js", import.meta.url), "utf8");
+  assert.match(source, /function blockLibraryWrites[\s\S]*stateLibraryClient\.pending = \[\]/);
+  assert.match(source, /if \(stateLibraryClient\.blocked\) \{[\s\S]*refreshNodeFromLibrary\(node/);
 });

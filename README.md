@@ -557,7 +557,7 @@ The **State Manager** uses a persistent user library for reusable characters and
 The library is stored under the active ComfyUI user directory:
 
 ```text
-<ComfyUI user directory>/dora_state_manager/state-library.json
+<ComfyUI user directory>/<active user id>/dora_state_manager/state-library.json
 ```
 
 Ordinary workflow JSON contains only the selected character/prompt UUID binding and workflow-specific queue options. Character names, prompt text, LoRA stacks, settings, thumbnails, reference-image metadata, and filename prefixes are not embedded in workflow JSON.
@@ -604,6 +604,8 @@ If a workflow references UUIDs that are unavailable on the current machine, the 
 - A stale write from another browser tab is rejected. Use **Reload library** to load the current revision before editing again.
 
 The old workflow/node-keyed browser backup is no longer used or read. Browser-local UI state cannot repopulate a sanitized workflow with private presets.
+
+Presets that exist only in an old browser backup require an explicit transition: run v1.0.40, open the workflow so its backup is restored, export or save the restored state, then update and import/migrate it. The redesign does not delete old browser entries, so this recovery remains possible by temporarily returning to v1.0.40.
 
 ### Basic wiring
 

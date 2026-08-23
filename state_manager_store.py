@@ -52,6 +52,27 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def state_manager_library_path(folder_paths_module: Any, user_id: Any = "default") -> str:
+    user = str(user_id or "default").strip() or "default"
+    if user in {".", ".."} or "\x00" in user or "/" in user or "\\" in user:
+        raise InvalidStateLibrary("The ComfyUI user id is invalid.")
+    get_public_directory = getattr(folder_paths_module, "get_public_user_directory", None)
+    if callable(get_public_directory):
+        user_directory = get_public_directory(user)
+    else:  # Compatibility with ComfyUI revisions predating public-user helpers.
+        user_directory = os.path.join(folder_paths_module.get_user_directory(), user)
+    if not user_directory:
+        raise InvalidStateLibrary("The active ComfyUI user directory is unavailable.")
+    base_directory = os.path.realpath(folder_paths_module.get_user_directory())
+    resolved_directory = os.path.realpath(user_directory)
+    try:
+        if os.path.commonpath((base_directory, resolved_directory)) != base_directory:
+            raise InvalidStateLibrary("The ComfyUI user directory is outside the configured user root.")
+    except ValueError as exc:
+        raise InvalidStateLibrary("The ComfyUI user directory is invalid.") from exc
+    return os.path.join(resolved_directory, "dora_state_manager", "state-library.json")
+
+
 def _normalize_relative_component(value: Any, label: str) -> str:
     raw = str(value or "").strip().replace("\\", "/")
     if not raw:
@@ -115,10 +136,14 @@ class StateLibraryStore:
             raise InvalidStateLibrary("The State Manager library must contain a character list.")
         if not characters:
             return []
+        if any(not isinstance(character, dict) for character in characters):
+            raise InvalidStateLibrary("One or more State Manager characters are malformed.")
         normalized = self._normalize_state({"version": 3, "characters": characters})
         result = normalized.get("characters") if isinstance(normalized, dict) else None
         if not isinstance(result, list):
             raise InvalidStateLibrary("The State Manager character library is malformed.")
+        if len(result) != len(characters):
+            raise InvalidStateLibrary("One or more State Manager characters are malformed.")
         character_ids = set()
         prompt_ids = set()
         for character in result:
@@ -478,7 +503,7 @@ class StateLibraryStore:
             return _json_copy(character), _json_copy(prompt)
 
 
-_STORE: Optional[StateLibraryStore] = None
+_STORES: Dict[str, StateLibraryStore] = {}
 _STORE_LOCK = threading.Lock()
 
 
@@ -488,16 +513,19 @@ def get_state_manager_store(
     normalize_state: Optional[Callable[[Any], Dict[str, Any]]] = None,
     default_state: Optional[Callable[[], Dict[str, Any]]] = None,
 ) -> StateLibraryStore:
-    global _STORE
     with _STORE_LOCK:
-        if _STORE is None:
-            if path is None or normalize_state is None or default_state is None:
-                raise RuntimeError("State Manager store has not been configured.")
-            _STORE = StateLibraryStore(path, normalize_state, default_state)
-        return _STORE
+        if path is None:
+            raise RuntimeError("A State Manager library path is required.")
+        normalized_path = os.path.realpath(path)
+        store = _STORES.get(normalized_path)
+        if store is None:
+            if normalize_state is None or default_state is None:
+                raise RuntimeError("State Manager store has not been configured for this user.")
+            store = StateLibraryStore(normalized_path, normalize_state, default_state)
+            _STORES[normalized_path] = store
+        return store
 
 
 def reset_state_manager_store_for_tests() -> None:
-    global _STORE
     with _STORE_LOCK:
-        _STORE = None
+        _STORES.clear()

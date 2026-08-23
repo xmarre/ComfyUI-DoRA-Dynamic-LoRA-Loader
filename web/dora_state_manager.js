@@ -67,6 +67,7 @@ const dsmQueueSession = {
 };
 
 const stateLibraryClient = {
+  userId: "default",
   revision: 0,
   state: { version: STATE_SCHEMA_VERSION, characters: [] },
   canonical: "[]",
@@ -544,7 +545,7 @@ function normalizeLoraRow(row) {
 function normalizePrompt(prompt, index, nameOverride = "") {
   const p = prompt && typeof prompt === "object" ? prompt : {};
   const fallbackName = `Character ${index + 1}`;
-  return syncPromptTextMirror({
+  const normalized = syncPromptTextMirror({
     id: cleanId(p.id, `prompt_${index + 1}`),
     name: String(nameOverride || p.name || fallbackName).trim() || fallbackName,
     positive: String(p.positive ?? p.positive_prompt ?? ""),
@@ -554,6 +555,8 @@ function normalizePrompt(prompt, index, nameOverride = "") {
     reference_image: normalizeThumbnail(p.reference_image ?? p.referenceImage ?? p.prompt_image ?? p.image),
     fileimage_prefix: String(p.fileimage_prefix ?? p.filename_prefix ?? p.file_image_prefix ?? "").trim(),
   });
+  if (p.__dsm_ephemeral) normalized.__dsm_ephemeral = true;
+  return normalized;
 }
 
 function normalizeCharacter(character, index, { migrateLegacyPresetNames = false } = {}) {
@@ -669,9 +672,13 @@ function isDefaultStateValue(value) {
 }
 
 function persistentCharacters(state) {
-  return normalizeState(state).characters.filter(
-    (character) => character.id !== "default_character" && !character.__dsm_ephemeral
-  );
+  return normalizeState(state).characters
+    .filter((character) => character.id !== "default_character" && !character.__dsm_ephemeral)
+    .map((character) => ({
+      ...character,
+      prompts: character.prompts.filter((prompt) => !prompt.__dsm_ephemeral),
+    }))
+    .filter((character) => character.prompts.length);
 }
 
 function materializeEditedDefault(state, characterId, promptId) {
@@ -716,6 +723,7 @@ function installLibrarySnapshot(snapshot, { force = false } = {}) {
   const characters = Array.isArray(snapshot?.characters) ? snapshot.characters : [];
   const revision = Math.max(0, Number(snapshot?.revision) || 0);
   if (!force && revision < stateLibraryClient.revision) return false;
+  stateLibraryClient.userId = String(snapshot?.user_id || stateLibraryClient.userId || "default");
   stateLibraryClient.revision = revision;
   stateLibraryClient.state = { version: STATE_SCHEMA_VERSION, characters: structuredCloneCompat(characters) };
   stateLibraryClient.canonical = canonicalJson(characters);
@@ -739,6 +747,14 @@ function stateViewForSelection(characterId, promptId) {
   const character = state.characters.find((item) => item.id === characterId);
   const prompt = character?.prompts?.find((item) => item.id === promptId);
   if (character && prompt) return state;
+  if (character) {
+    character.prompts.unshift({
+      ...defaultPrompt("Selected prompt preset is not available locally"),
+      id: String(promptId || "missing_prompt"),
+      __dsm_ephemeral: true,
+    });
+    return normalizeState(state);
+  }
   const missing = defaultCharacter();
   missing.__dsm_ephemeral = true;
   missing.id = String(characterId || "missing_character");
@@ -797,6 +813,16 @@ function mergeScheduledLibraryUpdate(baseCharacters, desiredCharacters, currentC
   return { conflict: null, characters: order };
 }
 
+function blockLibraryWrites(status) {
+  stateLibraryClient.blocked = true;
+  stateLibraryClient.pending = [];
+  for (const node of stateLibraryClient.nodes) {
+    const current = getRenderableState(node);
+    cacheRenderableState(node, current.state, { ...current.uiState, status });
+    scheduleRender(node);
+  }
+}
+
 async function writePendingLibrary() {
   if (stateLibraryClient.writing || stateLibraryClient.blocked) return;
   stateLibraryClient.writing = true;
@@ -810,15 +836,7 @@ async function writePendingLibrary() {
         { allowOverwrite: pending.node === stateLibraryClient.lastAppliedNode },
       );
       if (merged.conflict) {
-        stateLibraryClient.blocked = true;
-        for (const node of stateLibraryClient.nodes) {
-          const current = getRenderableState(node);
-          cacheRenderableState(node, current.state, {
-            ...current.uiState,
-            status: "Two local State Manager instances edited the same character concurrently. Reload the library; no conflicting write was sent.",
-          });
-          scheduleRender(node);
-        }
+        blockLibraryWrites("Two local State Manager instances edited the same character concurrently. Reload the library; no conflicting write was sent.");
         break;
       }
       if (canonicalJson(merged.characters) === stateLibraryClient.canonical) {
@@ -839,26 +857,10 @@ async function writePendingLibrary() {
         refreshAllNodesFromLibrary();
       } catch (error) {
         if (error.status === 409) {
-          stateLibraryClient.blocked = true;
-          for (const node of stateLibraryClient.nodes) {
-            const current = getRenderableState(node);
-            cacheRenderableState(node, current.state, {
-              ...current.uiState,
-              status: "Library changed in another tab or State Manager. Reload the library before editing again; the stale write was rejected.",
-            });
-            scheduleRender(node);
-          }
+          blockLibraryWrites("Library changed in another tab or State Manager. Reload the library before editing again; the stale write was rejected.");
           break;
         }
-        stateLibraryClient.blocked = true;
-        for (const node of stateLibraryClient.nodes) {
-          const current = getRenderableState(node);
-          cacheRenderableState(node, current.state, {
-            ...current.uiState,
-            status: `Library save failed: ${error?.message || error}`,
-          });
-          scheduleRender(node);
-        }
+        blockLibraryWrites(`Library save failed: ${error?.message || error}`);
         break;
       }
     }
@@ -870,7 +872,13 @@ async function writePendingLibrary() {
 function scheduleLibraryPersist(node, state) {
   const desiredCharacters = persistentCharacters(state);
   const canonical = canonicalJson(desiredCharacters);
-  if (canonical === stateLibraryClient.canonical || stateLibraryClient.blocked) return;
+  if (stateLibraryClient.blocked) {
+    refreshNodeFromLibrary(node, {
+      status: "This edit was not applied. Reload the State Manager library before editing again.",
+    });
+    return;
+  }
+  if (canonical === stateLibraryClient.canonical) return;
   const last = stateLibraryClient.pending[stateLibraryClient.pending.length - 1];
   const scheduled = {
     node,
@@ -916,7 +924,7 @@ async function initializeStateLibrary(node, legacyState, selectedCharacterId, se
   } else {
     snapshot = await stateLibraryRequest();
   }
-  if (token != null && node.__dsmLibraryLoadToken !== token) return;
+  if (token != null && node.__dsmLibraryLoadToken !== token) return false;
   installLibrarySnapshot(snapshot);
   const widgets = getWidgets(node);
   setWidgetValue(widgets.stateWidget, serializeBinding());
@@ -931,6 +939,7 @@ async function initializeStateLibrary(node, legacyState, selectedCharacterId, se
   refreshAllNodesFromLibrary();
   cacheRenderableState(node, state, status ? { ...uiState, status } : uiState);
   scheduleRender(node);
+  return true;
 }
 
 function selectionIdsForState(state, characterId = "", promptId = "") {
@@ -3566,7 +3575,14 @@ function initializeNode(node, widget) {
     const token = (node.__dsmLibraryLoadToken || 0) + 1;
     node.__dsmLibraryLoadToken = token;
     const currentWidgets = getWidgets(node);
-    const legacy = parseLegacyEmbeddedState(widgetValue(currentWidgets.stateWidget, ""));
+    const embeddedLegacy = parseLegacyEmbeddedState(widgetValue(currentWidgets.stateWidget, ""));
+    if (embeddedLegacy && !isDefaultStateValue(embeddedLegacy)) {
+      node.__dsmPendingLegacyState = structuredCloneCompat(embeddedLegacy);
+    }
+    const legacy = node.__dsmPendingLegacyState || embeddedLegacy;
+    // Keep queued prompt generation free of the embedded payload. Until the
+    // migration succeeds, onSerialize writes the stashed legacy state back to
+    // workflow JSON so a transient server failure cannot destroy it.
     setWidgetValue(currentWidgets.stateWidget, serializeBinding());
     node.properties = node.properties || {};
     delete node.properties.dora_state_manager;
@@ -3574,7 +3590,8 @@ function initializeNode(node, widget) {
     const characterId = String(widgetValue(currentWidgets.characterWidget, "") || "");
     const promptId = String(widgetValue(currentWidgets.promptWidget, "") || "");
     try {
-      await initializeStateLibrary(node, legacy, characterId, promptId, token);
+      const loaded = await initializeStateLibrary(node, legacy, characterId, promptId, token);
+      if (loaded) delete node.__dsmPendingLegacyState;
     } catch (err) {
       if (node.__dsmLibraryLoadToken !== token) return;
       const fallback = stateViewForSelection(characterId, promptId);
@@ -3723,6 +3740,7 @@ function firstControlledStateSeed(managerNode, promptPayload) {
 function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, queueIndex, total) {
   return JSON.stringify({
     ...safeJsonParse(serializeWorkflowUiState(uiState), {}),
+    __dsm_library_user_id: stateLibraryClient.userId,
     ...(runtimeSeed == null ? {} : { __dsm_runtime_seed: runtimeSeed }),
     __dsm_queued_runtime_character_id: String(characterId ?? ""),
     __dsm_queued_runtime_prompt_id: String(promptId ?? ""),
@@ -4368,6 +4386,9 @@ app.registerExtension({
         const widgets = getWidgets(this);
         const snapshot = getCurrentState(this);
         const binding = serializeBinding();
+        const serializedState = this.__dsmPendingLegacyState
+          ? serializeState(this.__dsmPendingLegacyState)
+          : binding;
         const workflowUiState = serializeWorkflowUiState(snapshot.uiState);
         setWidgetValue(widgets.stateWidget, binding);
         o.properties = o.properties || {};
@@ -4383,7 +4404,7 @@ app.registerExtension({
           ? o.widgets_values_named
           : null;
         for (const [widget, value] of [
-          [widgets.stateWidget, binding],
+          [widgets.stateWidget, serializedState],
           [widgets.uiStateWidget, workflowUiState],
         ]) {
           const index = (this.widgets || []).indexOf(widget);
