@@ -16,12 +16,19 @@ import comfy.utils
 import folder_paths
 import torch
 
+try:
+    from .state_manager_store import StatePresetNotFound, get_state_manager_store
+except ImportError:  # pragma: no cover - direct module loading outside the package
+    from state_manager_store import StatePresetNotFound, get_state_manager_store
+
 _LOG = logging.getLogger(__name__)
 
 
 _STATE_SEED_MIN = -1125899906842624
 _STATE_SEED_MAX = 1125899906842624
 _STATE_SEED_SPECIALS = {-1, -2, -3}
+_DORA_STATE_MANAGER_BINDING_VERSION = 1
+_DORA_STATE_MANAGER_BINDING_KIND = "dora_state_manager_binding"
 
 
 def _state_manager_new_random_seed() -> int:
@@ -532,6 +539,26 @@ def _state_manager_default_state() -> Dict[str, Any]:
             }
         ],
     }
+
+
+def _state_manager_default_binding() -> Dict[str, Any]:
+    return {
+        "version": _DORA_STATE_MANAGER_BINDING_VERSION,
+        "kind": _DORA_STATE_MANAGER_BINDING_KIND,
+    }
+
+
+def _get_state_manager_store():
+    path = os.path.join(
+        folder_paths.get_user_directory(),
+        "dora_state_manager",
+        "state-library.json",
+    )
+    return get_state_manager_store(
+        path=path,
+        normalize_state=_normalize_state_manager_state,
+        default_state=_state_manager_default_state,
+    )
 
 
 def _safe_json_load(raw: Any, fallback: Any) -> Any:
@@ -1080,8 +1107,8 @@ def _pick_state_manager_prompt(character: Dict[str, Any], selected_prompt_id: An
     return prompts[0] if prompts else _state_manager_default_state()["characters"][0]["prompts"][0]
 
 
-def _resolve_dora_state_payload(
-    state_json: Any,
+def _resolve_dora_state_payload_from_state(
+    state: Dict[str, Any],
     selected_character_id: Any,
     selected_prompt_id: Any,
 ) -> Dict[str, Any]:
@@ -1091,7 +1118,6 @@ def _resolve_dora_state_payload(
     is handled by the frontend as explicit graph editing; runtime execution must stay
     acyclic.
     """
-    state = _normalize_state_manager_state(state_json)
     character = _pick_state_manager_character(state, selected_character_id)
     prompt = _pick_state_manager_prompt(character, selected_prompt_id)
 
@@ -1134,6 +1160,55 @@ def _resolve_dora_state_payload(
     }
 
 
+def _state_manager_legacy_state(raw: Any) -> Optional[Dict[str, Any]]:
+    parsed = _safe_json_load(raw, None)
+    if isinstance(parsed, dict) and isinstance(parsed.get("characters"), list):
+        return parsed
+    return None
+
+
+def _state_manager_is_default_legacy_state(state: Dict[str, Any]) -> bool:
+    return _normalize_state_manager_state(state) == _normalize_state_manager_state(_state_manager_default_state())
+
+
+def _resolve_state_manager_selection(
+    state_json: Any,
+    selected_character_id: Any,
+    selected_prompt_id: Any,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    character_id = str(selected_character_id or "").strip()
+    prompt_id = str(selected_prompt_id or "").strip()
+    legacy = _state_manager_legacy_state(state_json)
+    store = _get_state_manager_store()
+    if legacy is not None and not _state_manager_is_default_legacy_state(legacy):
+        migration = store.migrate_legacy(legacy, character_id, prompt_id)
+        mapped_character = str(migration.get("selected_character_id", "") or "")
+        mapped_prompt = str(migration.get("selected_prompt_id", "") or "")
+        if not mapped_character or not mapped_prompt:
+            raise StatePresetNotFound(
+                "Legacy State Manager data was imported, but its selected preset could not be mapped. Select a local character and prompt."
+            )
+        character_id, prompt_id = mapped_character, mapped_prompt
+    elif legacy is not None:
+        character_id = character_id or "default_character"
+        prompt_id = prompt_id or "default_prompt"
+    return store.resolve(character_id, prompt_id)
+
+
+def _resolve_dora_state_payload(
+    state_json: Any,
+    selected_character_id: Any,
+    selected_prompt_id: Any,
+) -> Dict[str, Any]:
+    character, prompt = _resolve_state_manager_selection(
+        state_json,
+        selected_character_id,
+        selected_prompt_id,
+    )
+    state = {"version": _DORA_STATE_MANAGER_SCHEMA_VERSION, "characters": [character]}
+    return _resolve_dora_state_payload_from_state(state, character.get("id"), prompt.get("id"))
+
+
 def _build_state_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     settings = _normalize_settings_with_canonical_seed(payload.get("settings", {}))
     seed = _extract_seed_from_settings(settings)
@@ -1147,12 +1222,14 @@ def _build_state_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _queued_runtime_state_from_ui_state(ui_state_json: Any) -> Optional[Dict[str, Any]]:
+def _queued_runtime_seed_from_ui_state(ui_state_json: Any) -> Optional[int]:
     parsed = _safe_json_load(ui_state_json, {})
     if not isinstance(parsed, dict):
         return None
-    raw = parsed.get("__dsm_queued_runtime_state")
-    return _normalize_runtime_dora_state_payload(raw)
+    if "__dsm_runtime_seed" not in parsed:
+        return None
+    seed = _coerce_state_manager_seed(parsed.get("__dsm_runtime_seed"), -1)
+    return None if seed in _STATE_SEED_SPECIALS else seed
 
 
 def _settings_with_runtime_seed(settings: Any, seed: int) -> Dict[str, Any]:
@@ -4606,9 +4683,9 @@ def _build_auto_strength_stack_text_report(stack_report: Dict[str, Any]) -> str:
 
 class StateManager:
     """
-    Workflow-serialized preset manager for character LoRA stacks, prompt templates,
-    settings, and seed state. Runtime execution is source-only and acyclic: capture/load
-    actions are explicit frontend graph edits, not execution-time input feedback.
+    Workflow-bound view of the persistent State Manager library. Workflows serialize
+    only preset UUID bindings; runtime data is resolved from the user library without
+    downstream state reads or execution-time graph cycles.
     """
 
     @classmethod
@@ -4618,7 +4695,7 @@ class StateManager:
                 "state_json": (
                     "STRING",
                     {
-                        "default": json.dumps(_state_manager_default_state(), separators=(",", ":")),
+                        "default": json.dumps(_state_manager_default_binding(), separators=(",", ":")),
                         "multiline": True,
                     },
                 ),
@@ -4664,11 +4741,16 @@ class StateManager:
             "selected_character_id": selected_character_id,
             "selected_prompt_id": selected_prompt_id,
         }
-        resolved = _queued_runtime_state_from_ui_state(ui_state_json) or _resolve_dora_state_payload(
+        resolved = _resolve_dora_state_payload(
             state_json,
             selected_character_id,
             selected_prompt_id,
         )
+        queued_seed = _queued_runtime_seed_from_ui_state(ui_state_json)
+        if queued_seed is not None:
+            resolved = dict(resolved)
+            resolved["settings"] = _settings_with_runtime_seed(resolved.get("settings", {}), queued_seed)
+        payload["library_revision"] = _get_state_manager_store().revision()
         if _extract_seed_from_settings(resolved.get("settings", {})) in _STATE_SEED_SPECIALS:
             payload["runtime_seed_nonce"] = _state_manager_new_random_seed()
         return json.dumps(payload, sort_keys=True, default=str)
@@ -4682,13 +4764,12 @@ class StateManager:
         selected_prompt_id: Any = "",
     ):
         del ui_state_json
-        state = _normalize_state_manager_state(state_json)
-        character = _pick_state_manager_character(state, selected_character_id)
-        prompt = _pick_state_manager_prompt(character, selected_prompt_id)
-        if not character:
-            return "State Manager: no character states are available."
-        if not prompt:
-            return "State Manager: no prompt states are available for the selected character."
+        try:
+            _resolve_state_manager_selection(state_json, selected_character_id, selected_prompt_id)
+        except StatePresetNotFound as exc:
+            return f"State Manager: {exc}"
+        except Exception as exc:
+            return f"State Manager library error: {exc}"
         return True
 
     def resolve_state(
@@ -4698,28 +4779,18 @@ class StateManager:
         selected_character_id: Any = "",
         selected_prompt_id: Any = "",
     ):
-        runtime_payload = _queued_runtime_state_from_ui_state(ui_state_json)
-        if runtime_payload is not None:
-            payload = _resolve_state_manager_runtime_seed(runtime_payload)
-            state = _normalize_state_manager_state(state_json)
-            character = _pick_state_manager_character(
-                state,
-                (payload.get("character") or {}).get("id", selected_character_id) if isinstance(payload.get("character"), dict) else selected_character_id,
-            )
-            prompt = _pick_state_manager_prompt(
-                character,
-                (payload.get("prompt") or {}).get("id", selected_prompt_id) if isinstance(payload.get("prompt"), dict) else selected_prompt_id,
-            )
-        else:
-            payload = _resolve_dora_state_payload(
-                state_json,
-                selected_character_id,
-                selected_prompt_id,
-            )
-            payload = _resolve_state_manager_runtime_seed(payload)
-            state = _normalize_state_manager_state(state_json)
-            character = _pick_state_manager_character(state, selected_character_id)
-            prompt = _pick_state_manager_prompt(character, selected_prompt_id)
+        character, prompt = _resolve_state_manager_selection(
+            state_json,
+            selected_character_id,
+            selected_prompt_id,
+        )
+        state = {"version": _DORA_STATE_MANAGER_SCHEMA_VERSION, "characters": [character]}
+        payload = _resolve_dora_state_payload_from_state(state, character.get("id"), prompt.get("id"))
+        queued_seed = _queued_runtime_seed_from_ui_state(ui_state_json)
+        if queued_seed is not None:
+            payload = dict(payload)
+            payload["settings"] = _settings_with_runtime_seed(payload.get("settings", {}), queued_seed)
+        payload = _resolve_state_manager_runtime_seed(payload)
         settings = _normalize_settings_with_canonical_seed(payload.get("settings", {}))
         settings_json = json.dumps(settings, ensure_ascii=False, sort_keys=True, indent=2)
         lora_stack_payload = _build_lora_stack_payload(

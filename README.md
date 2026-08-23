@@ -552,7 +552,15 @@ This repo is meant for cases where plain ComfyUI LoRA loading is not enough, esp
 
 ## State Manager
 
-This build adds a **State Manager** node for workflow-serialized character states. Workflows made with the older **DoRA State Manager** node name remain supported through a legacy alias.
+The **State Manager** uses a persistent user library for reusable characters and prompt presets. Workflows made with the older **DoRA State Manager** node name remain supported through a legacy alias.
+
+The library is stored under the active ComfyUI user directory:
+
+```text
+<ComfyUI user directory>/dora_state_manager/state-library.json
+```
+
+Ordinary workflow JSON contains only the selected character/prompt UUID binding and workflow-specific queue options. Character names, prompt text, LoRA stacks, settings, thumbnails, reference-image metadata, and filename prefixes are not embedded in workflow JSON.
 
 The manager separates **saved state** from **runtime execution**:
 
@@ -582,7 +590,20 @@ The State Manager opens with the saved-state library as its largest pane:
 - Preset, character, LoRA, settings/seed, and queue editing live in tabs in the detail pane.
 - Resizing the node gives the library the additional space; the collection has no fixed-height cap.
 
-The UI-only redesign does not change node class names, widget names/order, state JSON, selection widgets, outputs, or the legacy **DoRA State Manager** alias. Existing workflows continue through the same normalization and migration paths.
+The storage redesign keeps node class names, widget order, selection widgets, outputs, connected save/load behavior, and the legacy **DoRA State Manager** alias. Existing schema-v3 embedded libraries are imported into persistent storage on first load. Migration is fingerprinted and idempotent, preserves valid collision-free UUIDs, remaps unsafe/colliding IDs, and never overwrites an unrelated local preset.
+
+If a workflow references UUIDs that are unavailable on the current machine, the node reports that the selected preset is unavailable. It does not fall back to another local character. A deliberately empty/default node continues to use an ephemeral built-in **Default Character** until it is edited into a persistent character.
+
+### Library portability and recovery
+
+- **Export character** downloads only the selected character and its prompt presets.
+- **Export library** downloads a versioned backup of the entire persistent library.
+- **Import** accepts character exports, library exports, and legacy State Manager exports.
+- Library writes use a lock, optimistic revisions, a flushed temporary file, atomic `os.replace()`, and directory fsync where supported.
+- Malformed storage is quarantined as `state-library.json.corrupt-<timestamp>` instead of being overwritten.
+- A stale write from another browser tab is rejected. Use **Reload library** to load the current revision before editing again.
+
+The old workflow/node-keyed browser backup is no longer used or read. Browser-local UI state cannot repopulate a sanitized workflow with private presets.
 
 ### Basic wiring
 

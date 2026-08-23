@@ -1,3 +1,15 @@
+# Unreleased
+
+## State Manager persistent library architecture
+
+- Moves reusable characters, prompt presets, LoRA stacks, settings, thumbnails, reference metadata, and filename prefixes into a backend-authoritative library under the ComfyUI user directory.
+- Limits workflow serialization to UUID bindings and workflow-specific queue configuration.
+- Removes workflow/node-keyed `localStorage` library backups and their automatic restore path.
+- Adds atomic, revisioned storage with UUID validation, locking, corruption quarantine, explicit missing-preset errors, and stale-write rejection.
+- Adds idempotent migration for legacy embedded schema-v3 libraries plus explicit character/library import and export.
+- Keeps runtime outputs, connected save/load/apply, text boxes, seeds, multiple loaders, queue wildcarding, and the legacy node alias compatible.
+- Keeps queue-time library values transient and out of the queued workflow copy.
+
 # DoRA Dynamic LoRA Loader v1.0.40
 
 This release fixes DoRA Power LoRA Loader settings appearing to reset when switching away from a ComfyUI workflow tab and returning to it on newer store-backed ComfyUI frontends.

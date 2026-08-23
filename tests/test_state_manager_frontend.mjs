@@ -1,0 +1,217 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+
+async function loadStateManagerHelpers() {
+  const sourceUrl = new URL("../web/dora_state_manager.js", import.meta.url);
+  let source = await readFile(sourceUrl, "utf8");
+  source = source
+    .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
+    .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi() { throw new Error('not used'); }, apiURL(value) { return value; } };")
+    .replace('import "../../scripts/domWidget.js";', "");
+  source += `\nexport { capturedExtension, defaultBinding, defaultState, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState };\n`;
+  const encoded = Buffer.from(source, "utf8").toString("base64");
+  return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
+}
+
+
+function privateCharacter(id, name, promptText) {
+  return {
+    id,
+    name,
+    prompts: [{ id: `${id}-prompt`, name: "Private preset", positive: promptText }],
+  };
+}
+
+
+test("workflow binding contains IDs/configuration only and no private library payload", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const binding = JSON.parse(helpers.serializeBinding());
+  assert.deepEqual(binding, { version: 1, kind: "dora_state_manager_binding" });
+  const serialized = JSON.stringify(binding);
+  for (const secret of ["Private Character", "private prompt", "private.safetensors", "thumbnail", "reference_image", "loader_stacks"]) {
+    assert.equal(serialized.includes(secret), false);
+  }
+});
+
+
+test("the installed onSerialize hook scrubs private widget and property payloads", async () => {
+  const helpers = await loadStateManagerHelpers();
+  class StateManagerNode {
+    onSerialize(output) {
+      output.widgets_values = this.widgets.map((widget) => widget.value);
+      output.widgets_values_named = Object.fromEntries(this.widgets.map((widget) => [widget.name, widget.value]));
+      output.properties = { ...this.properties };
+    }
+  }
+  StateManagerNode.comfyClass = "State Manager";
+  await helpers.capturedExtension.beforeRegisterNodeDef(StateManagerNode, {
+    name: "State Manager",
+    input: { required: {} },
+  });
+  const privateState = {
+    version: 3,
+    characters: [privateCharacter("private-character", "Private Character", "private prompt text")],
+  };
+  const node = new StateManagerNode();
+  node.properties = {
+    dora_state_manager: privateState,
+    dora_state_manager_backup_node_uid: "private-backup-id",
+  };
+  node.widgets = [
+    { name: "state_json", value: JSON.stringify(privateState) },
+    { name: "ui_state_json", value: JSON.stringify({ status: "Private Character", panel: "character" }) },
+    { name: "selected_character_id", value: "private-character" },
+    { name: "selected_prompt_id", value: "private-character-prompt" },
+  ];
+  node.__dsm = { state: privateState, uiState: { status: "Private Character", panel: "character" } };
+
+  const output = {};
+  node.onSerialize(output);
+  const serialized = JSON.stringify(output);
+  assert.equal(serialized.includes("Private Character"), false);
+  assert.equal(serialized.includes("private prompt text"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(output.properties, "dora_state_manager"), false);
+  assert.deepEqual(JSON.parse(output.widgets_values[0]), helpers.defaultBinding());
+  assert.deepEqual(JSON.parse(output.widgets_values[1]), {
+    version: 2,
+    queue_prompt_wildcard: false,
+    queue_character_wildcard: false,
+    queue_randomize_saved_seed: false,
+    queue_character_ids: [],
+  });
+});
+
+
+test("an untouched ephemeral default is never materialized by selection or queue UI updates", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const result = helpers.materializeEditedDefault(
+    helpers.defaultState(),
+    "default_character",
+    "default_prompt",
+  );
+  assert.equal(result.characterId, "default_character");
+  assert.equal(result.promptId, "default_prompt");
+  assert.equal(result.state.characters[0].id, "default_character");
+});
+
+
+test("materializing an edited default preserves the selected newly-created prompt", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const state = helpers.defaultState();
+  state.characters[0].prompts.push({
+    ...structuredClone(state.characters[0].prompts[0]),
+    id: "draft_prompt",
+    name: "New preset",
+  });
+  const result = helpers.materializeEditedDefault(state, "default_character", "draft_prompt");
+  assert.notEqual(result.characterId, "default_character");
+  assert.equal(result.promptId, result.state.characters[0].prompts[1].id);
+});
+
+
+test("new and duplicated presets receive collision-resistant UUID bindings", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const ids = new Set(Array.from({ length: 100 }, () => helpers.makeId("prompt")));
+  assert.equal(ids.size, 100);
+  for (const id of ids) assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+});
+
+
+test("disjoint character edits rebase without losing either manager's change", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const base = [
+    privateCharacter("character-a", "A", "A0"),
+    privateCharacter("character-b", "B", "B0"),
+  ];
+  const desired = structuredClone(base);
+  desired[1].prompts[0].positive = "B1";
+  const current = structuredClone(base);
+  current[0].prompts[0].positive = "A1";
+  const merged = helpers.mergeScheduledLibraryUpdate(base, desired, current);
+  assert.equal(merged.conflict, null);
+  assert.equal(merged.characters[0].prompts[0].positive, "A1");
+  assert.equal(merged.characters[1].prompts[0].positive, "B1");
+});
+
+
+test("same-character concurrent edits are surfaced instead of overwritten", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const base = [privateCharacter("character-a", "A", "A0")];
+  const desired = structuredClone(base);
+  desired[0].prompts[0].positive = "A from manager two";
+  const current = structuredClone(base);
+  current[0].prompts[0].positive = "A from manager one";
+  const merged = helpers.mergeScheduledLibraryUpdate(base, desired, current);
+  assert.equal(merged.conflict, "character-a");
+  assert.equal(merged.characters[0].prompts[0].positive, "A from manager one");
+});
+
+
+test("workflow UI serialization drops disposable status and panel state", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const serialized = helpers.serializeWorkflowUiState({
+    panel: "character",
+    status: "Editing Private Character",
+    queue_prompt_wildcard: true,
+    queue_character_wildcard: true,
+    queue_randomize_saved_seed: false,
+    queue_character_ids: ["9aa1ddfd-a018-4f42-9ca5-e8c05d558729"],
+  });
+  const parsed = JSON.parse(serialized);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, "status"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, "panel"), false);
+  assert.deepEqual(parsed.queue_character_ids, ["9aa1ddfd-a018-4f42-9ca5-e8c05d558729"]);
+});
+
+
+test("queued manager override carries a runtime seed and selection metadata only", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const serialized = helpers.serializeQueuedUiStateOverride(
+    { status: "Private Character", queue_randomize_saved_seed: true },
+    "8e7dd506-439d-4040-b5ba-d9e258259abc",
+    "0a4f988a-4f17-4df6-9d2f-5f0042e9306b",
+    1234,
+    0,
+    2,
+  );
+  const parsed = JSON.parse(serialized);
+  assert.equal(parsed.__dsm_runtime_seed, 1234);
+  assert.equal(parsed.__dsm_queued_runtime_character_id, "8e7dd506-439d-4040-b5ba-d9e258259abc");
+  assert.equal(parsed.__dsm_queued_runtime_prompt_id, "0a4f988a-4f17-4df6-9d2f-5f0042e9306b");
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, "__dsm_queued_runtime_state"), false);
+  assert.equal(serialized.includes("Private Character"), false);
+});
+
+
+test("legacy embedded state remains detectable for controlled migration", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const legacy = { version: 3, characters: [{ id: "legacy", name: "Legacy" }] };
+  assert.deepEqual(helpers.parseLegacyEmbeddedState(JSON.stringify(legacy)), legacy);
+  assert.equal(helpers.parseLegacyEmbeddedState(helpers.serializeBinding()), null);
+});
+
+
+test("browser persistence code cannot resurrect a private library", async () => {
+  const source = await readFile(new URL("../web/dora_state_manager.js", import.meta.url), "utf8");
+  assert.equal(source.includes("localStorage"), false);
+  assert.equal(source.includes("tryRestoreStateBackup"), false);
+  assert.equal(source.includes("writeStateBackup"), false);
+  assert.equal(source.includes("dora_state_manager_backup_workflow_id"), true, "legacy metadata should only appear in the serialization scrubber");
+  assert.match(source, /delete app\.graph\.extra\.dora_state_manager_backup_workflow_id/);
+  assert.equal(source.includes("setWidgetValue(widgets.uiStateWidget, serializeUiState"), false);
+  assert.match(source, /setWidgetValue\(currentWidgets\.stateWidget, serializeBinding\(\)\)/);
+});
+
+
+test("queued library values never synchronize into the workflow copy", async () => {
+  const source = await readFile(new URL("../web/dora_state_manager.js", import.meta.url), "utf8");
+  const stateManagerCalls = source.match(/setQueuedInput\([^;]+\);/gs) || [];
+  for (const call of stateManagerCalls) {
+    if (/function setQueuedInput/.test(call)) continue;
+    if (/mutatePromptForStateSeedNode/.test(call)) continue;
+    assert.equal(/syncWidget:\s*true/.test(call), false, call);
+  }
+  assert.equal(source.includes("__dsm_queued_runtime_state"), false);
+});

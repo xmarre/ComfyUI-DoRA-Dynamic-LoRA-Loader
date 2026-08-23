@@ -29,7 +29,7 @@ jobs:
           node-version: "22"
 
       - name: Compile Python sources
-        run: python -m py_compile __init__.py nodes.py runtime_bypass.py
+        run: python -m py_compile __init__.py nodes.py runtime_bypass.py state_manager_api.py state_manager_store.py
 
       - name: Check frontend JavaScript syntax
         shell: bash
@@ -40,7 +40,7 @@ jobs:
           done < <(find web -type f -name '*.js' -print0)
 
       - name: Run frontend persistence regression tests
-        run: node --test tests/test_frontend_state_persistence.mjs
+        run: node --test tests/test_frontend_state_persistence.mjs tests/test_state_manager_frontend.mjs
 
       - name: Build package wheel
         run: |
