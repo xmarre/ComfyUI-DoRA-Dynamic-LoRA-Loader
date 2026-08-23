@@ -1,4 +1,15 @@
-# Unreleased
+# DoRA Dynamic LoRA Loader v1.0.41
+
+This release moves State Manager presets into a backend-authoritative per-user library and adds mathematically equivalent runtime bypass support for plain LoKr adapters on compatible ComfyUI revisions.
+
+## Plain LoKr runtime bypass
+
+- Adds runtime bypass support for plain direct-factor, decomposed, and mixed LoRA + LoKr adapter stacks when ComfyUI provides native LoKr bypass math.
+- Preserves current ComfyUI materialized LoKr semantics across direct-factor alpha values and unequal decomposed ranks through runtime-only adapter copies.
+- Keeps source adapters unchanged and continues to reject DoRA-LoKr, sliced/offset/transformed targets, reshape LoRA, and unsupported adapter forms.
+- Rejects LoKr runtime mode explicitly on older ComfyUI revisions whose `LoKrAdapter` lacks forward-bypass math.
+- Defers deterministic runtime validation failures across the base loader's retry boundary and commits captured adapters transactionally, preventing partial or duplicate hooks after a failed materialized-patch attempt.
+- Adds parity, mixed-stack, rejection, retry, rollback, and hook-restoration coverage against a pinned current ComfyUI revision.
 
 ## State Manager persistent library architecture
 

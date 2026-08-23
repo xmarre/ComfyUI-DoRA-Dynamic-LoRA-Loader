@@ -76,6 +76,11 @@ jobs:
             torch_version: "2.10.0"
             torchvision_version: "0.25.0"
             torchaudio_version: "2.10.0"
+          - comfy_version: 2026-08-21
+            comfy_ref: 28864ca8fed67cc05a957710f88ce23aff75fd2f
+            torch_version: "2.10.0"
+            torchvision_version: "0.25.0"
+            torchaudio_version: "2.10.0"
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom node
