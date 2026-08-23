@@ -1,5 +1,15 @@
-from .nodes import DoraStateManager, StateManager, StateManagerSeed, StateManagerTextBox
+import logging
+
+from .nodes import (
+    DoraStateManager,
+    StateManager,
+    StateManagerSeed,
+    StateManagerTextBox,
+    _normalize_state_manager_state,
+    _state_manager_default_state,
+)
 from .runtime_bypass import RuntimeBypassDoraPowerLoraLoader
+from .state_manager_api import register_routes as register_state_manager_routes
 
 # Backend API for frontend LoRA dropdown (avoids relying on /object_info variants).
 import folder_paths
@@ -12,6 +22,20 @@ async def dora_dynamic_lora_list_loras(request):
     # Return plain list of filenames from ComfyUI's "loras" folder_paths category.
     # Frontend will prepend "None".
     return web.json_response(folder_paths.get_filename_list("loras"))
+
+
+try:
+    register_state_manager_routes(
+        folder_paths,
+        PromptServer,
+        web,
+        _normalize_state_manager_state,
+        _state_manager_default_state,
+    )
+except Exception:
+    logging.getLogger(__name__).exception(
+        "State Manager library routes could not be registered; State Manager persistence will be unavailable."
+    )
 
 # Tell ComfyUI to load our frontend extension.
 WEB_DIRECTORY = "./web"
