@@ -8,7 +8,7 @@ from unittest import mock
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(os.environ.get("DORA_REPO_ROOT", Path(__file__).resolve().parents[1])).resolve()
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
