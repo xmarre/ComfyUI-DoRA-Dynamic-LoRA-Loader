@@ -445,6 +445,7 @@ class RuntimeBypassDoraPowerLoraLoader(_base.DoraPowerLoraLoader):
 
                 regular: Dict[Any, Any] = {}
                 applied: List[Any] = []
+                staged_capture: List[Dict[str, Any]] = []
 
                 for raw_key, patch_data in patches.items():
                     key, offset, function = _patch_target(raw_key)
@@ -458,7 +459,7 @@ class RuntimeBypassDoraPowerLoraLoader(_base.DoraPowerLoraLoader):
                                 "Runtime bypass does not currently support sliced/offset or transformed adapter targets. "
                                 f"{lora_name!r} uses one at {raw_key!r}. Disable Runtime bypass LoRA for this file."
                             )
-                        capture.append(
+                        staged_capture.append(
                             {
                                 "key": key,
                                 "adapter": runtime_adapter,
@@ -485,6 +486,11 @@ class RuntimeBypassDoraPowerLoraLoader(_base.DoraPowerLoraLoader):
                         target,
                     )
 
+                # Commit runtime captures only after every adapter validates and
+                # any materialized patches complete. The base loader retries
+                # add_patches() after an exception; mutating the shared capture
+                # earlier would retain a partial attempt and duplicate adapters.
+                capture.extend(staged_capture)
                 return applied
             except RuntimeBypassUnsupportedError as exc:
                 if deferred_errors is None:

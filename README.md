@@ -19,9 +19,9 @@ This implementation was reworked for the unified DoRA + standard LoRA path in th
 
 ---
 
-## Runtime bypass LoRA (low VRAM)
+## Runtime bypass adapters (low VRAM)
 
-The loader includes an optional **Runtime bypass LoRA (low VRAM)** mode for supported standard LoRAs.
+The loader includes an optional **Runtime bypass LoRA (low VRAM)** mode for supported standard LoRA and plain LoKr adapters.
 
 The word **bypass** refers to bypassing **weight materialization**, not bypassing or weakening the LoRA effect. For a normal additive LoRA, the regular merged path evaluates a layer with `W + ΔW`, while the runtime path keeps `W` untouched and evaluates the equivalent low-rank contribution during the forward pass:
 
@@ -40,6 +40,12 @@ Normal materialized patching may need to retain the original model weights while
 
 Runtime bypass keeps the base model weights unchanged and stores/evaluates the low-rank adapter tensors directly, avoiding that full patched-model copy for supported adapters.
 
+### Plain LoKr support
+
+Plain LoKr adapters use ComfyUI's native LoKr forward-bypass implementation when it is available. Direct-factor, decomposed, and mixed LoRA + LoKr stacks are supported. The runtime-only adapter metadata is normalized where current ComfyUI's LoKr materialization and bypass paths use different alpha/rank conventions; the source adapter remains unchanged.
+
+Older ComfyUI revisions without a real `LoKrAdapter.h()` implementation reject LoKr runtime bypass with an explicit update/disable message. DoRA-LoKr magnitude scaling remains unsupported because ComfyUI's LoKr bypass path does not implement DoRA normalization.
+
 ### Important limitation: DoRA is not runtime-bypassed
 
 Current ComfyUI bypass LoRA math implements the additive LoRA path, but not DoRA magnitude normalization/rescaling. Treating a DoRA as ordinary bypass LoRA would therefore change its mathematics.
@@ -49,7 +55,7 @@ This loader deliberately **fails closed** when runtime bypass encounters DoRA or
 Runtime bypass currently refuses:
 
 - DoRA / magnitude-vector LoRAs (`dora_scale`, Diffusers/PEFT `lora_magnitude_vector`, `w_norm`, `b_norm`)
-- non-LoRA weight-adapter types
+- DoRA-LoKr and adapter types other than standard LoRA/plain LoKr
 - LoRA reshape metadata
 - sliced / offset / transformed adapter targets
 - non-default `strength_model` patch semantics
@@ -441,11 +447,11 @@ These patches affect DoRA / LoRA application in the running ComfyUI process, not
 
 ## Troubleshooting
 
-### Runtime bypass rejects a LoRA
+### Runtime bypass rejects an adapter
 
 Runtime bypass only takes adapters for which the supported forward-pass path preserves the normal patch semantics. In particular, current ComfyUI bypass LoRA does **not** implement DoRA magnitude normalization.
 
-If the loader reports DoRA/magnitude-vector, reshape, offset/transform, or another unsupported adapter form, disable **Runtime bypass LoRA (low VRAM)** for that file rather than trying to force it through the runtime path.
+If the loader reports DoRA/magnitude-vector, reshape, offset/transform, an older ComfyUI build without LoKr bypass math, or another unsupported adapter form, disable **Runtime bypass LoRA (low VRAM)** for that file.
 
 ### Flux2 DoRA instability
 

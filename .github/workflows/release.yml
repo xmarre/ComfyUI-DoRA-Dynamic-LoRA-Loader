@@ -57,10 +57,19 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
-          test -s "dist/ComfyUI-DoRA-Dynamic-LoRA-Loader-v${VERSION}.zip"
+          archive="dist/ComfyUI-DoRA-Dynamic-LoRA-Loader-v${VERSION}.zip"
+          prefix="ComfyUI-DoRA-Dynamic-LoRA-Loader-v${VERSION}"
+          test -s "${archive}"
           test -s dist/SHA256SUMS
           test -s RELEASE_NOTES.md
           grep -F "ComfyUI-DoRA-Dynamic-LoRA-Loader-v${VERSION}.zip" dist/SHA256SUMS
+          listing="$(unzip -Z1 "${archive}")"
+          for required in \
+            state_manager_api.py \
+            state_manager_store.py \
+            web/dora_state_manager.js; do
+            printf '%s\n' "${listing}" | grep -Fx "${prefix}/${required}"
+          done
 
       - name: Publish GitHub release
         env:
