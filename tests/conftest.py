@@ -16,26 +16,6 @@ ROOT = pathlib.Path(
 COMFYUI_PATH = pathlib.Path(os.environ.get("COMFYUI_PATH", ROOT / "ComfyUI")).resolve()
 
 comfy_cli_args_path = COMFYUI_PATH / "comfy" / "cli_args.py"
-if not comfy_cli_args_path.is_file():
-    pytest.skip(
-        f"ComfyUI checkout not found at {COMFYUI_PATH}; set COMFYUI_PATH to a valid checkout.",
-        allow_module_level=True,
-    )
-
-if str(COMFYUI_PATH) not in sys.path:
-    sys.path.insert(0, str(COMFYUI_PATH))
-
-# GitHub's hosted runners use the CPU-only PyTorch wheel. ComfyUI's CLI parser
-# intentionally parses an empty argv when imported as a library, so its default
-# device remains CUDA unless a caller changes the parsed args before importing
-# comfy.model_management. Force CPU mode for these pure adapter tests; this is
-# the same supported ComfyUI --cpu execution mode, without letting ComfyUI parse
-# pytest's own command-line arguments.
-comfy_cli_args = pytest.importorskip(
-    "comfy.cli_args",
-    reason=f"Could not import comfy.cli_args from ComfyUI checkout at {COMFYUI_PATH}.",
-)
-comfy_cli_args.args.cpu = True
 
 
 @pytest.fixture(scope="session")
@@ -45,6 +25,21 @@ def dora_modules():
     The custom-node __init__ registers HTTP routes against a live PromptServer,
     which is correct inside ComfyUI but unnecessary for these pure loader tests.
     """
+    if not comfy_cli_args_path.is_file():
+        pytest.skip(
+            f"ComfyUI checkout not found at {COMFYUI_PATH}; set COMFYUI_PATH to a valid checkout."
+        )
+    if str(COMFYUI_PATH) not in sys.path:
+        sys.path.insert(0, str(COMFYUI_PATH))
+
+    # GitHub's hosted runners use the CPU-only PyTorch wheel. Force the supported
+    # ComfyUI CPU mode before importing comfy.model_management.
+    comfy_cli_args = pytest.importorskip(
+        "comfy.cli_args",
+        reason=f"Could not import comfy.cli_args from ComfyUI checkout at {COMFYUI_PATH}.",
+    )
+    comfy_cli_args.args.cpu = True
+
     package_name = "dora_loader_testpkg"
     package = types.ModuleType(package_name)
     package.__path__ = [str(ROOT)]

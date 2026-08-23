@@ -53,13 +53,9 @@ const STATE_SEED_INCREMENT = -2;
 const STATE_SEED_DECREMENT = -3;
 const STATE_SEED_SPECIALS = [STATE_SEED_RANDOM, STATE_SEED_INCREMENT, STATE_SEED_DECREMENT];
 const LAST_SEED_BUTTON_LABEL = "♻️ (Use Last Queued Seed)";
-const BACKUP_STORAGE_PREFIX = "comfyui_dora_state_manager_backup_v2";
-const LEGACY_BACKUP_STORAGE_PREFIX = "comfyui_dora_state_manager_backup_v1";
-const BACKUP_WORKFLOW_ID_EXTRA_KEY = "dora_state_manager_backup_workflow_id";
-const BACKUP_NODE_UID_PROPERTY = "dora_state_manager_backup_node_uid";
-const BACKUP_INDEX_STORAGE_SUFFIX = "workflow_index";
-const BACKUP_EXPORT_KIND = "dora_state_manager_export";
-const BACKUP_RESTORE_STATUS_PREFIX = "Warning: this node loaded with default/empty state";
+const LIBRARY_API = "/dora_dynamic_lora/state-library";
+const BINDING_KIND = "dora_state_manager_binding";
+const BINDING_VERSION = 1;
 const QUEUE_SESSION_MAX_AGE_MS = 30000;
 
 const dsmQueueSession = {
@@ -68,6 +64,18 @@ const dsmQueueSession = {
   nextIndex: 0,
   startedAt: 0,
   promptPools: new Map(),
+};
+
+const stateLibraryClient = {
+  userId: "default",
+  revision: 0,
+  state: { version: STATE_SCHEMA_VERSION, characters: [] },
+  canonical: "[]",
+  pending: [],
+  writing: false,
+  blocked: false,
+  lastAppliedNode: null,
+  nodes: new Set(),
 };
 
 
@@ -87,9 +95,17 @@ function safeJsonParse(raw, fallback) {
   }
 }
 
-function makeId(prefix) {
-  if (globalThis.crypto?.randomUUID) return `${prefix}_${globalThis.crypto.randomUUID()}`;
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+function makeId(_prefix) {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  globalThis.crypto?.getRandomValues?.(bytes);
+  if (!bytes.some(Boolean)) {
+    for (let index = 0; index < bytes.length; index++) bytes[index] = Math.floor(Math.random() * 256);
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 function cleanId(value, fallback) {
@@ -292,26 +308,8 @@ function defaultUiState() {
   return { version: 1, panel: "prompts", status: "", queue_randomize_saved_seed: false };
 }
 
-function isBackupRestoreStatus(value) {
-  return String(value ?? "").trim().startsWith(BACKUP_RESTORE_STATUS_PREFIX);
-}
-
 function stripBackupRestoreStatus(uiState) {
-  const normalized = normalizeUiState(uiState || defaultUiState());
-  return isBackupRestoreStatus(normalized.status) ? { ...normalized, status: "" } : normalized;
-}
-
-function setBackupWarning(node, text) {
-  if (!node) return;
-  const warning = String(text ?? "").trim();
-  if (warning) node.__dsmBackupWarning = warning;
-  else delete node.__dsmBackupWarning;
-}
-
-function clearBackupWarning(node) {
-  if (!node?.__dsmBackupWarning) return false;
-  delete node.__dsmBackupWarning;
-  return true;
+  return normalizeUiState(uiState || defaultUiState());
 }
 
 function normalizeNumber(value, fallback = 1.0) {
@@ -547,7 +545,7 @@ function normalizeLoraRow(row) {
 function normalizePrompt(prompt, index, nameOverride = "") {
   const p = prompt && typeof prompt === "object" ? prompt : {};
   const fallbackName = `Character ${index + 1}`;
-  return syncPromptTextMirror({
+  const normalized = syncPromptTextMirror({
     id: cleanId(p.id, `prompt_${index + 1}`),
     name: String(nameOverride || p.name || fallbackName).trim() || fallbackName,
     positive: String(p.positive ?? p.positive_prompt ?? ""),
@@ -557,6 +555,8 @@ function normalizePrompt(prompt, index, nameOverride = "") {
     reference_image: normalizeThumbnail(p.reference_image ?? p.referenceImage ?? p.prompt_image ?? p.image),
     fileimage_prefix: String(p.fileimage_prefix ?? p.filename_prefix ?? p.file_image_prefix ?? "").trim(),
   });
+  if (p.__dsm_ephemeral) normalized.__dsm_ephemeral = true;
+  return normalized;
 }
 
 function normalizeCharacter(character, index, { migrateLegacyPresetNames = false } = {}) {
@@ -572,6 +572,7 @@ function normalizeCharacter(character, index, { migrateLegacyPresetNames = false
     loader_stacks: normalizeLoaderStacks(c),
     prompts: prompts.length ? prompts : [defaultPrompt(name)],
   };
+  if (c.__dsm_ephemeral) normalized.__dsm_ephemeral = true;
   return syncLegacyLoaderMirror(normalized);
 }
 
@@ -627,8 +628,39 @@ function serializeUiState(uiState) {
   return JSON.stringify(stripBackupRestoreStatus(uiState), null, 0);
 }
 
+function serializeWorkflowUiState(uiState) {
+  const normalized = normalizeUiState(uiState);
+  return JSON.stringify({
+    version: 2,
+    queue_prompt_wildcard: normalized.queue_prompt_wildcard,
+    queue_character_wildcard: normalized.queue_character_wildcard,
+    queue_randomize_saved_seed: normalized.queue_randomize_saved_seed,
+    queue_character_ids: normalized.queue_character_ids,
+  });
+}
+
 function canonicalJson(value) {
-  return JSON.stringify(value);
+  const canonicalize = (item) => {
+    if (Array.isArray(item)) return item.map(canonicalize);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(
+      Object.keys(item).sort().map((key) => [key, canonicalize(item[key])])
+    );
+  };
+  return JSON.stringify(canonicalize(value));
+}
+
+function defaultBinding() {
+  return { version: BINDING_VERSION, kind: BINDING_KIND };
+}
+
+function serializeBinding() {
+  return JSON.stringify(defaultBinding());
+}
+
+function parseLegacyEmbeddedState(raw) {
+  const parsed = safeJsonParse(raw, null);
+  return parsed && Array.isArray(parsed.characters) ? parsed : null;
 }
 
 function isDefaultStateValue(value) {
@@ -639,327 +671,275 @@ function isDefaultStateValue(value) {
   }
 }
 
-function isStateJsonDefaultOrEmpty(raw) {
-  if (raw == null) return true;
-  if (typeof raw === "string" && !raw.trim()) return true;
-  return isDefaultStateValue(raw);
+function persistentCharacters(state) {
+  return normalizeState(state).characters
+    .filter((character) => character.id !== "default_character" && !character.__dsm_ephemeral)
+    .map((character) => ({
+      ...character,
+      prompts: character.prompts.filter((prompt) => !prompt.__dsm_ephemeral),
+    }))
+    .filter((character) => character.prompts.length);
 }
 
-function graphForBackup(node) {
-  return getGraph(node) || app?.graph || null;
-}
-
-function workflowBackupId(node, { create = true } = {}) {
-  const graph = graphForBackup(node);
-  if (!graph) return "unknown_workflow";
-  graph.extra = graph.extra || {};
-  const existing = String(graph.extra[BACKUP_WORKFLOW_ID_EXTRA_KEY] ?? "").trim();
-  if (existing) return existing;
-  if (!create) return "";
-  const id = makeId("workflow");
-  graph.extra[BACKUP_WORKFLOW_ID_EXTRA_KEY] = id;
-  return id;
-}
-
-function nodeBackupId(node) {
-  const id = node?.id ?? node?.__id ?? "unknown_node";
-  return String(id).trim() || "unknown_node";
-}
-
-function nodeBackupUid(node, { create = true } = {}) {
-  const props = node?.properties || {};
-  const nested = props.dora_state_manager && typeof props.dora_state_manager === "object" ? props.dora_state_manager : {};
-  const existing = String(props[BACKUP_NODE_UID_PROPERTY] ?? nested.backup_node_uid ?? "").trim();
-  if (existing) return existing;
-  if (!create || !node) return "";
-  node.properties = node.properties || {};
-  const uid = makeId("state_manager_node");
-  node.properties[BACKUP_NODE_UID_PROPERTY] = uid;
-  return uid;
-}
-
-function stateBackupNodeKey(node, { createNodeUid = true } = {}) {
-  return nodeBackupUid(node, { create: createNodeUid }) || `node_id_${nodeBackupId(node)}`;
-}
-
-function stateBackupStorageKey(prefix, workflowId, nodeKey) {
-  return `${prefix}:${workflowId || "unknown_workflow"}:node:${nodeKey || "unknown_node"}`;
-}
-
-function stateBackupKey(node, { createWorkflowId = true, createNodeUid = true } = {}) {
-  const workflowId = workflowBackupId(node, { create: createWorkflowId }) || "unknown_workflow";
-  return stateBackupStorageKey(BACKUP_STORAGE_PREFIX, workflowId, stateBackupNodeKey(node, { createNodeUid }));
-}
-
-function legacyStateBackupKey(node, { createWorkflowId = false } = {}) {
-  const workflowId = workflowBackupId(node, { create: createWorkflowId }) || "unknown_workflow";
-  return stateBackupStorageKey(LEGACY_BACKUP_STORAGE_PREFIX, workflowId, `node_id_${nodeBackupId(node)}`);
-}
-
-function stateBackupIndexKey(workflowId, prefix = BACKUP_STORAGE_PREFIX) {
-  return `${prefix}:${workflowId || "unknown_workflow"}:${BACKUP_INDEX_STORAGE_SUFFIX}`;
-}
-
-function nodeBackupSignature(node) {
-  const pos = Array.isArray(node?.pos) ? node.pos : [];
-  const size = Array.isArray(node?.size) ? node.size : [];
-  return {
-    type: String(node?.type ?? node?.constructor?.type ?? "").trim(),
-    title: String(node?.title ?? "").trim(),
-    comfyClass: String(node?.comfyClass ?? node?.constructor?.comfyClass ?? "").trim(),
-    pos: [Number(pos[0]) || 0, Number(pos[1]) || 0],
-    size: [Number(size[0]) || 0, Number(size[1]) || 0],
-  };
-}
-
-function backupStateSummary(state) {
+function materializeEditedDefault(state, characterId, promptId) {
   const normalized = normalizeState(state);
-  const characterCount = normalized.characters.length;
-  const promptCount = normalized.characters.reduce((sum, character) => sum + (character.prompts?.length || 0), 0);
-  const loaderCount = normalized.characters.reduce((sum, character) => sum + normalizeLoaderStacks(character).length, 0);
-  return { characterCount, promptCount, loaderCount };
-}
-
-function normalizeBackupRecord(raw, storageKey = "") {
-  const parsed = safeJsonParse(raw, null);
-  if (!parsed || typeof parsed !== "object") return null;
-  const stateRaw = parsed.state ?? parsed.state_json ?? parsed.stateJson;
-  if (stateRaw == null) return null;
-  const state = normalizeState(stateRaw);
-  const uiState = stripBackupRestoreStatus(parsed.ui_state ?? parsed.uiState ?? parsed.ui_state_json ?? parsed.uiStateJson ?? defaultUiState());
-  const characterId = String(parsed.selected_character_id ?? parsed.selectedCharacterId ?? "").trim();
-  const promptId = String(parsed.selected_prompt_id ?? parsed.selectedPromptId ?? "").trim();
-  const nodeMeta = parsed.node && typeof parsed.node === "object" ? parsed.node : {};
+  const defaultIndex = normalized.characters.findIndex((character) => character.id === "default_character");
+  if (defaultIndex < 0) return { state: normalized, characterId, promptId };
+  const character = normalized.characters[defaultIndex];
+  if (canonicalJson(character) === canonicalJson(defaultCharacter())) return { state: normalized, characterId, promptId };
+  const oldPromptId = String(promptId || "");
+  character.id = makeId("character");
+  const promptIds = new Map();
+  character.prompts = character.prompts.map((prompt) => {
+    const id = makeId("prompt");
+    promptIds.set(String(prompt.id || ""), id);
+    return { ...prompt, id };
+  });
   return {
-    version: 2,
-    kind: "dora_state_manager_backup",
-    storageKey,
-    workflowId: String(parsed.workflow_id ?? parsed.workflowId ?? "").trim(),
-    nodeId: String(parsed.node_id ?? parsed.nodeId ?? "").trim(),
-    nodeKey: String(parsed.node_key ?? parsed.nodeKey ?? "").trim(),
-    backupNodeUid: String(parsed.backup_node_uid ?? parsed.backupNodeUid ?? parsed.node_uid ?? parsed.nodeUid ?? "").trim(),
-    updatedAt: String(parsed.updated_at ?? parsed.updatedAt ?? "").trim(),
-    state,
-    uiState,
-    selectedCharacterId: characterId,
-    selectedPromptId: promptId,
-    node: {
-      type: String(nodeMeta.type ?? "").trim(),
-      title: String(nodeMeta.title ?? "").trim(),
-      comfyClass: String(nodeMeta.comfyClass ?? nodeMeta.comfy_class ?? "").trim(),
-      pos: Array.isArray(nodeMeta.pos) ? [Number(nodeMeta.pos[0]) || 0, Number(nodeMeta.pos[1]) || 0] : [0, 0],
-      size: Array.isArray(nodeMeta.size) ? [Number(nodeMeta.size[0]) || 0, Number(nodeMeta.size[1]) || 0] : [0, 0],
-    },
+    state: normalized,
+    characterId: String(characterId || "") === "default_character" ? character.id : characterId,
+    promptId: promptIds.get(oldPromptId) || character.prompts[0]?.id || "",
   };
 }
 
-function readStorageJson(key, fallback) {
+async function stateLibraryRequest(path = "", options = {}) {
+  const response = await api.fetchApi(`${LIBRARY_API}${path}`, options);
+  let payload = null;
   try {
-    const raw = globalThis.localStorage?.getItem(key);
-    if (raw == null) return structuredCloneCompat(fallback);
-    return safeJsonParse(raw, fallback);
-  } catch (err) {
-    console.warn(`[${EXT_NAME}] failed to read localStorage key ${key}`, err);
-    return structuredCloneCompat(fallback);
+    payload = await response.json();
+  } catch {
+    payload = null;
   }
-}
-
-function writeStorageJson(key, value) {
-  try {
-    globalThis.localStorage?.setItem(key, JSON.stringify(value));
-    return true;
-  } catch (err) {
-    console.warn(`[${EXT_NAME}] failed to write localStorage key ${key}`, err);
-    return false;
+  if (!response.ok) {
+    const error = new Error(payload?.error || `State Manager library request failed (${response.status}).`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
+  return payload;
 }
 
-function readBackupRecordAtKey(key) {
-  try {
-    const raw = globalThis.localStorage?.getItem(key);
-    return normalizeBackupRecord(raw, key);
-  } catch (err) {
-    console.warn(`[${EXT_NAME}] failed to read State Manager browser backup`, err);
-    return null;
+function installLibrarySnapshot(snapshot, { force = false } = {}) {
+  const characters = Array.isArray(snapshot?.characters) ? snapshot.characters : [];
+  const revision = Math.max(0, Number(snapshot?.revision) || 0);
+  if (!force && revision < stateLibraryClient.revision) return false;
+  stateLibraryClient.userId = String(snapshot?.user_id || stateLibraryClient.userId || "default");
+  stateLibraryClient.revision = revision;
+  stateLibraryClient.state = { version: STATE_SCHEMA_VERSION, characters: structuredCloneCompat(characters) };
+  stateLibraryClient.canonical = canonicalJson(characters);
+  stateLibraryClient.blocked = false;
+  return true;
+}
+
+function selectionIsDefault(characterId, promptId) {
+  return ["", "default_character"].includes(String(characterId || ""))
+    && ["", "default_prompt"].includes(String(promptId || ""));
+}
+
+function stateViewForSelection(characterId, promptId) {
+  const characters = Array.isArray(stateLibraryClient.state?.characters)
+    ? stateLibraryClient.state.characters.map((character, index) => normalizeCharacter(character, index)).filter(Boolean)
+    : [];
+  const state = { version: STATE_SCHEMA_VERSION, characters };
+  if (selectionIsDefault(characterId, promptId)) {
+    return normalizeState({ version: STATE_SCHEMA_VERSION, characters: [defaultCharacter(), ...state.characters] });
   }
-}
-
-function readStateBackup(node) {
-  const keys = [
-    stateBackupKey(node, { createWorkflowId: false, createNodeUid: false }),
-    legacyStateBackupKey(node, { createWorkflowId: false }),
-  ];
-  for (const key of keys) {
-    const backup = readBackupRecordAtKey(key);
-    if (backup) return backup;
+  const character = state.characters.find((item) => item.id === characterId);
+  const prompt = character?.prompts?.find((item) => item.id === promptId);
+  if (character && prompt) return state;
+  if (character) {
+    character.prompts.unshift({
+      ...defaultPrompt("Selected prompt preset is not available locally"),
+      id: String(promptId || "missing_prompt"),
+      __dsm_ephemeral: true,
+    });
+    return normalizeState(state);
   }
-  return null;
+  const missing = defaultCharacter();
+  missing.__dsm_ephemeral = true;
+  missing.id = String(characterId || "missing_character");
+  missing.name = "Selected character preset is not available locally";
+  missing.prompts[0].id = String(promptId || "missing_prompt");
+  missing.prompts[0].name = "Select or create a local character";
+  return normalizeState({ version: STATE_SCHEMA_VERSION, characters: [missing, ...state.characters] });
 }
 
-function backupIndexEntry(record, key) {
-  return {
-    key,
-    workflow_id: record.workflow_id,
-    node_id: record.node_id,
-    node_key: record.node_key,
-    backup_node_uid: record.backup_node_uid,
-    updated_at: record.updated_at,
-    summary: record.summary,
-    node: record.node,
-  };
+function refreshNodeFromLibrary(node, { status = "" } = {}) {
+  if (!node?.__dsm) return;
+  const widgets = getWidgets(node);
+  const characterId = String(widgetValue(widgets.characterWidget, "") || "");
+  const promptId = String(widgetValue(widgets.promptWidget, "") || "");
+  const state = stateViewForSelection(characterId, promptId);
+  const uiState = normalizeUiState(
+    node.__dsm?.uiState || widgetValue(widgets.uiStateWidget, serializeWorkflowUiState(defaultUiState()))
+  );
+  cacheRenderableState(node, state, status ? { ...uiState, status } : uiState);
+  scheduleRender(node);
 }
 
-function updateBackupIndex(record, key) {
-  const workflowId = String(record.workflow_id || "").trim();
-  if (!workflowId) return;
-  const indexKey = stateBackupIndexKey(workflowId);
-  const index = readStorageJson(indexKey, []);
-  const entries = Array.isArray(index) ? index.filter((entry) => entry && entry.key !== key) : [];
-  entries.unshift(backupIndexEntry(record, key));
-  writeStorageJson(indexKey, entries.slice(0, 100));
+function refreshAllNodesFromLibrary() {
+  for (const node of stateLibraryClient.nodes) refreshNodeFromLibrary(node);
 }
 
-function scanBackupKeysForWorkflow(workflowId) {
-  const out = new Set();
-  const prefixes = [
-    `${BACKUP_STORAGE_PREFIX}:${workflowId}:node:`,
-    `${LEGACY_BACKUP_STORAGE_PREFIX}:${workflowId}:node:`,
-  ];
-  try {
-    const storage = globalThis.localStorage;
-    if (!storage) return [];
-    for (let i = 0; i < storage.length; i++) {
-      const key = storage.key(i);
-      if (prefixes.some((prefix) => String(key || "").startsWith(prefix))) out.add(key);
+function mergeScheduledLibraryUpdate(baseCharacters, desiredCharacters, currentCharacters, { allowOverwrite = false } = {}) {
+  const base = new Map((baseCharacters || []).map((character) => [character.id, character]));
+  const desired = new Map((desiredCharacters || []).map((character) => [character.id, character]));
+  const current = new Map((currentCharacters || []).map((character) => [character.id, character]));
+  const changedIds = new Set();
+  for (const id of new Set([...base.keys(), ...desired.keys()])) {
+    if (canonicalJson(base.get(id)) !== canonicalJson(desired.get(id))) changedIds.add(id);
+  }
+  for (const id of changedIds) {
+    const baseValue = base.get(id);
+    const desiredValue = desired.get(id);
+    const currentValue = current.get(id);
+    const currentMatchesBase = canonicalJson(currentValue) === canonicalJson(baseValue);
+    const currentMatchesDesired = canonicalJson(currentValue) === canonicalJson(desiredValue);
+    if (!currentMatchesBase && !currentMatchesDesired && !allowOverwrite) {
+      return { conflict: id, characters: currentCharacters };
     }
-  } catch (err) {
-    console.warn(`[${EXT_NAME}] failed to scan State Manager browser backups`, err);
+    if (desiredValue === undefined) current.delete(id);
+    else current.set(id, structuredCloneCompat(desiredValue));
   }
-  return [...out];
-}
-
-function readWorkflowBackupCandidates(node) {
-  const workflowId = workflowBackupId(node, { create: false });
-  if (!workflowId) return [];
-  const keys = new Set();
-  const index = readStorageJson(stateBackupIndexKey(workflowId), []);
-  if (Array.isArray(index)) {
-    for (const entry of index) {
-      if (entry?.key) keys.add(String(entry.key));
+  const order = [];
+  for (const character of currentCharacters || []) {
+    if (current.has(character.id)) order.push(current.get(character.id));
+  }
+  for (const character of desiredCharacters || []) {
+    if (!order.some((entry) => entry.id === character.id) && current.has(character.id)) {
+      order.push(current.get(character.id));
     }
   }
-  for (const key of scanBackupKeysForWorkflow(workflowId)) keys.add(key);
-  const records = [];
-  for (const key of keys) {
-    const record = readBackupRecordAtKey(key);
-    if (record && !isDefaultStateValue(record.state)) records.push(record);
-  }
-  records.sort((a, b) => Date.parse(b.updatedAt || 0) - Date.parse(a.updatedAt || 0));
-  return records;
+  return { conflict: null, characters: order };
 }
 
-function backupDistanceScore(nodeSignature, backupSignature) {
-  const a = Array.isArray(nodeSignature?.pos) ? nodeSignature.pos : [0, 0];
-  const b = Array.isArray(backupSignature?.pos) ? backupSignature.pos : [0, 0];
-  const dx = (Number(a[0]) || 0) - (Number(b[0]) || 0);
-  const dy = (Number(a[1]) || 0) - (Number(b[1]) || 0);
-  return Math.sqrt(dx * dx + dy * dy);
+function blockLibraryWrites(status) {
+  stateLibraryClient.blocked = true;
+  stateLibraryClient.pending = [];
+  for (const node of stateLibraryClient.nodes) {
+    const current = getRenderableState(node);
+    cacheRenderableState(node, current.state, { ...current.uiState, status });
+    scheduleRender(node);
+  }
 }
 
-function scoreBackupForNode(node, record) {
-  const currentUid = nodeBackupUid(node, { create: false });
-  const currentId = nodeBackupId(node);
-  const current = nodeBackupSignature(node);
-  const backup = record?.node || {};
-  let score = 0;
-  let exact = false;
-
-  if (currentUid && record.backupNodeUid && currentUid === record.backupNodeUid) {
-    score += 10000;
-    exact = true;
-  }
-  if (currentId && record.nodeId && currentId === record.nodeId) {
-    score += 5000;
-    exact = true;
-  }
-
-  const sameTitle = current.title && backup.title && current.title === backup.title;
-  const sameType = current.type && backup.type && current.type === backup.type;
-  const sameClass = current.comfyClass && backup.comfyClass && current.comfyClass === backup.comfyClass;
-  const distance = backupDistanceScore(current, backup);
-
-  if (sameTitle) score += 80;
-  if (sameType) score += 40;
-  if (sameClass) score += 40;
-  if (Number.isFinite(distance)) {
-    if (distance <= 4) score += 160;
-    else if (distance <= 32) score += 120;
-    else if (distance <= 96) score += 60;
-  }
-
-  return { score, exact, sameTitle, sameType, sameClass, distance };
-}
-
-function findBestStateBackup(node) {
-  const exact = readStateBackup(node);
-  if (exact && !isDefaultStateValue(exact.state)) return { record: exact, reason: "exact", ambiguous: false };
-
-  const candidates = readWorkflowBackupCandidates(node);
-  if (!candidates.length) return { record: null, reason: "none", ambiguous: false };
-
-  const scored = candidates
-    .map((record) => ({ record, match: scoreBackupForNode(node, record) }))
-    .sort((a, b) => b.match.score - a.match.score || Date.parse(b.record.updatedAt || 0) - Date.parse(a.record.updatedAt || 0));
-
-  const best = scored[0];
-  const second = scored[1];
-  if (best.match.exact) return { record: best.record, reason: "stable-node-id", ambiguous: false };
-
-  const strongPositionalMatch = best.match.score >= 180 && (best.match.sameTitle || best.match.sameType || best.match.sameClass) && best.match.distance <= 96;
-  if (strongPositionalMatch && (!second || best.match.score - second.match.score >= 40)) {
-    return { record: best.record, reason: "position-title", ambiguous: false };
-  }
-
-  if (candidates.length === 1) return { record: best.record, reason: "only-workflow-backup", ambiguous: false };
-
-  return { record: null, reason: "ambiguous", ambiguous: true, candidates: scored };
-}
-
-function makeBackupRecord(node, state, uiState, widgets = getWidgets(node)) {
-  const normalizedState = normalizeState(state);
-  const normalizedUiState = stripBackupRestoreStatus(uiState || defaultUiState());
-  const workflowId = workflowBackupId(node, { create: true });
-  const backupUid = nodeBackupUid(node, { create: true });
-  const nodeKey = stateBackupNodeKey(node, { createNodeUid: true });
-  return {
-    version: 2,
-    kind: "dora_state_manager_backup",
-    workflow_id: workflowId,
-    node_id: nodeBackupId(node),
-    node_key: nodeKey,
-    backup_node_uid: backupUid,
-    updated_at: new Date().toISOString(),
-    summary: backupStateSummary(normalizedState),
-    node: nodeBackupSignature(node),
-    state: normalizedState,
-    ui_state: normalizedUiState,
-    selected_character_id: String(widgetValue(widgets.characterWidget, "") || ""),
-    selected_prompt_id: String(widgetValue(widgets.promptWidget, "") || ""),
-  };
-}
-
-function writeStateBackup(node, state, uiState, widgets = getWidgets(node)) {
-  if (!node) return;
+async function writePendingLibrary() {
+  if (stateLibraryClient.writing || stateLibraryClient.blocked) return;
+  stateLibraryClient.writing = true;
   try {
-    const normalizedState = normalizeState(state);
-    if (isDefaultStateValue(normalizedState)) return;
-    const record = makeBackupRecord(node, normalizedState, uiState, widgets);
-    const key = stateBackupKey(node, { createWorkflowId: true, createNodeUid: true });
-    globalThis.localStorage?.setItem(key, JSON.stringify(record));
-    updateBackupIndex(record, key);
-  } catch (err) {
-    console.warn(`[${EXT_NAME}] failed to write State Manager browser backup`, err);
+    while (stateLibraryClient.pending.length && !stateLibraryClient.blocked) {
+      const pending = stateLibraryClient.pending.shift();
+      const merged = mergeScheduledLibraryUpdate(
+        pending.baseCharacters,
+        pending.desiredCharacters,
+        stateLibraryClient.state.characters,
+        { allowOverwrite: pending.node === stateLibraryClient.lastAppliedNode },
+      );
+      if (merged.conflict) {
+        blockLibraryWrites("Two local State Manager instances edited the same character concurrently. Reload the library; no conflicting write was sent.");
+        break;
+      }
+      if (canonicalJson(merged.characters) === stateLibraryClient.canonical) {
+        stateLibraryClient.lastAppliedNode = pending.node;
+        continue;
+      }
+      try {
+        const snapshot = await stateLibraryRequest("", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            expected_revision: stateLibraryClient.revision,
+            characters: merged.characters,
+          }),
+        });
+        installLibrarySnapshot(snapshot);
+        stateLibraryClient.lastAppliedNode = pending.node;
+        refreshAllNodesFromLibrary();
+      } catch (error) {
+        if (error.status === 409) {
+          blockLibraryWrites("Library changed in another tab or State Manager. Reload the library before editing again; the stale write was rejected.");
+          break;
+        }
+        blockLibraryWrites(`Library save failed: ${error?.message || error}`);
+        break;
+      }
+    }
+  } finally {
+    stateLibraryClient.writing = false;
   }
+}
+
+function scheduleLibraryPersist(node, state) {
+  const desiredCharacters = persistentCharacters(state);
+  const canonical = canonicalJson(desiredCharacters);
+  if (stateLibraryClient.blocked) {
+    refreshNodeFromLibrary(node, {
+      status: "This edit was not applied. Reload the State Manager library before editing again.",
+    });
+    return;
+  }
+  if (canonical === stateLibraryClient.canonical) return;
+  const last = stateLibraryClient.pending[stateLibraryClient.pending.length - 1];
+  const scheduled = {
+    node,
+    baseCharacters: structuredCloneCompat(last?.node === node ? last.baseCharacters : stateLibraryClient.state.characters),
+    desiredCharacters: structuredCloneCompat(desiredCharacters),
+  };
+  if (last?.node === node) stateLibraryClient.pending[stateLibraryClient.pending.length - 1] = scheduled;
+  else stateLibraryClient.pending.push(scheduled);
+  void writePendingLibrary();
+}
+
+async function reloadStateLibrary(node, { status = "Reloaded State Manager library." } = {}) {
+  stateLibraryClient.blocked = false;
+  stateLibraryClient.pending = [];
+  stateLibraryClient.lastAppliedNode = null;
+  const snapshot = await stateLibraryRequest();
+  installLibrarySnapshot(snapshot, { force: true });
+  refreshAllNodesFromLibrary();
+  refreshNodeFromLibrary(node, { status });
+}
+
+async function initializeStateLibrary(node, legacyState, selectedCharacterId, selectedPromptId, token = null) {
+  let snapshot;
+  let characterId = String(selectedCharacterId || "");
+  let promptId = String(selectedPromptId || "");
+  let status = "";
+  if (legacyState && !isDefaultStateValue(legacyState)) {
+    const migration = await stateLibraryRequest("/migrate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        state: legacyState,
+        selected_character_id: characterId,
+        selected_prompt_id: promptId,
+      }),
+    });
+    snapshot = migration.snapshot;
+    characterId = migration.selected_character_id || "";
+    promptId = migration.selected_prompt_id || "";
+    status = migration.already_migrated
+      ? "Legacy embedded library was already migrated; restored its local UUID binding."
+      : "Migrated the legacy embedded State Manager library into persistent user storage.";
+  } else {
+    snapshot = await stateLibraryRequest();
+  }
+  if (token != null && node.__dsmLibraryLoadToken !== token) return false;
+  installLibrarySnapshot(snapshot);
+  const widgets = getWidgets(node);
+  setWidgetValue(widgets.stateWidget, serializeBinding());
+  setWidgetValue(widgets.characterWidget, characterId || "default_character");
+  setWidgetValue(widgets.promptWidget, promptId || "default_prompt");
+  const state = stateViewForSelection(
+    widgetValue(widgets.characterWidget, ""),
+    widgetValue(widgets.promptWidget, ""),
+  );
+  const uiState = normalizeUiState(widgetValue(widgets.uiStateWidget, serializeUiState(defaultUiState())));
+  setWidgetValue(widgets.uiStateWidget, serializeWorkflowUiState(uiState));
+  refreshAllNodesFromLibrary();
+  cacheRenderableState(node, state, status ? { ...uiState, status } : uiState);
+  scheduleRender(node);
+  return true;
 }
 
 function selectionIdsForState(state, characterId = "", promptId = "") {
@@ -967,77 +947,6 @@ function selectionIdsForState(state, characterId = "", promptId = "") {
   const character = normalizedState.characters.find((item) => item.id === characterId) || normalizedState.characters[0];
   const prompt = character?.prompts?.find((item) => item.id === promptId) || character?.prompts?.[0];
   return { characterId: character?.id || "", promptId: prompt?.id || "" };
-}
-
-function backupRestoredStatus(record, reason = "") {
-  const summary = record?.state ? backupStateSummary(record.state) : null;
-  const suffix = summary ? ` (${summary.characterCount} character${summary.characterCount === 1 ? "" : "s"}, ${summary.promptCount} prompt${summary.promptCount === 1 ? "" : "s"}).` : ".";
-  const source = reason && reason !== "exact" ? ` Matched backup by ${reason}.` : "";
-  return `Warning: this node loaded with default/empty state while a browser backup existed. Restored backup${suffix}${source} Save the workflow to persist the recovered state.`;
-}
-
-function backupAmbiguousStatus(match) {
-  const count = match?.candidates?.length || 0;
-  return `Warning: this node loaded with default/empty state and ${count} browser backups exist for this workflow, but none matched this recreated node safely. Use Import State JSON or move/rename the node to match the original location before retrying.`;
-}
-
-function tryRestoreStateBackup(node, { force = false } = {}) {
-  const widgets = getWidgets(node);
-  const rawState = widgetValue(widgets.stateWidget, "");
-  const result = { restored: false, preserveBackupWarning: false };
-  if (!force && !isStateJsonDefaultOrEmpty(rawState)) return result;
-  const match = findBestStateBackup(node);
-  const backup = match.record;
-  if (!backup || isDefaultStateValue(backup.state)) {
-    if (match.ambiguous) {
-      const status = backupAmbiguousStatus(match);
-      setWidgetValue(widgets.uiStateWidget, serializeUiState(stripBackupRestoreStatus(widgetValue(widgets.uiStateWidget, ""))));
-      setBackupWarning(node, status);
-      markNodeDirty(node);
-      return { restored: false, preserveBackupWarning: true };
-    }
-    return result;
-  }
-  const selection = selectionIdsForState(backup.state, backup.selectedCharacterId, backup.selectedPromptId);
-  const status = backupRestoredStatus(backup, match.reason);
-  const restoredUiState = stripBackupRestoreStatus(backup.uiState);
-  setWidgetValue(widgets.stateWidget, serializeState(backup.state));
-  setWidgetValue(widgets.uiStateWidget, serializeUiState(restoredUiState));
-  setWidgetValue(widgets.characterWidget, selection.characterId);
-  setWidgetValue(widgets.promptWidget, selection.promptId);
-  node.properties = node.properties || {};
-  if (backup.backupNodeUid) node.properties[BACKUP_NODE_UID_PROPERTY] = backup.backupNodeUid;
-  node.properties.dora_state_manager = {
-    state: normalizeState(backup.state),
-    selected_character_id: selection.characterId,
-    selected_prompt_id: selection.promptId,
-    backup_node_uid: nodeBackupUid(node, { create: true }),
-  };
-  setBackupWarning(node, status);
-  cacheRenderableState(node, backup.state, restoredUiState);
-  writeStateBackup(node, backup.state, restoredUiState, widgets);
-  markNodeDirty(node);
-  return { restored: true, preserveBackupWarning: true };
-}
-
-function buildStateExportPayload(node, state, uiState, characterId, promptId) {
-  const normalizedState = normalizeState(state);
-  const normalizedUiState = stripBackupRestoreStatus(uiState || defaultUiState());
-  const selection = selectionIdsForState(normalizedState, characterId, promptId);
-  return {
-    version: 2,
-    kind: BACKUP_EXPORT_KIND,
-    exported_at: new Date().toISOString(),
-    workflow_id: workflowBackupId(node, { create: true }),
-    node_id: nodeBackupId(node),
-    node_key: stateBackupNodeKey(node, { createNodeUid: true }),
-    backup_node_uid: nodeBackupUid(node, { create: true }),
-    node: nodeBackupSignature(node),
-    state: normalizedState,
-    ui_state: normalizedUiState,
-    selected_character_id: selection.characterId,
-    selected_prompt_id: selection.promptId,
-  };
 }
 
 function downloadJsonFile(filename, payload) {
@@ -1056,36 +965,35 @@ function downloadJsonFile(filename, payload) {
   }
 }
 
-function exportStateJson(node, state, uiState, characterId, promptId) {
-  const payload = buildStateExportPayload(node, state, uiState, characterId, promptId);
-  const timestamp = payload.exported_at.replace(/[:.]/g, "-");
-  downloadJsonFile(`dora-state-manager-node-${nodeBackupId(node)}-${timestamp}.json`, payload);
+async function exportCharacterJson(characterId) {
+  const payload = await stateLibraryRequest(`/characters/${encodeURIComponent(characterId)}/export`);
+  downloadJsonFile(`dora-state-manager-character-${characterId}.json`, payload);
 }
 
-function parseImportedStateJson(text) {
-  const parsed = JSON.parse(String(text ?? ""));
-  const stateRaw = parsed.state ?? parsed.state_json ?? parsed.stateJson ?? (Array.isArray(parsed.characters) ? parsed : null);
-  if (stateRaw == null) throw new Error("JSON does not contain a State Manager state.");
-  const state = normalizeState(stateRaw);
-  if (isDefaultStateValue(state) && !isDefaultStateValue(stateRaw)) throw new Error("Imported state normalized to the default state.");
-  const uiState = stripBackupRestoreStatus(parsed.ui_state ?? parsed.uiState ?? parsed.ui_state_json ?? parsed.uiStateJson ?? defaultUiState());
-  const selection = selectionIdsForState(
-    state,
-    String(parsed.selected_character_id ?? parsed.selectedCharacterId ?? ""),
-    String(parsed.selected_prompt_id ?? parsed.selectedPromptId ?? "")
-  );
-  return { state, uiState, ...selection };
+async function exportLibraryJson() {
+  const payload = await stateLibraryRequest("/export");
+  downloadJsonFile("dora-state-manager-library.json", payload);
 }
 
-async function importStateJsonFile(node, file, currentUiState = defaultUiState()) {
+async function importStateJsonFile(node, file) {
   if (!file) return;
   const text = await file.text();
-  const imported = parseImportedStateJson(text);
-  updateState(node, imported.state, { ...currentUiState, ...imported.uiState }, {
-    characterId: imported.characterId,
-    promptId: imported.promptId,
-    status: `Imported State Manager JSON from ${file.name || "file"}.`,
+  const parsed = JSON.parse(String(text || ""));
+  const result = await stateLibraryRequest("/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(parsed),
   });
+  installLibrarySnapshot(result.snapshot);
+  refreshAllNodesFromLibrary();
+  const characterId = result.character?.id || result.character_ids?.[0] || "";
+  if (characterId) {
+    const character = stateLibraryClient.state.characters.find((item) => item.id === characterId);
+    const widgets = getWidgets(node);
+    setWidgetValue(widgets.characterWidget, characterId);
+    setWidgetValue(widgets.promptWidget, character?.prompts?.[0]?.id || "");
+  }
+  refreshNodeFromLibrary(node, { status: `Imported ${file.name || "State Manager JSON"}.` });
 }
 
 function getWidgets(node) {
@@ -1121,8 +1029,14 @@ function hideWidget(widget) {
 }
 
 function getCurrentState(node) {
+  if (node?.__dsm?.state && node?.__dsm?.uiState) {
+    return { state: node.__dsm.state, uiState: node.__dsm.uiState };
+  }
   const widgets = getWidgets(node);
-  const state = normalizeState(widgetValue(widgets.stateWidget, serializeState(defaultState())));
+  const state = stateViewForSelection(
+    String(widgetValue(widgets.characterWidget, "") || ""),
+    String(widgetValue(widgets.promptWidget, "") || ""),
+  );
   const uiState = normalizeUiState(widgetValue(widgets.uiStateWidget, serializeUiState(defaultUiState())));
   return { state, uiState };
 }
@@ -1184,28 +1098,29 @@ function markDownstreamDirty(node) {
 
 function updateState(node, state, uiState, opts = {}) {
   const widgets = getWidgets(node);
-  const normalizedState = normalizeState(state);
+  const currentCharacterId = opts.characterId ?? String(widgetValue(widgets.characterWidget, "") || "");
+  const currentPromptId = opts.promptId ?? String(widgetValue(widgets.promptWidget, "") || "");
+  const materialized = materializeEditedDefault(state, currentCharacterId, currentPromptId);
+  const normalizedState = materialized.state;
   const normalizedUiState = stripBackupRestoreStatus(uiState || defaultUiState());
-  const warningCleared = opts.preserveBackupWarning ? false : clearBackupWarning(node);
+  const nextUiState = normalizeUiState({
+    ...normalizedUiState,
+    status: opts.status ?? normalizedUiState.status,
+  });
+  setWidgetValue(widgets.characterWidget, materialized.characterId || "default_character");
+  setWidgetValue(widgets.promptWidget, materialized.promptId || "default_prompt");
   const { character, prompt } = ensureSelection(node, normalizedState);
-  setWidgetValue(widgets.stateWidget, serializeState(normalizedState));
-  setWidgetValue(widgets.uiStateWidget, serializeUiState({ ...normalizedUiState, status: opts.status ?? normalizedUiState.status }));
-  setWidgetValue(widgets.characterWidget, opts.characterId ?? character.id);
-  setWidgetValue(widgets.promptWidget, opts.promptId ?? prompt.id);
+  setWidgetValue(widgets.stateWidget, serializeBinding());
+  setWidgetValue(widgets.uiStateWidget, serializeWorkflowUiState(nextUiState));
+  setWidgetValue(widgets.characterWidget, materialized.characterId || character.id);
+  setWidgetValue(widgets.promptWidget, materialized.promptId || prompt.id);
   node.properties = node.properties || {};
-  const backupUid = nodeBackupUid(node, { create: !isDefaultStateValue(normalizedState) });
-  if (backupUid) node.properties[BACKUP_NODE_UID_PROPERTY] = backupUid;
-  node.properties.dora_state_manager = {
-    state: normalizedState,
-    selected_character_id: widgetValue(widgets.characterWidget, ""),
-    selected_prompt_id: widgetValue(widgets.promptWidget, ""),
-    backup_node_uid: backupUid,
-  };
-  const cachedUiState = normalizeUiState(widgetValue(widgets.uiStateWidget, ""));
-  cacheRenderableState(node, normalizedState, cachedUiState);
-  writeStateBackup(node, normalizedState, cachedUiState, widgets);
+  delete node.properties.dora_state_manager;
+  delete node.properties.dora_state_manager_backup_node_uid;
+  cacheRenderableState(node, normalizedState, nextUiState);
+  if (opts.persist !== false) scheduleLibraryPersist(node, normalizedState);
   if (opts.dirty !== false) markNodeDirty(node);
-  if (opts.render !== false || warningCleared) scheduleRender(node);
+  if (opts.render !== false) scheduleRender(node);
 }
 
 function cacheRenderableState(node, state, uiState) {
@@ -1418,13 +1333,6 @@ function extractLoraStackFromNode(sourceNode, fallbackIndex = 0) {
   if (sourceNode.properties?.dora_power_lora) return normalizeDoraLoaderState(sourceNode.properties.dora_power_lora, sourceNode, fallbackIndex);
   if (sourceNode._doraRows || sourceNode._doraGlobals) {
     return normalizeDoraLoaderState({ rows: sourceNode._doraRows || [], globals: sourceNode._doraGlobals || {} }, sourceNode, fallbackIndex);
-  }
-  if (sourceNode.properties?.dora_state_manager?.state) {
-    const state = normalizeState(sourceNode.properties.dora_state_manager.state);
-    const charId = sourceNode.properties.dora_state_manager.selected_character_id;
-    const character = selectedCharacter(state, charId);
-    const stack = findCharacterLoaderStack(character, getDoraLoaderSlot(sourceNode, fallbackIndex));
-    return stack ? structuredCloneCompat(stack) : null;
   }
   return null;
 }
@@ -2470,7 +2378,7 @@ function renderHeader(node, state, uiState, character, prompt) {
     const file = importInput.files?.[0];
     if (!file) return;
     try {
-      await importStateJsonFile(node, file, uiState);
+      await importStateJsonFile(node, file);
     } catch (err) {
       setStatus(node, `Import failed: ${err?.message || err}`);
     } finally {
@@ -2518,25 +2426,36 @@ function renderHeader(node, state, uiState, character, prompt) {
         status: changes.length ? `Applied ${changes.join(", ")} to selected nodes.` : "Selected nodes did not match this state.",
       });
     }, "Apply the current character/preset to selected graph nodes"),
-    makeButton("Export", () => {
-      exportStateJson(node, state, uiState, character.id, prompt.id);
-      setStatus(node, "Exported State Manager JSON.");
-    }, "Download the complete State Manager data as JSON"),
-    makeButton("Import", () => importInput.click(), "Import a State Manager JSON backup")
+    makeButton("Export character", async () => {
+      try {
+        if (character.id === "default_character" || character.__dsm_ephemeral) {
+          throw new Error("The built-in or missing placeholder is not a persistent character.");
+        }
+        await exportCharacterJson(character.id);
+        setStatus(node, "Exported the selected character.");
+      } catch (err) {
+        setStatus(node, `Character export failed: ${err?.message || err}`);
+      }
+    }, "Download only the selected character and its prompts"),
+    makeButton("Export library", async () => {
+      try {
+        await exportLibraryJson();
+        setStatus(node, "Exported the complete State Manager library.");
+      } catch (err) {
+        setStatus(node, `Library export failed: ${err?.message || err}`);
+      }
+    }, "Download the complete persistent State Manager library"),
+    makeButton("Import", () => importInput.click(), "Import a character or State Manager library JSON"),
+    makeButton("Reload library", async () => {
+      try {
+        await reloadStateLibrary(node);
+      } catch (err) {
+        setStatus(node, `Library reload failed: ${err?.message || err}`);
+      }
+    }, "Discard unsaved stale edits and reload persistent storage")
   );
 
   section.append(toolbar, importInput);
-  if (node.__dsmBackupWarning) {
-    const warning = document.createElement("div");
-    warning.className = "dsm-warning";
-    const warningText = document.createElement("span");
-    warningText.textContent = node.__dsmBackupWarning;
-    warning.append(warningText, makeButton("Dismiss", () => {
-      clearBackupWarning(node);
-      scheduleRender(node);
-    }));
-    section.appendChild(warning);
-  }
   return section;
 }
 
@@ -3383,8 +3302,7 @@ function renderSettingsPanelContent(section, node, state, uiState, character, pr
 }
 
 function libraryRenderKey(node, state, uiState, mode) {
-  const rawState = widgetValue(getWidgets(node).stateWidget, "");
-  const stateKey = typeof rawState === "string" && rawState ? rawState : serializeState(state);
+  const stateKey = canonicalJson(state);
   return [
     mode,
     stateKey,
@@ -3652,17 +3570,43 @@ function initializeNode(node, widget) {
   node.min_size = [MIN_NODE_WIDTH, MIN_NODE_HEIGHT];
   node.setSize?.([Math.max(oldSize[0], MIN_NODE_WIDTH), Math.max(oldSize[1], MIN_NODE_HEIGHT)]);
 
-  const restoreResult = tryRestoreStateBackup(node);
-  const snapshot = getCurrentState(node);
-  const { character, prompt } = ensureSelection(node, snapshot.state);
-  updateState(node, snapshot.state, snapshot.uiState, { characterId: character.id, promptId: prompt.id, dirty: false, render: false, preserveBackupWarning: restoreResult.preserveBackupWarning });
+  stateLibraryClient.nodes.add(node);
+  const load = async () => {
+    const token = (node.__dsmLibraryLoadToken || 0) + 1;
+    node.__dsmLibraryLoadToken = token;
+    const currentWidgets = getWidgets(node);
+    const embeddedLegacy = parseLegacyEmbeddedState(widgetValue(currentWidgets.stateWidget, ""));
+    if (embeddedLegacy && !isDefaultStateValue(embeddedLegacy)) {
+      node.__dsmPendingLegacyState = structuredCloneCompat(embeddedLegacy);
+    }
+    const legacy = node.__dsmPendingLegacyState || embeddedLegacy;
+    // Keep queued prompt generation free of the embedded payload. Until the
+    // migration succeeds, onSerialize writes the stashed legacy state back to
+    // workflow JSON so a transient server failure cannot destroy it.
+    setWidgetValue(currentWidgets.stateWidget, serializeBinding());
+    node.properties = node.properties || {};
+    delete node.properties.dora_state_manager;
+    delete node.properties.dora_state_manager_backup_node_uid;
+    const characterId = String(widgetValue(currentWidgets.characterWidget, "") || "");
+    const promptId = String(widgetValue(currentWidgets.promptWidget, "") || "");
+    try {
+      const loaded = await initializeStateLibrary(node, legacy, characterId, promptId, token);
+      if (loaded) delete node.__dsmPendingLegacyState;
+    } catch (err) {
+      if (node.__dsmLibraryLoadToken !== token) return;
+      const fallback = stateViewForSelection(characterId, promptId);
+      const uiState = normalizeUiState(widgetValue(currentWidgets.uiStateWidget, serializeUiState(defaultUiState())));
+      cacheRenderableState(node, fallback, {
+        ...uiState,
+        status: `State Manager library load failed: ${err?.message || err}`,
+      });
+      scheduleRender(node);
+    }
+  };
+  void load();
 
   chainNodeCallback(node, "onConfigure", function () {
-    const restoreOnConfigureResult = tryRestoreStateBackup(node);
-    const next = getCurrentState(node);
-    const selection = ensureSelection(node, next.state);
-    updateState(node, next.state, next.uiState, { characterId: selection.character.id, promptId: selection.prompt.id, dirty: false, render: false, preserveBackupWarning: restoreOnConfigureResult.preserveBackupWarning });
-    scheduleRender(node);
+    void Promise.resolve().then(load);
   });
 
   chainNodeCallback(node, "onResize", function () {
@@ -3671,6 +3615,7 @@ function initializeNode(node, widget) {
   });
 
   chainNodeCallback(node, "onRemoved", function () {
+    stateLibraryClient.nodes.delete(node);
     const ctx = node.__dsm;
     if (!ctx?.renderFrame) return;
     cancelAnimationFrame(ctx.renderFrame);
@@ -3764,7 +3709,7 @@ function setQueuedInput(promptPayload, node, inputName, value, { addIfMissing = 
 }
 
 function setQueuedWidgetInput(promptPayload, node, widgetName, value) {
-  return setQueuedInput(promptPayload, node, widgetName, value, { addIfMissing: false, syncWidget: true });
+  return setQueuedInput(promptPayload, node, widgetName, value, { addIfMissing: false, syncWidget: false });
 }
 
 function readQueuedInput(promptPayload, node, inputName) {
@@ -3792,12 +3737,13 @@ function firstControlledStateSeed(managerNode, promptPayload) {
   return null;
 }
 
-function serializeQueuedUiStateOverride(uiState, payload, queueIndex, total) {
+function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, queueIndex, total) {
   return JSON.stringify({
-    ...stripBackupRestoreStatus(uiState || defaultUiState()),
-    __dsm_queued_runtime_state: structuredCloneCompat(payload),
-    __dsm_queued_runtime_character_id: String(payload?.character?.id ?? ""),
-    __dsm_queued_runtime_prompt_id: String(payload?.prompt?.id ?? ""),
+    ...safeJsonParse(serializeWorkflowUiState(uiState), {}),
+    __dsm_library_user_id: stateLibraryClient.userId,
+    ...(runtimeSeed == null ? {} : { __dsm_runtime_seed: runtimeSeed }),
+    __dsm_queued_runtime_character_id: String(characterId ?? ""),
+    __dsm_queued_runtime_prompt_id: String(promptId ?? ""),
     __dsm_queued_runtime_queue_index: Math.max(0, Number(queueIndex) || 0),
     __dsm_queued_runtime_queue_total: Math.max(1, Number(total) || 1),
     // The runtime override must differ per queued prompt even if the same prompt
@@ -3807,20 +3753,20 @@ function serializeQueuedUiStateOverride(uiState, payload, queueIndex, total) {
   }, null, 0);
 }
 
-function setQueuedStateManagerRuntimeState(promptPayload, node, uiState, payload, queueIndex, total) {
+function setQueuedStateManagerRuntimeState(promptPayload, node, uiState, characterId, promptId, runtimeSeed, queueIndex, total) {
   return setQueuedInput(
     promptPayload,
     node,
     UI_STATE_WIDGET,
-    serializeQueuedUiStateOverride(uiState, payload, queueIndex, total),
-    { addIfMissing: true, syncWidget: true }
+    serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, queueIndex, total),
+    { addIfMissing: true, syncWidget: false }
   );
 }
 
 function setQueuedStateManagerSelection(promptPayload, node, characterId, promptId) {
   let changed = 0;
-  changed += setQueuedInput(promptPayload, node, SELECTED_CHARACTER_WIDGET, characterId, { addIfMissing: false, syncWidget: true });
-  changed += setQueuedInput(promptPayload, node, SELECTED_PROMPT_WIDGET, promptId, { addIfMissing: false, syncWidget: true });
+  changed += setQueuedInput(promptPayload, node, SELECTED_CHARACTER_WIDGET, characterId, { addIfMissing: false, syncWidget: false });
+  changed += setQueuedInput(promptPayload, node, SELECTED_PROMPT_WIDGET, promptId, { addIfMissing: false, syncWidget: false });
   return changed;
 }
 
@@ -4034,10 +3980,10 @@ function mutateQueuedLegacyTextTargets(promptPayload, managerNode, prompt) {
   for (const group of legacyTargets) {
     for (const target of group.targets) {
       const inputName = target.inputName || (group.role === "negative" ? "negative" : "text");
-      changed += setQueuedInput(promptPayload, target.node, inputName, String(group.text ?? ""), { addIfMissing: true, syncWidget: true });
+      changed += setQueuedInput(promptPayload, target.node, inputName, String(group.text ?? ""), { addIfMissing: true, syncWidget: false });
       if (isImpactWildcardNode(target.node)) {
-        changed += setQueuedInput(promptPayload, target.node, "wildcard_text", String(group.text ?? ""), { addIfMissing: true, syncWidget: true });
-        changed += setQueuedInput(promptPayload, target.node, "populated_text", String(group.text ?? ""), { addIfMissing: true, syncWidget: true });
+        changed += setQueuedInput(promptPayload, target.node, "wildcard_text", String(group.text ?? ""), { addIfMissing: true, syncWidget: false });
+        changed += setQueuedInput(promptPayload, target.node, "populated_text", String(group.text ?? ""), { addIfMissing: true, syncWidget: false });
       }
     }
   }
@@ -4060,7 +4006,7 @@ function mutateQueuedSettingsNodes(promptPayload, managerNode, settingsSource) {
     if (snapshot?.widgets) {
       for (const [name, value] of Object.entries(snapshot.widgets)) {
         if (preserveLiveStateSeed && String(name) === "seed") continue;
-        changed += setQueuedInput(promptPayload, node, String(name), value, { addIfMissing: false, syncWidget: true });
+        changed += setQueuedInput(promptPayload, node, String(name), value, { addIfMissing: false, syncWidget: false });
       }
     }
     if (isSeedNode(node) && !preserveLiveStateSeed) {
@@ -4068,7 +4014,7 @@ function mutateQueuedSettingsNodes(promptPayload, managerNode, settingsSource) {
       if (seed != null) {
         for (const name of ["seed", "noise_seed", "value"]) {
           const before = changed;
-          changed += setQueuedInput(promptPayload, node, name, seed, { addIfMissing: false, syncWidget: true });
+          changed += setQueuedInput(promptPayload, node, name, seed, { addIfMissing: false, syncWidget: false });
           if (changed !== before) break;
         }
       }
@@ -4091,14 +4037,26 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
     const { character, prompt } = selectQueuedCharacterAndPrompt(node, state, uiState, currentCharacterId, currentPromptId, queueIndex, total);
     if (!character || !prompt) continue;
     let payload = buildQueuedDoraStatePayload(character, prompt);
+    let runtimeSeed = null;
     const liveStateSeed = firstControlledStateSeed(node, promptPayload);
     if (liveStateSeed) {
-      payload = withRuntimeSeed(payload, liveStateSeed.seed);
+      runtimeSeed = liveStateSeed.seed;
+      payload = withRuntimeSeed(payload, runtimeSeed);
     } else if (uiState.queue_randomize_saved_seed) {
-      payload = withRuntimeSeed(payload, generateStateManagerRuntimeSeed());
+      runtimeSeed = generateStateManagerRuntimeSeed();
+      payload = withRuntimeSeed(payload, runtimeSeed);
     }
     changed += setQueuedStateManagerSelection(promptPayload, node, character.id, prompt.id);
-    changed += setQueuedStateManagerRuntimeState(promptPayload, node, uiState, payload, queueIndex, total);
+    changed += setQueuedStateManagerRuntimeState(
+      promptPayload,
+      node,
+      uiState,
+      character.id,
+      prompt.id,
+      runtimeSeed,
+      queueIndex,
+      total,
+    );
     changed += mutateQueuedDoraLoaders(promptPayload, node, character);
     changed += mutateQueuedStateTextBoxes(promptPayload, node, prompt);
     changed += mutateQueuedLegacyTextTargets(promptPayload, node, prompt);
@@ -4425,16 +4383,34 @@ app.registerExtension({
     nodeType.prototype.onSerialize = function (o) {
       const result = originalOnSerialize?.apply(this, arguments);
       try {
+        const widgets = getWidgets(this);
         const snapshot = getCurrentState(this);
-        const selection = ensureSelection(this, snapshot.state);
-        updateState(this, snapshot.state, snapshot.uiState, {
-          characterId: selection.character.id,
-          promptId: selection.prompt.id,
-          dirty: false,
-          render: false,
-        });
+        const binding = serializeBinding();
+        const serializedState = this.__dsmPendingLegacyState
+          ? serializeState(this.__dsmPendingLegacyState)
+          : binding;
+        const workflowUiState = serializeWorkflowUiState(snapshot.uiState);
+        setWidgetValue(widgets.stateWidget, binding);
         o.properties = o.properties || {};
-        o.properties.dora_state_manager = this.properties?.dora_state_manager;
+        delete o.properties.dora_state_manager;
+        delete o.properties.dora_state_manager_backup_node_uid;
+        if (this.properties) {
+          delete this.properties.dora_state_manager;
+          delete this.properties.dora_state_manager_backup_node_uid;
+        }
+        if (app?.graph?.extra) delete app.graph.extra.dora_state_manager_backup_workflow_id;
+        const values = Array.isArray(o.widgets_values) ? o.widgets_values : null;
+        const named = o.widgets_values_named && typeof o.widgets_values_named === "object"
+          ? o.widgets_values_named
+          : null;
+        for (const [widget, value] of [
+          [widgets.stateWidget, serializedState],
+          [widgets.uiStateWidget, workflowUiState],
+        ]) {
+          const index = (this.widgets || []).indexOf(widget);
+          if (values && index >= 0) values[index] = value;
+          if (named && widget?.name) named[widget.name] = value;
+        }
       } catch (err) {
         console.warn(`[${EXT_NAME}] serialize sync failed`, err);
       }

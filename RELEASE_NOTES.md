@@ -1,3 +1,27 @@
+# DoRA Dynamic LoRA Loader v1.0.41
+
+This release moves State Manager presets into a backend-authoritative per-user library and adds mathematically equivalent runtime bypass support for plain LoKr adapters on compatible ComfyUI revisions.
+
+## Plain LoKr runtime bypass
+
+- Adds runtime bypass support for plain direct-factor, decomposed, and mixed LoRA + LoKr adapter stacks when ComfyUI provides native LoKr bypass math.
+- Preserves current ComfyUI materialized LoKr semantics across direct-factor alpha values and unequal decomposed ranks through runtime-only adapter copies.
+- Keeps source adapters unchanged and continues to reject DoRA-LoKr, sliced/offset/transformed targets, reshape LoRA, and unsupported adapter forms.
+- Rejects LoKr runtime mode explicitly on older ComfyUI revisions whose `LoKrAdapter` lacks forward-bypass math.
+- Defers deterministic runtime validation failures across the base loader's retry boundary and commits captured adapters transactionally, preventing partial or duplicate hooks after a failed materialized-patch attempt.
+- Adds parity, mixed-stack, rejection, retry, rollback, and hook-restoration coverage against a pinned current ComfyUI revision.
+
+## State Manager persistent library architecture
+
+- Moves reusable characters, prompt presets, LoRA stacks, settings, thumbnails, reference metadata, and filename prefixes into a backend-authoritative library under the ComfyUI user directory.
+- Limits workflow serialization to UUID bindings and workflow-specific queue configuration.
+- Removes workflow/node-keyed `localStorage` library backups and their automatic restore path. This is a breaking change for presets that exist only in a browser backup: before updating, open the workflow with v1.0.40, let the backup restore, then save/export it. After updating, the old browser entry remains untouched and can still be recovered by temporarily returning to v1.0.40 and exporting the restored state.
+- Adds atomic, revisioned storage with UUID validation, locking, corruption quarantine, explicit missing-preset errors, and stale-write rejection.
+- Adds idempotent migration for legacy embedded schema-v3 libraries plus explicit character/library import and export.
+- Keeps runtime outputs, connected save/load/apply, text boxes, seeds, multiple loaders, queue wildcarding, and the legacy node alias compatible.
+- Keeps queue-time library values transient and out of the queued workflow copy.
+- Scopes backend libraries to the active ComfyUI user, including multi-user installations.
+
 # DoRA Dynamic LoRA Loader v1.0.40
 
 This release fixes DoRA Power LoRA Loader settings appearing to reset when switching away from a ComfyUI workflow tab and returning to it on newer store-backed ComfyUI frontends.
