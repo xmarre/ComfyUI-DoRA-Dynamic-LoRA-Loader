@@ -10,7 +10,7 @@ async function loadStateManagerHelpers() {
     .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
     .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi() { throw new Error('not used'); }, apiURL(value) { return value; } };")
     .replace('import "../../scripts/domWidget.js";', "");
-  source += `\nexport { capturedExtension, defaultBinding, defaultState, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection };\n`;
+  source += `\nexport { capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection };\n`;
   const encoded = Buffer.from(source, "utf8").toString("base64");
   return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
 }
@@ -150,6 +150,59 @@ test("new and duplicated presets receive collision-resistant UUID bindings", asy
   const ids = new Set(Array.from({ length: 100 }, () => helpers.makeId("prompt")));
   assert.equal(ids.size, 100);
   for (const id of ids) assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+});
+
+
+test("deleting the sole preset removes its character from persistent storage", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const state = {
+    version: 3,
+    characters: [privateCharacter("character-a", "A", "A0")],
+  };
+  const result = helpers.deletePromptPreset(state, "character-a", "character-a-prompt");
+  assert.equal(result.deleted, true);
+  assert.equal(result.removedCharacter, true);
+  assert.equal(result.characterId, "default_character");
+  assert.equal(result.promptId, "default_prompt");
+  assert.deepEqual(helpers.persistentCharacters(result.state), []);
+});
+
+
+test("deleting one of several presets keeps the character and selects its neighbor", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const character = privateCharacter("character-a", "A", "A0");
+  character.prompts.push({
+    ...structuredClone(character.prompts[0]),
+    id: "character-a-prompt-2",
+    name: "Second preset",
+    positive: "A1",
+  });
+  const result = helpers.deletePromptPreset(
+    { version: 3, characters: [character] },
+    "character-a",
+    "character-a-prompt",
+  );
+  assert.equal(result.deleted, true);
+  assert.equal(result.removedCharacter, false);
+  assert.equal(result.characterId, "character-a");
+  assert.equal(result.promptId, "character-a-prompt-2");
+  assert.deepEqual(
+    helpers.persistentCharacters(result.state)[0].prompts.map((prompt) => prompt.id),
+    ["character-a-prompt-2"],
+  );
+});
+
+
+test("deleting the final character leaves an empty persistent library", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const result = helpers.deleteStateCharacter(
+    { version: 3, characters: [privateCharacter("character-a", "A", "A0")] },
+    "character-a",
+  );
+  assert.equal(result.deleted, true);
+  assert.equal(result.characterId, "default_character");
+  assert.equal(result.promptId, "default_prompt");
+  assert.deepEqual(helpers.persistentCharacters(result.state), []);
 });
 
 
