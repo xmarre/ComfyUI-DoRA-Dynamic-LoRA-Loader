@@ -206,6 +206,22 @@ test("deleting the final character leaves an empty persistent library", async ()
 });
 
 
+test("deleting an ephemeral stale preset repairs selection without reporting a stored deletion", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const character = privateCharacter("character-a", "A", "A0");
+  helpers.stateLibraryClient.state = { version: 2, characters: [character] };
+  const state = helpers.stateViewForSelection("character-a", "deleted-prompt");
+  const result = helpers.deletePromptPreset(state, "character-a", "deleted-prompt");
+  assert.equal(result.deleted, false);
+  assert.equal(result.characterId, "character-a");
+  assert.equal(result.promptId, "character-a-prompt");
+  assert.deepEqual(
+    helpers.persistentCharacters(result.state)[0].prompts.map((prompt) => prompt.id),
+    ["character-a-prompt"],
+  );
+});
+
+
 test("disjoint character edits rebase without losing either manager's change", async () => {
   const helpers = await loadStateManagerHelpers();
   const base = [

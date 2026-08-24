@@ -602,9 +602,11 @@ function updatePromptName(state, characterId, promptId, value) {
 function deleteStateCharacter(state, characterId) {
   const nextState = normalizeState(state);
   const characterIndex = nextState.characters.findIndex((item) => item.id === characterId);
-  if (characterIndex < 0) {
-    const selection = selectionIdsForState(nextState, characterId, "");
-    return { state: nextState, ...selection, deleted: false };
+  const character = nextState.characters[characterIndex];
+  if (!character || character.__dsm_ephemeral) {
+    const durableState = normalizeState({ version: STATE_SCHEMA_VERSION, characters: persistentCharacters(nextState) });
+    const selection = selectionIdsForState(durableState);
+    return { state: durableState, ...selection, deleted: false };
   }
   nextState.characters.splice(characterIndex, 1);
   if (!nextState.characters.length) {
@@ -629,9 +631,11 @@ function deletePromptPreset(state, characterId, promptId) {
   const characterIndex = nextState.characters.findIndex((item) => item.id === characterId);
   const character = nextState.characters[characterIndex];
   const promptIndex = character?.prompts.findIndex((item) => item.id === promptId) ?? -1;
-  if (!character || promptIndex < 0) {
-    const selection = selectionIdsForState(nextState, characterId, promptId);
-    return { state: nextState, ...selection, deleted: false };
+  const prompt = character?.prompts[promptIndex];
+  if (!character || character.__dsm_ephemeral || !prompt || prompt.__dsm_ephemeral) {
+    const durableState = normalizeState({ version: STATE_SCHEMA_VERSION, characters: persistentCharacters(nextState) });
+    const selection = selectionIdsForState(durableState, character?.__dsm_ephemeral ? "" : characterId, "");
+    return { state: durableState, ...selection, deleted: false };
   }
 
   if (character.prompts.length > 1) {
@@ -2610,7 +2614,12 @@ function renderLibrary(node, state, uiState, character, prompt) {
         const current = currentLibrarySelection();
         const result = deletePromptPreset(current.state, current.character.id, current.prompt.id);
         if (!result.deleted) {
-          setStatus(node, "The selected prompt preset is no longer available.");
+          updateState(node, result.state, current.uiState, {
+            characterId: result.characterId,
+            promptId: result.promptId,
+            status: "The selected prompt preset was already unavailable; selected the nearest saved preset.",
+            persist: false,
+          });
           return;
         }
         const status = result.removedCharacter
@@ -2646,7 +2655,12 @@ function renderLibrary(node, state, uiState, character, prompt) {
         const current = currentLibrarySelection();
         const result = deleteStateCharacter(current.state, current.character.id);
         if (!result.deleted) {
-          setStatus(node, "The selected character is no longer available.");
+          updateState(node, result.state, current.uiState, {
+            characterId: result.characterId,
+            promptId: result.promptId,
+            status: "The selected character was already unavailable; selected the nearest saved character.",
+            persist: false,
+          });
           return;
         }
         updateState(node, result.state, current.uiState, { characterId: result.characterId, promptId: result.promptId, status: "Deleted character." });
@@ -2908,7 +2922,12 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
     makeButton("Delete", () => {
       const result = deletePromptPreset(state, character.id, prompt.id);
       if (!result.deleted) {
-        setStatus(node, "The selected prompt preset is no longer available.");
+        updateState(node, result.state, uiState, {
+          characterId: result.characterId,
+          promptId: result.promptId,
+          status: "The selected prompt preset was already unavailable; selected the nearest saved preset.",
+          persist: false,
+        });
         return;
       }
       const status = result.removedCharacter
