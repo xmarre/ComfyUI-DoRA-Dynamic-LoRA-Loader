@@ -206,18 +206,28 @@ test("deleting the final character leaves an empty persistent library", async ()
 });
 
 
-test("deleting an ephemeral stale preset repairs selection without reporting a stored deletion", async () => {
+test("deleting ephemeral stale selections repairs bindings without reporting stored deletions", async () => {
   const helpers = await loadStateManagerHelpers();
   const character = privateCharacter("character-a", "A", "A0");
   helpers.stateLibraryClient.state = { version: 2, characters: [character] };
-  const state = helpers.stateViewForSelection("character-a", "deleted-prompt");
-  const result = helpers.deletePromptPreset(state, "character-a", "deleted-prompt");
-  assert.equal(result.deleted, false);
-  assert.equal(result.characterId, "character-a");
-  assert.equal(result.promptId, "character-a-prompt");
+  const promptState = helpers.stateViewForSelection("character-a", "deleted-prompt");
+  const promptResult = helpers.deletePromptPreset(promptState, "character-a", "deleted-prompt");
+  assert.equal(promptResult.deleted, false);
+  assert.equal(promptResult.characterId, "character-a");
+  assert.equal(promptResult.promptId, "character-a-prompt");
   assert.deepEqual(
-    helpers.persistentCharacters(result.state)[0].prompts.map((prompt) => prompt.id),
+    helpers.persistentCharacters(promptResult.state)[0].prompts.map((prompt) => prompt.id),
     ["character-a-prompt"],
+  );
+
+  const characterState = helpers.stateViewForSelection("deleted-character", "deleted-prompt");
+  const characterResult = helpers.deleteStateCharacter(characterState, "deleted-character");
+  assert.equal(characterResult.deleted, false);
+  assert.equal(characterResult.characterId, "character-a");
+  assert.equal(characterResult.promptId, "character-a-prompt");
+  assert.deepEqual(
+    helpers.persistentCharacters(characterResult.state).map((item) => item.id),
+    ["character-a"],
   );
 });
 
