@@ -599,6 +599,60 @@ function updatePromptName(state, characterId, promptId, value) {
   return nextState;
 }
 
+function deleteStateCharacter(state, characterId) {
+  const nextState = normalizeState(state);
+  const characterIndex = nextState.characters.findIndex((item) => item.id === characterId);
+  const character = nextState.characters[characterIndex];
+  if (!character || character.__dsm_ephemeral) {
+    const durableState = normalizeState({ version: STATE_SCHEMA_VERSION, characters: persistentCharacters(nextState) });
+    const selection = selectionIdsForState(durableState);
+    return { state: durableState, ...selection, deleted: false };
+  }
+  nextState.characters.splice(characterIndex, 1);
+  if (!nextState.characters.length) {
+    return {
+      state: defaultState(),
+      characterId: "default_character",
+      promptId: "default_prompt",
+      deleted: true,
+    };
+  }
+  const nextCharacter = nextState.characters[Math.min(characterIndex, nextState.characters.length - 1)];
+  return {
+    state: nextState,
+    characterId: nextCharacter.id,
+    promptId: nextCharacter.prompts[0].id,
+    deleted: true,
+  };
+}
+
+function deletePromptPreset(state, characterId, promptId) {
+  const nextState = normalizeState(state);
+  const characterIndex = nextState.characters.findIndex((item) => item.id === characterId);
+  const character = nextState.characters[characterIndex];
+  const promptIndex = character?.prompts.findIndex((item) => item.id === promptId) ?? -1;
+  const prompt = character?.prompts[promptIndex];
+  if (!character || character.__dsm_ephemeral || !prompt || prompt.__dsm_ephemeral) {
+    const durableState = normalizeState({ version: STATE_SCHEMA_VERSION, characters: persistentCharacters(nextState) });
+    const selection = selectionIdsForState(durableState, character?.__dsm_ephemeral ? "" : characterId, "");
+    return { state: durableState, ...selection, deleted: false };
+  }
+
+  if (character.prompts.length > 1) {
+    character.prompts.splice(promptIndex, 1);
+    const nextPrompt = character.prompts[Math.min(promptIndex, character.prompts.length - 1)];
+    return {
+      state: nextState,
+      characterId: character.id,
+      promptId: nextPrompt.id,
+      deleted: true,
+      removedCharacter: false,
+    };
+  }
+
+  return { ...deleteStateCharacter(nextState, characterId), removedCharacter: true };
+}
+
 function normalizeIdList(value) {
   if (Array.isArray(value)) return value.map((item) => cleanId(item, "")).filter(Boolean);
   if (typeof value === "string") {
@@ -2558,14 +2612,20 @@ function renderLibrary(node, state, uiState, character, prompt) {
       }),
       makeButton("Delete preset", () => {
         const current = currentLibrarySelection();
-        if (current.character.prompts.length <= 1) {
-          setStatus(node, "At least one prompt preset must remain for this character.");
+        const result = deletePromptPreset(current.state, current.character.id, current.prompt.id);
+        if (!result.deleted) {
+          updateState(node, result.state, current.uiState, {
+            characterId: result.characterId,
+            promptId: result.promptId,
+            status: "The selected prompt preset was already unavailable; selected the nearest saved preset.",
+            persist: false,
+          });
           return;
         }
-        const index = current.character.prompts.findIndex((item) => item.id === current.prompt.id);
-        if (index >= 0) current.character.prompts.splice(index, 1);
-        const next = current.character.prompts[Math.max(0, Math.min(index, current.character.prompts.length - 1))];
-        updateState(node, current.state, current.uiState, { characterId: current.character.id, promptId: next.id, status: "Deleted prompt preset." });
+        const status = result.removedCharacter
+          ? "Deleted prompt preset and its now-empty character."
+          : "Deleted prompt preset.";
+        updateState(node, result.state, current.uiState, { characterId: result.characterId, promptId: result.promptId, status });
       })
     );
   } else {
@@ -2593,14 +2653,17 @@ function renderLibrary(node, state, uiState, character, prompt) {
       }),
       makeButton("Delete character", () => {
         const current = currentLibrarySelection();
-        if (current.state.characters.length <= 1) {
-          setStatus(node, "At least one character must remain.");
+        const result = deleteStateCharacter(current.state, current.character.id);
+        if (!result.deleted) {
+          updateState(node, result.state, current.uiState, {
+            characterId: result.characterId,
+            promptId: result.promptId,
+            status: "The selected character was already unavailable; selected the nearest saved character.",
+            persist: false,
+          });
           return;
         }
-        const index = current.state.characters.findIndex((item) => item.id === current.character.id);
-        if (index >= 0) current.state.characters.splice(index, 1);
-        const next = current.state.characters[Math.max(0, Math.min(index, current.state.characters.length - 1))];
-        updateState(node, current.state, current.uiState, { characterId: next.id, promptId: next.prompts[0]?.id || "", status: "Deleted character." });
+        updateState(node, result.state, current.uiState, { characterId: result.characterId, promptId: result.promptId, status: "Deleted character." });
       })
     );
   }
@@ -2857,14 +2920,20 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
       updateState(node, state, uiState, { characterId: character.id, promptId: copy.id, status: "Duplicated prompt preset." });
     }),
     makeButton("Delete", () => {
-      if (character.prompts.length <= 1) {
-        setStatus(node, "At least one prompt preset must remain.");
+      const result = deletePromptPreset(state, character.id, prompt.id);
+      if (!result.deleted) {
+        updateState(node, result.state, uiState, {
+          characterId: result.characterId,
+          promptId: result.promptId,
+          status: "The selected prompt preset was already unavailable; selected the nearest saved preset.",
+          persist: false,
+        });
         return;
       }
-      const index = character.prompts.findIndex((p) => p.id === prompt.id);
-      if (index >= 0) character.prompts.splice(index, 1);
-      const next = character.prompts[Math.max(0, Math.min(index, character.prompts.length - 1))];
-      updateState(node, state, uiState, { characterId: character.id, promptId: next.id, status: "Deleted prompt preset." });
+      const status = result.removedCharacter
+        ? "Deleted prompt preset and its now-empty character."
+        : "Deleted prompt preset.";
+      updateState(node, result.state, uiState, { characterId: result.characterId, promptId: result.promptId, status });
     })
   );
 
