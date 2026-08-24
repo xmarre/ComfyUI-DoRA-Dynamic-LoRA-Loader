@@ -1,3 +1,16 @@
+# DoRA Dynamic LoRA Loader v1.0.42
+
+This hotfix makes State Manager prompt-preset and character deletion persist correctly when removing the final stored entry.
+
+## State Manager deletion fix
+
+- Removes the selected prompt and selects its adjacent preset when the character has other prompts.
+- Removes a character when its sole prompt is deleted, matching the persisted character schema's requirement that a stored character contain at least one prompt.
+- Allows the final stored character to be deleted and shows the existing non-persistent default placeholder for an empty library.
+- Treats ephemeral missing-selection placeholders as already unavailable, repairs the workflow binding to the nearest durable selection, and sends no storage write for that repair.
+- Uses the same tested deletion helpers from the preset library, prompt editor, and character library controls.
+- Adds regression coverage for multi-preset deletion, sole-preset deletion, final-character deletion, and stale prompt/character placeholders.
+
 # DoRA Dynamic LoRA Loader v1.0.41
 
 This release moves State Manager presets into a backend-authoritative per-user library and adds mathematically equivalent runtime bypass support for plain LoKr adapters on compatible ComfyUI revisions.
