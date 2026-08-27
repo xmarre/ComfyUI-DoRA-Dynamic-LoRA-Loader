@@ -737,6 +737,38 @@ function setButtonCallback(widget, cb) {
   widget.options.callback = cb;
 }
 
+function preserveCustomWidgetPrototypeMethods(widget) {
+  let prototype = Object.getPrototypeOf(widget);
+  while (prototype && prototype !== Object.prototype) {
+    for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(prototype))) {
+      if (
+        name === "constructor" ||
+        Object.prototype.hasOwnProperty.call(widget, name) ||
+        typeof descriptor.value !== "function"
+      ) {
+        continue;
+      }
+      Object.defineProperty(widget, name, {
+        configurable: true,
+        enumerable: false,
+        value: descriptor.value.bind(widget),
+        writable: true,
+      });
+    }
+    prototype = Object.getPrototypeOf(prototype);
+  }
+  return widget;
+}
+
+function addDoraCustomWidget(node, widget) {
+  preserveCustomWidgetPrototypeMethods(widget);
+  if (typeof node.addCustomWidget === "function") {
+    return node.addCustomWidget(widget) || widget;
+  }
+  node.widgets.push(widget);
+  return widget;
+}
+
 function rebuild(node) {
   const st = getState(node);
   const lorasNow = _cachedLoras || ["None"];
@@ -1517,11 +1549,7 @@ function buildUI(node, state, loraValues) {
 
   node._doraRows.forEach((row, i) => {
     const widget = new DoraLoraRowWidget(`LORA_${i + 1}`, node, row);
-    if (typeof node.addCustomWidget === "function") {
-      node.addCustomWidget(widget);
-    } else {
-      node.widgets.push(widget);
-    }
+    addDoraCustomWidget(node, widget);
   });
 
   const wAdd = node.addWidget("button", "add_lora", "Add LoRA");
@@ -1722,12 +1750,10 @@ function buildUI(node, state, loraValues) {
   );
   wAutoStrengthCeiling.label = "Auto-strength ratio ceiling";
 
-  const wAutoStrengthReport = new DoraAutoStrengthReportWidget("auto_strength_visualization", node);
-  if (typeof node.addCustomWidget === "function") {
-    node.addCustomWidget(wAutoStrengthReport);
-  } else {
-    node.widgets.push(wAutoStrengthReport);
-  }
+  const wAutoStrengthReport = addDoraCustomWidget(
+    node,
+    new DoraAutoStrengthReportWidget("auto_strength_visualization", node)
+  );
   wAutoStrengthReport.serialize = false;
 
   const size = node.computeSize();
