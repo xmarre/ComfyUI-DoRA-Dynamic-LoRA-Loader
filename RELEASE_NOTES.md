@@ -1,3 +1,13 @@
+# DoRA Dynamic LoRA Loader v1.0.43
+
+This hotfix restores the loaded LoRA row controls on current ComfyUI frontend master while preserving compatibility with older frontends.
+
+## Custom-widget rendering compatibility
+
+- Preserves the DoRA row and auto-strength report widgets' drawing, sizing, pointer, picker, editing, and serialization hooks when the frontend normalizes custom widgets into its store-backed legacy adapter.
+- Keeps the existing class instances and state model on classic and older frontends.
+- Adds a regression harness that reproduces the current frontend's prototype-replacement behavior and verifies that loaded LoRA names and strengths still render and remain interactive.
+
 # DoRA Dynamic LoRA Loader v1.0.42
 
 This hotfix makes State Manager prompt-preset and character deletion persist correctly when removing the final stored entry.
