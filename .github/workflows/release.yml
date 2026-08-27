@@ -71,6 +71,40 @@ jobs:
             printf '%s\n' "${listing}" | grep -Fx "${prefix}/${required}"
           done
 
+      - name: Extract current release notes
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          tag = os.environ["TAG"]
+          source = pathlib.Path("RELEASE_NOTES.md").read_text(encoding="utf-8")
+          heading_re = re.compile(
+              r"(?m)^# DoRA Dynamic LoRA Loader (v[0-9][0-9A-Za-z.-]*)[ \t]*$"
+          )
+          headings = list(heading_re.finditer(source))
+
+          if not headings:
+              raise SystemExit("RELEASE_NOTES.md contains no version release heading")
+          if headings[0].group(1) != tag:
+              raise SystemExit(
+                  f"RELEASE_NOTES.md must start with the current release {tag}; "
+                  f"found {headings[0].group(1)}"
+              )
+          if sum(match.group(1) == tag for match in headings) != 1:
+              raise SystemExit(f"RELEASE_NOTES.md must contain exactly one heading for {tag}")
+
+          end = headings[1].start() if len(headings) > 1 else len(source)
+          notes = source[headings[0].start():end].rstrip() + "\n"
+          output = pathlib.Path("dist/RELEASE_NOTES_CURRENT.md")
+          output.write_text(notes, encoding="utf-8")
+          print(f"Extracted {tag} release notes to {output}")
+          PY
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -92,4 +126,4 @@ jobs:
             dist/SHA256SUMS \
             --target "${RELEASE_SHA}" \
             --title "DoRA Dynamic LoRA Loader ${TAG}" \
-            --notes-file RELEASE_NOTES.md
+            --notes-file dist/RELEASE_NOTES_CURRENT.md
