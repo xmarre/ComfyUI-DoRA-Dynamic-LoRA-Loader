@@ -1,0 +1,78 @@
+name: repair release notes
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/repair-release-notes.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trim cumulative historical release bodies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          release_json = subprocess.check_output(
+              ["gh", "api", f"repos/{repo}/releases?per_page=100"],
+              text=True,
+          )
+          releases = json.loads(release_json)
+          heading_re = re.compile(
+              r"(?m)^# DoRA Dynamic LoRA Loader (v[0-9][0-9A-Za-z.-]*)[ \t]*$"
+          )
+
+          repaired = []
+          for release in releases:
+              body = release.get("body") or ""
+              headings = list(heading_re.finditer(body))
+              if len(headings) <= 1:
+                  continue
+              tag = release["tag_name"]
+              if headings[0].group(1) != tag:
+                  raise SystemExit(
+                      f"Refusing to rewrite {tag}: first release heading is "
+                      f"{headings[0].group(1)}"
+                  )
+              cleaned = body[:headings[1].start()].rstrip() + "\n"
+              subprocess.run(
+                  [
+                      "gh",
+                      "api",
+                      "--method",
+                      "PATCH",
+                      f"repos/{repo}/releases/{release['id']}",
+                      "-f",
+                      f"body={cleaned}",
+                  ],
+                  check=True,
+                  stdout=subprocess.DEVNULL,
+              )
+              repaired.append(tag)
+
+          verify_json = subprocess.check_output(
+              ["gh", "api", f"repos/{repo}/releases?per_page=100"],
+              text=True,
+          )
+          for release in json.loads(verify_json):
+              headings = list(heading_re.finditer(release.get("body") or ""))
+              if len(headings) > 1:
+                  raise SystemExit(
+                      f"{release['tag_name']} still contains multiple version sections"
+                  )
+
+          print("Repaired releases: " + (", ".join(repaired) if repaired else "none"))
+          PY
