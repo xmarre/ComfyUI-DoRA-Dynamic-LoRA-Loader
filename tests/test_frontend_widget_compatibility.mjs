@@ -133,7 +133,7 @@ function makeNodeType() {
   return FakeNode;
 }
 
-test("current frontend prototype normalization preserves DoRA custom widget behavior", async () => {
+test("frontend normalization and rebuilds preserve live DoRA custom widget behavior", async () => {
   const { cleanup, extension } = await loadLoaderExtension();
   try {
     const NodeType = makeNodeType();
@@ -144,6 +144,22 @@ test("current frontend prototype normalization preserves DoRA custom widget beha
 
     const node = new NodeType();
     node.onNodeCreated();
+
+    // Current Vue legacy-widget rendering binds the live widget instance on
+    // mount and keeps that object while the WidgetId/type render key is stable.
+    // Capture the first-build instances before fetchLoras() completes so the
+    // test detects a same-name replacement during the async refresh.
+    const initiallyBoundRowWidget = node.widgets.find((widget) => widget.name === "LORA_1");
+    const initiallyBoundReportWidget = node.widgets.find(
+      (widget) => widget.name === "auto_strength_visualization"
+    );
+    assert.ok(initiallyBoundRowWidget, "initial LoRA row widget should be registered");
+    assert.ok(initiallyBoundReportWidget, "initial auto-strength report should be registered");
+    let reboundDraws = 0;
+    initiallyBoundRowWidget.triggerDraw = () => {
+      reboundDraws += 1;
+    };
+
     await new Promise((resolve) => setImmediate(resolve));
 
     const rowWidget = node.widgets.find((widget) => widget.name === "LORA_1");
@@ -152,6 +168,17 @@ test("current frontend prototype normalization preserves DoRA custom widget beha
     );
 
     assert.ok(rowWidget, "LoRA row widget should be registered");
+    assert.strictEqual(
+      rowWidget,
+      initiallyBoundRowWidget,
+      "async LoRA refresh must preserve the live row widget object"
+    );
+    assert.strictEqual(
+      reportWidget,
+      initiallyBoundReportWidget,
+      "async LoRA refresh must preserve the live report widget object"
+    );
+    assert.ok(reboundDraws >= 1, "async rebuild should redraw the reused Vue-bound row");
     assert.equal(Object.getPrototypeOf(rowWidget), Object.prototype);
     assert.equal(rowWidget.computeSize(360)[1], 24);
     assert.equal(typeof rowWidget.draw, "function");
@@ -169,6 +196,31 @@ test("current frontend prototype normalization preserves DoRA custom widget beha
     rowWidget.draw(context, node, 360, 0, 24);
     assert.ok(context.labels.includes("loaded.safetensors"));
     assert.ok(context.labels.includes("0.85"));
+
+    const pointerDown = {
+      button: 0,
+      preventDefault() {},
+      stopPropagation() {},
+      type: "pointerdown",
+    };
+    assert.equal(rowWidget.mouse(pointerDown, [30, 12], node), true);
+    assert.equal(
+      node.properties.dora_power_lora.rows[0].enabled,
+      false,
+      "a click delivered to the originally bound row must update canonical live state"
+    );
+
+    const rowBeforeAdd = rowWidget;
+    const addWidget = node.widgets.find((widget) => widget.name === "add_lora");
+    assert.equal(typeof addWidget?.callback, "function");
+    addWidget.callback();
+    assert.equal(node.properties.dora_power_lora.rows.length, 2);
+    assert.ok(node.widgets.some((widget) => widget.name === "LORA_2"));
+    assert.strictEqual(
+      node.widgets.find((widget) => widget.name === "LORA_1"),
+      rowBeforeAdd,
+      "Add LoRA rebuild must keep the existing row widget object live"
+    );
 
     assert.ok(reportWidget, "auto-strength report widget should be registered");
     assert.equal(Object.getPrototypeOf(reportWidget), Object.prototype);

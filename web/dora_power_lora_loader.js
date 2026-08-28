@@ -737,7 +737,12 @@ function setButtonCallback(widget, cb) {
   widget.options.callback = cb;
 }
 
+const DORA_CUSTOM_WIDGET_KIND = "__doraDynamicLoraWidgetKind";
+const DORA_CUSTOM_WIDGET_METHODS_PREPARED = "__doraDynamicLoraMethodsPrepared";
+
 function preserveCustomWidgetPrototypeMethods(widget) {
+  if (!widget || widget[DORA_CUSTOM_WIDGET_METHODS_PREPARED]) return widget;
+
   let prototype = Object.getPrototypeOf(widget);
   while (prototype && prototype !== Object.prototype) {
     for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(prototype))) {
@@ -757,7 +762,27 @@ function preserveCustomWidgetPrototypeMethods(widget) {
     }
     prototype = Object.getPrototypeOf(prototype);
   }
+  Object.defineProperty(widget, DORA_CUSTOM_WIDGET_METHODS_PREPARED, {
+    configurable: true,
+    enumerable: false,
+    value: true,
+  });
   return widget;
+}
+
+function collectReusableDoraCustomWidgets(node) {
+  const rows = new Map();
+  let report = null;
+  for (const widget of Array.isArray(node?.widgets) ? node.widgets : []) {
+    if (!widget || widget.parentNode !== node) continue;
+    const kind = widget[DORA_CUSTOM_WIDGET_KIND];
+    if (kind === "lora-row") {
+      rows.set(String(widget.name ?? ""), widget);
+    } else if (kind === "auto-strength-report") {
+      report = widget;
+    }
+  }
+  return { rows, report };
 }
 
 function addDoraCustomWidget(node, widget) {
@@ -784,6 +809,11 @@ class DoraLoraRowWidget {
     this.name = name;
     this.type = "custom";
     this.parentNode = parentNode;
+    Object.defineProperty(this, DORA_CUSTOM_WIDGET_KIND, {
+      configurable: true,
+      enumerable: false,
+      value: "lora-row",
+    });
     this.row = row;
     this.last_y = 0;
     this._drag = null;
@@ -1217,6 +1247,11 @@ class DoraAutoStrengthReportWidget {
     this.name = name;
     this.type = "custom";
     this.parentNode = parentNode;
+    Object.defineProperty(this, DORA_CUSTOM_WIDGET_KIND, {
+      configurable: true,
+      enumerable: false,
+      value: "auto-strength-report",
+    });
     this.last_y = 0;
     this.hitAreas = [];
     this.hoverAreas = [];
@@ -1524,6 +1559,7 @@ class DoraAutoStrengthReportWidget {
 
 function buildUI(node, state, loraValues) {
   const st = sanitizeState(state);
+  const reusableCustomWidgets = collectReusableDoraCustomWidgets(node);
   clearCanvasTooltip();
   setState(node, st);
   removeAllWidgets(node);
@@ -1548,7 +1584,10 @@ function buildUI(node, state, loraValues) {
   wStateSlot.label = "State slot";
 
   node._doraRows.forEach((row, i) => {
-    const widget = new DoraLoraRowWidget(`LORA_${i + 1}`, node, row);
+    const name = `LORA_${i + 1}`;
+    const widget = reusableCustomWidgets.rows.get(name) || new DoraLoraRowWidget(name, node, row);
+    widget.parentNode = node;
+    widget.row = row;
     addDoraCustomWidget(node, widget);
   });
 
@@ -1750,10 +1789,10 @@ function buildUI(node, state, loraValues) {
   );
   wAutoStrengthCeiling.label = "Auto-strength ratio ceiling";
 
-  const wAutoStrengthReport = addDoraCustomWidget(
-    node,
-    new DoraAutoStrengthReportWidget("auto_strength_visualization", node)
-  );
+  const autoStrengthReportWidget =
+    reusableCustomWidgets.report || new DoraAutoStrengthReportWidget("auto_strength_visualization", node);
+  autoStrengthReportWidget.parentNode = node;
+  const wAutoStrengthReport = addDoraCustomWidget(node, autoStrengthReportWidget);
   wAutoStrengthReport.serialize = false;
 
   const size = node.computeSize();
@@ -1764,6 +1803,9 @@ function buildUI(node, state, loraValues) {
   node.min_size = minSize;
   node.size[0] = Math.max(node.size[0], size[0], minWidth);
   syncNodeHeightToContent(node);
+  for (const widget of Array.isArray(node.widgets) ? node.widgets : []) {
+    if (widget?.[DORA_CUSTOM_WIDGET_KIND]) widget.triggerDraw?.();
+  }
 }
 
 installGlobalStateApi();
