@@ -1,3 +1,19 @@
+# DoRA Dynamic LoRA Loader v1.0.44
+
+This hotfix restores LoRA-row interaction on current ComfyUI frontend main when the displayed rows survive a dynamic loader rebuild.
+
+## Stable custom-widget lifetime
+
+- Keeps each existing LoRA row widget object stable across the loader's immediate build, asynchronous LoRA-list refresh, Add LoRA rebuilds, and other same-name UI rebuilds.
+- Rebinds a reused row widget to the newly sanitized canonical row state instead of leaving the frontend bound to an orphaned row object.
+- Keeps the auto-strength visualization widget identity stable for the same frontend lifecycle.
+- Prevents the v1.0.43 prototype-compatibility preparation from running again after a widget has already been normalized by the frontend.
+- Adds a regression that captures the row object before the asynchronous refresh, requires the same object afterward, verifies a click updates canonical loader state, and verifies Add LoRA creates the next row without replacing the existing row object.
+
+## Root cause
+
+Current Vue legacy-widget rendering binds the live custom-widget object when its component mounts and keeps that object while the stable WidgetId/type render key remains unchanged. The loader rebuilt its UI after fetching the LoRA list and created a new `LORA_1` object under the same widget identity. The frontend therefore continued drawing and dispatching pointer events to the old object while the node's live widget list and canonical row state belonged to the replacement object.
+
 # DoRA Dynamic LoRA Loader v1.0.43
 
 This hotfix restores the loaded LoRA row controls on current ComfyUI frontend master while preserving compatibility with older frontends.
