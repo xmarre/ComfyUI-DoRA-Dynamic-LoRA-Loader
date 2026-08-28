@@ -1925,6 +1925,8 @@ _AUTO_STRENGTH_DISPLAY_RATIO_EPS = 1e-3
 _AUTO_STRENGTH_EPS = 1e-8
 _AUTO_STRENGTH_LINEAR_MIN_SAMPLE = 5
 _AUTO_STRENGTH_LINEAR_ROLE_MIN_SAMPLE = 2
+_AUTO_STRENGTH_LINEAR_DEPTH_MIN_SAMPLE = 5
+_AUTO_STRENGTH_LINEAR_DEPTH_WINDOW = 7
 _AUTO_STRENGTH_LINEAR_MAD_Z = 3.5
 _AUTO_STRENGTH_LINEAR_MIN_FACTOR = 1.5
 _AUTO_STRENGTH_LINEAR_MAX_CANDIDATES = 1
@@ -3589,6 +3591,82 @@ def _auto_strength_linear_outlier_model(values_by_logical: Dict[str, float]) -> 
     return result
 
 
+def _auto_strength_block_coordinate(block_identity: Optional[str]) -> Optional[Tuple[int, ...]]:
+    """Extract a stable repeated-block coordinate from structural block metadata."""
+    if not block_identity:
+        return None
+    coords: List[int] = []
+    for component in str(block_identity).split("/"):
+        match = re.search(r"\.(\d+)$", component)
+        if match is None:
+            return None
+        coords.append(int(match.group(1)))
+    return tuple(coords) if coords else None
+
+
+def _auto_strength_linear_depth_model(
+    values_by_logical: Dict[str, float],
+    coordinates_by_logical: Dict[str, Tuple[int, ...]],
+) -> Dict[str, Any]:
+    """Build robust local depth baselines without reacting to single-layer noise.
+
+    A centered moving log-median recovers the useful part of legacy per-layer
+    redistribution while making neighboring layers share one local trend. Coherent
+    weak/strong depth regions can therefore receive substantial family-level
+    correction without forcing every individual member to the same magnitude.
+    """
+    ordered = [
+        (coordinates_by_logical[logical_id], logical_id, float(value))
+        for logical_id, value in values_by_logical.items()
+        if logical_id in coordinates_by_logical
+        and math.isfinite(float(value))
+        and float(value) > _AUTO_STRENGTH_EPS
+    ]
+    ordered.sort(key=lambda item: (item[0], item[1]))
+    result: Dict[str, Any] = {
+        "eligible": False,
+        "sample_count": len(ordered),
+        "window_size": None,
+        "local_references": {},
+        "fallback_reason": "insufficient_depth_sample",
+    }
+    if len(ordered) < _AUTO_STRENGTH_LINEAR_DEPTH_MIN_SAMPLE:
+        return result
+
+    window_size = min(_AUTO_STRENGTH_LINEAR_DEPTH_WINDOW, len(ordered))
+    if window_size % 2 == 0 and window_size > 1:
+        window_size -= 1
+    window_size = max(1, window_size)
+    radius = window_size // 2
+    local_references: Dict[str, float] = {}
+
+    for index, (_coord, logical_id, _value) in enumerate(ordered):
+        start = index - radius
+        end = index + radius + 1
+        if start < 0:
+            end = min(len(ordered), end - start)
+            start = 0
+        if end > len(ordered):
+            start = max(0, start - (end - len(ordered)))
+            end = len(ordered)
+        reference = _auto_strength_log_median(entry[2] for entry in ordered[start:end])
+        if reference is not None and reference > _AUTO_STRENGTH_EPS:
+            local_references[logical_id] = float(reference)
+
+    if len(local_references) < _AUTO_STRENGTH_LINEAR_DEPTH_MIN_SAMPLE:
+        return result
+
+    result.update(
+        {
+            "eligible": True,
+            "window_size": window_size,
+            "local_references": local_references,
+            "fallback_reason": None,
+        }
+    )
+    return result
+
+
 def _auto_strength_measure_dora_effect(
     weight: torch.Tensor,
     delta: torch.Tensor,
@@ -3971,6 +4049,7 @@ def _auto_strength_analyze_base_targets(
     cohort_models: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     cohort_reference_statistics: Dict[Tuple[str, str, str], str] = {}
     cohort_role_eligible: Dict[Tuple[str, str, str], bool] = {}
+    cohort_depth_models: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     family_values: Dict[Tuple[str, str], List[float]] = {}
 
     for cohort, vals_by_logical in grouped_norms.items():
@@ -4013,6 +4092,29 @@ def _auto_strength_analyze_base_targets(
             )
             cohort_role_references[cohort] = role_reference
             cohort_role_eligible[cohort] = role_eligible
+
+            coordinates_by_logical: Dict[str, Tuple[int, ...]] = {}
+            for logical_id in logical_values.keys():
+                logical_key = (cohort[0], cohort[1], cohort[2], logical_id)
+                coords = {
+                    _auto_strength_block_coordinate(
+                        base_metadata.get(base, {}).get("block_identity")
+                    )
+                    for base in logical_members.get(logical_key, [])
+                }
+                coords.discard(None)
+                if len(coords) == 1:
+                    coordinates_by_logical[logical_id] = next(iter(coords))
+            depth_model = _auto_strength_linear_depth_model(
+                logical_values,
+                coordinates_by_logical,
+            )
+            if not cohort_is_eligible:
+                depth_model["eligible"] = False
+                depth_model["local_references"] = {}
+                depth_model["fallback_reason"] = "cohort_ineligible"
+            cohort_depth_models[cohort] = depth_model
+
             if role_eligible:
                 family_values.setdefault((cohort[0], cohort[1]), []).extend(logical_vals)
         else:
@@ -4034,6 +4136,13 @@ def _auto_strength_analyze_base_targets(
             cohort_anomaly_references[cohort] = reference
             cohort_role_references[cohort] = reference
             cohort_role_eligible[cohort] = eligible
+            cohort_depth_models[cohort] = {
+                "eligible": False,
+                "sample_count": len(logical_vals),
+                "window_size": None,
+                "local_references": {},
+                "fallback_reason": "non_linear_family",
+            }
             cohort_reference_statistics[cohort] = "arithmetic_mean"
 
     family_references: Dict[Tuple[str, str], Optional[float]] = {}
@@ -4092,16 +4201,27 @@ def _auto_strength_analyze_base_targets(
             if role_gain is None:
                 targets[base] = global_strength
                 continue
+            family_reference = family_references.get((cohort[0], cohort[1]))
+            depth_model = cohort_depth_models.get(cohort, {})
+            depth_reference = depth_model.get("local_references", {}).get(logical_id)
+            base_gain = role_gain
+            if (
+                depth_reference is not None
+                and family_reference is not None
+                and depth_reference > _AUTO_STRENGTH_EPS
+            ):
+                base_gain = float(family_reference / depth_reference)
+
             anomaly_gain = 1.0
             model = cohort_models.get(cohort, {})
-            anomaly_reference = cohort_anomaly_references.get(cohort)
+            correction_reference = depth_reference or cohort_anomaly_references.get(cohort)
             if (
                 logical_id in model.get("candidate_ids", set())
-                and anomaly_reference is not None
-                and anomaly_reference > _AUTO_STRENGTH_EPS
+                and correction_reference is not None
+                and correction_reference > _AUTO_STRENGTH_EPS
             ):
-                anomaly_gain = float(anomaly_reference / norm)
-            ratio = float(role_gain * anomaly_gain)
+                anomaly_gain = float(correction_reference / norm)
+            ratio = float(base_gain * anomaly_gain)
         else:
             reference = cohort_anomaly_references.get(cohort)
             model = cohort_models.get(cohort, {})
@@ -4146,10 +4266,17 @@ def _auto_strength_analyze_base_targets(
         cohort_bases = [base for base, base_cohort in base_cohorts.items() if base_cohort == cohort]
         metadata = base_metadata.get(cohort_bases[0], {}) if cohort_bases else {}
         model = cohort_models.get(cohort, {})
+        depth_model = cohort_depth_models.get(cohort, {})
         anomaly_reference = cohort_anomaly_references.get(cohort)
         role_reference = cohort_role_references.get(cohort)
         family_reference = family_references.get((group, family))
         role_gain = cohort_role_gains.get(cohort)
+        depth_references = depth_model.get("local_references", {}) if family == "linear" else {}
+        depth_gains = [
+            float(family_reference / reference)
+            for reference in depth_references.values()
+            if family_reference is not None and reference > _AUTO_STRENGTH_EPS
+        ]
         is_linear = family == "linear"
 
         if is_linear:
@@ -4204,6 +4331,12 @@ def _auto_strength_analyze_base_targets(
                 "family_reference_statistic": "arithmetic_mean" if is_linear else None,
                 "family_reference_score": _auto_strength_safe_number(family_reference),
                 "role_gain_raw": _auto_strength_safe_number(role_gain),
+                "depth_profile_eligible": bool(depth_model.get("eligible")) if is_linear else None,
+                "depth_profile_sample_count": int(depth_model.get("sample_count", 0)) if is_linear else None,
+                "depth_profile_window_size": depth_model.get("window_size") if is_linear else None,
+                "depth_profile_fallback_reason": depth_model.get("fallback_reason") if is_linear else None,
+                "depth_gain_min_raw": _auto_strength_safe_number(min(depth_gains)) if depth_gains else None,
+                "depth_gain_max_raw": _auto_strength_safe_number(max(depth_gains)) if depth_gains else None,
                 "role_gain_at_bounds": (
                     _auto_strength_safe_number(max(ratio_floor, min(ratio_ceiling, role_gain)))
                     if role_gain is not None
@@ -4233,6 +4366,15 @@ def _auto_strength_analyze_base_targets(
         role_reference = cohort_role_references.get(cohort)
         family_reference = family_references.get((group, family))
         role_gain = cohort_role_gains.get(cohort)
+        depth_model = cohort_depth_models.get(cohort, {})
+        depth_reference = depth_model.get("local_references", {}).get(logical_id)
+        depth_gain_raw = None
+        if (
+            depth_reference is not None
+            and family_reference is not None
+            and depth_reference > _AUTO_STRENGTH_EPS
+        ):
+            depth_gain_raw = float(family_reference / depth_reference)
 
         ratio_raw = None
         ratio_applied = None
@@ -4247,24 +4389,42 @@ def _auto_strength_analyze_base_targets(
             if role_gain is None:
                 fallback_reason = cohort_role_gain_reasons.get(cohort) or "role_redistribution_unavailable"
             else:
+                base_gain = depth_gain_raw if depth_gain_raw is not None else role_gain
                 anomaly_gain_raw = 1.0
+                correction_reference = depth_reference or anomaly_reference
                 if (
                     logical_id in model.get("candidate_ids", set())
-                    and anomaly_reference is not None
-                    and anomaly_reference > _AUTO_STRENGTH_EPS
+                    and correction_reference is not None
+                    and correction_reference > _AUTO_STRENGTH_EPS
                 ):
-                    anomaly_gain_raw = float(anomaly_reference / logical_norm)
-                    decision_reason = "role_redistribution_plus_outlier_correction"
+                    anomaly_gain_raw = float(correction_reference / logical_norm)
+                    decision_reason = (
+                        "depth_profile_redistribution_plus_outlier_correction"
+                        if depth_gain_raw is not None
+                        else "role_redistribution_plus_outlier_correction"
+                    )
                 elif logical_id in model.get("detected_candidate_ids", set()):
-                    decision_reason = "role_redistribution_anomaly_suppressed_candidate"
+                    decision_reason = (
+                        "depth_profile_redistribution_anomaly_suppressed_candidate"
+                        if depth_gain_raw is not None
+                        else "role_redistribution_anomaly_suppressed_candidate"
+                    )
                 elif model.get("fallback_reason") == "multiple_outlier_candidates":
-                    decision_reason = "role_redistribution_anomaly_suppressed"
+                    decision_reason = (
+                        "depth_profile_redistribution_anomaly_suppressed"
+                        if depth_gain_raw is not None
+                        else "role_redistribution_anomaly_suppressed"
+                    )
                 else:
-                    decision_reason = "role_redistribution"
+                    decision_reason = (
+                        "depth_profile_redistribution"
+                        if depth_gain_raw is not None
+                        else "role_redistribution"
+                    )
 
                 if not bool(model.get("eligible")):
                     anomaly_fallback_reason = model.get("fallback_reason")
-                ratio_raw = float(role_gain * anomaly_gain_raw)
+                ratio_raw = float(base_gain * anomaly_gain_raw)
                 ratio_applied = float(max(ratio_floor, min(ratio_ceiling, ratio_raw)))
         else:
             if (
@@ -4314,6 +4474,8 @@ def _auto_strength_analyze_base_targets(
                     "logical_scale": _auto_strength_safe_number(base_logical_scales.get(base, 1.0)),
                     "measured": base in base_norms,
                     "role_gain_raw": _auto_strength_safe_number(role_gain),
+                    "depth_reference_score": _auto_strength_safe_number(depth_reference),
+                    "depth_gain_raw": _auto_strength_safe_number(depth_gain_raw),
                     "anomaly_gain_raw": _auto_strength_safe_number(anomaly_gain_raw),
                     "ratio_applied": _auto_strength_safe_number(base_ratio),
                     "target_strength": base_target,
@@ -4389,6 +4551,8 @@ def _auto_strength_analyze_base_targets(
                 "role_reference_score": _auto_strength_safe_number(role_reference),
                 "family_reference_score": _auto_strength_safe_number(family_reference),
                 "role_gain_raw": _auto_strength_safe_number(role_gain),
+                "depth_reference_score": _auto_strength_safe_number(depth_reference),
+                "depth_gain_raw": _auto_strength_safe_number(depth_gain_raw),
                 "anomaly_gain_raw": _auto_strength_safe_number(anomaly_gain_raw),
                 "log_deviation": _auto_strength_safe_number(log_deviation),
                 "robust_z": _auto_strength_safe_number(robust_z),
@@ -4438,16 +4602,22 @@ def _auto_strength_analyze_base_targets(
         "scoring_basis": "absolute_update_rms",
         "base_relative_scoring": False,
         "cohort_reference_policy": {
-            "repeated_block_linear": "family_arithmetic_role_gain_plus_log_median_mad_single_outlier_gate",
+            "repeated_block_linear": "family_arithmetic_local_depth_log_median_plus_single_outlier_gate",
             "other_tensor_families": "arithmetic_mean",
         },
         "linear_cohorting": "repeated_block_semantic_role_logical_shape_and_slice",
         "linear_role_redistribution_policy": {
             "family_reference": "arithmetic_mean_of_eligible_logical_sources",
-            "role_reference": "arithmetic_mean",
+            "role_reference": "arithmetic_mean_fallback",
             "minimum_role_sample": _AUTO_STRENGTH_LINEAR_ROLE_MIN_SAMPLE,
-            "gain": "family_reference_divided_by_role_reference",
-            "preserves_within_role_profile": True,
+            "fallback_gain": "family_reference_divided_by_role_reference",
+        },
+        "linear_depth_redistribution_policy": {
+            "minimum_sample": _AUTO_STRENGTH_LINEAR_DEPTH_MIN_SAMPLE,
+            "window_size": _AUTO_STRENGTH_LINEAR_DEPTH_WINDOW,
+            "local_reference": "centered_moving_log_median",
+            "gain": "family_reference_divided_by_local_depth_reference",
+            "preserves_local_residual_structure": True,
         },
         "linear_outlier_policy": {
             "minimum_sample": _AUTO_STRENGTH_LINEAR_MIN_SAMPLE,
@@ -4455,7 +4625,7 @@ def _auto_strength_analyze_base_targets(
             "minimum_deviation_factor": _AUTO_STRENGTH_LINEAR_MIN_FACTOR,
             "maximum_candidates": _AUTO_STRENGTH_LINEAR_MAX_CANDIDATES,
             "correction_target": "cohort_log_median",
-            "composition": "role_gain_times_outlier_gain",
+            "composition": "depth_or_role_gain_times_outlier_gain",
         },
         "strength_model": float(strength_model),
         "strength_clip": float(strength_clip),
@@ -4493,6 +4663,32 @@ def _auto_strength_analyze_base_targets(
                     family_references.get((group, family))
                 ),
                 "role_gain": _auto_strength_safe_number(cohort_role_gains.get(cohort)),
+                "depth_profile": {
+                    "eligible": bool(cohort_depth_models.get(cohort, {}).get("eligible")),
+                    "window_size": cohort_depth_models.get(cohort, {}).get("window_size"),
+                    "gain_min": _auto_strength_safe_number(
+                        min(
+                            [
+                                family_references.get((group, family)) / reference
+                                for reference in cohort_depth_models.get(cohort, {}).get("local_references", {}).values()
+                                if family_references.get((group, family)) is not None
+                                and reference > _AUTO_STRENGTH_EPS
+                            ],
+                            default=None,
+                        )
+                    ),
+                    "gain_max": _auto_strength_safe_number(
+                        max(
+                            [
+                                family_references.get((group, family)) / reference
+                                for reference in cohort_depth_models.get(cohort, {}).get("local_references", {}).values()
+                                if family_references.get((group, family)) is not None
+                                and reference > _AUTO_STRENGTH_EPS
+                            ],
+                            default=None,
+                        )
+                    ),
+                } if family == "linear" else None,
                 "anomaly_reference": _auto_strength_safe_number(
                     cohort_anomaly_references.get(cohort)
                 ),
@@ -4510,7 +4706,7 @@ def _auto_strength_analyze_base_targets(
             }
 
         _LOG.info(
-            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (%s/%s logical groups) (scoring=absolute_update_rms linear_policy=family_role_gain_plus_log_median_mad_single_outlier_gate family_references=%s cohorts=%s ratio_floor=%s ratio_ceiling=%s)",
+            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (%s/%s logical groups) (scoring=absolute_update_rms linear_policy=family_local_depth_log_median_plus_single_outlier_gate family_references=%s cohorts=%s ratio_floor=%s ratio_ceiling=%s)",
             measured,
             total,
             measured_logical,
@@ -4522,7 +4718,7 @@ def _auto_strength_analyze_base_targets(
         )
         for item in logical_reports[:20]:
             _LOG.info(
-                "[DoRA Power LoRA Loader] auto-strength: logical=%s group=%s family=%s role=%s block=%s fanout=%s update_rms=%s role_reference=%s family_reference=%s role_gain=%s anomaly_gain=%s robust_z=%s outlier=%s corrected=%s ratio_raw=%s ratio_applied=%s target=%s decision=%s fallback=%s anomaly_fallback=%s",
+                "[DoRA Power LoRA Loader] auto-strength: logical=%s group=%s family=%s role=%s block=%s fanout=%s update_rms=%s role_reference=%s family_reference=%s role_gain=%s depth_reference=%s depth_gain=%s anomaly_gain=%s robust_z=%s outlier=%s corrected=%s ratio_raw=%s ratio_applied=%s target=%s decision=%s fallback=%s anomaly_fallback=%s",
                 item.get("logical_id"),
                 item.get("group"),
                 item.get("family"),
@@ -4533,6 +4729,8 @@ def _auto_strength_analyze_base_targets(
                 item.get("role_reference_score"),
                 item.get("family_reference_score"),
                 item.get("role_gain_raw"),
+                item.get("depth_reference_score"),
+                item.get("depth_gain_raw"),
                 item.get("anomaly_gain_raw"),
                 item.get("robust_z"),
                 item.get("outlier_candidate"),

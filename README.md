@@ -95,29 +95,34 @@ then enabling auto-strength is a true no-op.
 
 - scores ordinary LoRA with absolute `RMS(ΔW)` after LoRA alpha/rank scaling
 - scores DoRA with the RMS of its actual post-normalization weight update
-- separates model and CLIP and keeps non-linear tensor families isolated
+- separates model and CLIP and keeps tensor families isolated
 - infers repeated-block projection roles structurally from mapped destination paths; there is no MiniMax-H3 role table
 - derives linear cohort shape from the adapter's logical update matrix when possible, so packed/quantized checkpoint storage does not split an otherwise identical role
-- computes the legacy broad **family arithmetic reference** across eligible linear logical sources
-- computes one **uniform role gain** as `family_reference / role_reference`, where the role reference is that role's arithmetic mean
-- applies the same role gain to every block in the role, preserving the LoRA's trained within-role depth profile instead of forcing every block toward one magnitude
-- keeps exact semantic role, logical shape, and slice identity for within-role anomaly analysis
-- optionally composes the role gain with a conservative log-median/MAD correction for one isolated member
-- suppresses only the per-member anomaly correction when multiple candidates form a coherent tail or multimodal regime; the role-level redistribution still applies
-- requires at least two measured logical sources for role redistribution and at least five for isolated-outlier inference
+- retains the legacy broad **family arithmetic reference** across eligible linear logical sources
+- for ordered repeated-block roles, builds a robust **local depth reference** with a centered 7-member moving log-median
+- applies `family_reference / local_depth_reference` as the main gain, so a coherently weak depth region can still receive the large boosts that made the original Auto-strength useful
+- uses one role-wide arithmetic-mean gain only as a fallback when a reliable depth profile cannot be inferred
+- preserves local residual structure because neighboring blocks share the same robust local trend instead of each block being independently forced to the family mean
+- optionally composes one isolated-member correction on top; when a true isolated outlier is detected, the local reference is used as its correction target
+- multiple anomaly candidates suppress only the isolated-member correction; they do not suppress coherent depth redistribution
+- requires at least five ordered logical sources for depth profiling and at least five for isolated-outlier inference
 - leaves unclassifiable linear destinations at their normal global strength
-- preserves the existing arithmetic-mean redistribution for non-linear families such as convolution cohorts
+- preserves arithmetic-mean redistribution for non-linear families such as convolution cohorts
 - keeps Flux / Flux2 compat-broadcasted logical sources from being over-counted during measurement
 - preserves the normal outer patch strength during final application
 - `auto` resolves to CPU-safe analysis
 - `gpu` is the explicit accelerator path
 - default node UI state is `gpu`
 
-This deliberately keeps the useful behavior of the original broad Auto-strength
-implementation—different projection roles can receive substantial relative boosts or
-pullbacks—without flattening learned block-to-block structure inside a role. For a
-linear role, Auto-strength first applies one role-wide scalar. Only a genuinely
-isolated statistical anomaly may receive an additional per-member correction.
+The linear policy deliberately sits between the two previous extremes. The original
+implementation compared every individual layer directly with one broad family mean,
+which could produce useful 4–5× boosts but also reacted to every layer independently.
+The first role-aware redesign protected depth structure too aggressively and could
+collapse Auto-strength to a near no-op.
+
+The current policy keeps the original family target but estimates a robust local trend
+inside each semantic role. Coherent weak regions therefore keep strong corrections,
+while isolated layer noise does not define the baseline for its neighbors.
 
 Ordinary LoRA scoring remains independent of destination weight numeric values.
 A base-relative score such as `RMS(ΔW) / RMS(W0)` would make the same LoRA

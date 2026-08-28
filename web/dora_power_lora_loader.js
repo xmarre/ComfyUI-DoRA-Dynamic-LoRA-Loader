@@ -1482,8 +1482,17 @@ class DoraAutoStrengthReportWidget {
             .map((cohort) => {
               const name = `${cohort.group}/${cohort.family}/${cohort.semantic_role || "unclassified"}`;
               if (cohort.family !== "linear") return name;
-              const gain = toFiniteNumberOrNull(cohort.role_gain_raw);
-              const gainText = gain == null ? "gain —" : `gain ×${formatNumber(gain, 2)}`;
+              const minDepthGain = toFiniteNumberOrNull(cohort.depth_gain_min_raw);
+              const maxDepthGain = toFiniteNumberOrNull(cohort.depth_gain_max_raw);
+              const roleGain = toFiniteNumberOrNull(cohort.role_gain_raw);
+              let gainText = "gain —";
+              if (minDepthGain !== null && maxDepthGain !== null) {
+                gainText = Math.abs(maxDepthGain - minDepthGain) <= 1e-6
+                  ? `depth ×${formatNumber(minDepthGain, 2)}`
+                  : `depth ×${formatNumber(minDepthGain, 2)}–${formatNumber(maxDepthGain, 2)}`;
+              } else if (roleGain !== null) {
+                gainText = `role ×${formatNumber(roleGain, 2)}`;
+              }
               return `${name} ${gainText} · ${cohort.corrected_logical_count || 0}/${cohort.outlier_candidate_count || 0} outliers corrected`;
             })
             .join("  ·  ")

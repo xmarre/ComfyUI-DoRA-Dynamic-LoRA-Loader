@@ -90,7 +90,7 @@ def test_minimax_projection_regimes_are_redistributed_by_uniform_role_gain(dora_
     assert report["base_relative_scoring"] is False
     assert report["family_references"]["model/linear"] == pytest.approx(expected_family_reference)
     assert report["cohort_reference_policy"] == {
-        "repeated_block_linear": "family_arithmetic_role_gain_plus_log_median_mad_single_outlier_gate",
+        "repeated_block_linear": "family_arithmetic_local_depth_log_median_plus_single_outlier_gate",
         "other_tensor_families": "arithmetic_mean",
     }
     assert {cohort["semantic_role"] for cohort in report["cohorts"]} == set(regimes)
@@ -98,6 +98,47 @@ def test_minimax_projection_regimes_are_redistributed_by_uniform_role_gain(dora_
         assert cohort["measured_logical_count"] == 50
         assert cohort["role_gain_raw"] == pytest.approx(expected_gains[cohort["semantic_role"]])
         assert cohort["family_reference_score"] == pytest.approx(expected_family_reference)
+
+
+
+def test_h3_like_weak_fc2_depth_region_recovers_large_boosts(dora_modules):
+    nodes, _ = dora_modules
+    lora_sd = {}
+    key_map = {}
+    model_state = {}
+
+    for block in range(50):
+        _add_linear(
+            lora_sd,
+            key_map,
+            model_state,
+            f"qkv_{block}",
+            f"diffusion_model.blocks.{block}.attn.qkv_proj.weight",
+            1.0,
+        )
+        fc2_magnitude = 0.25 if block < 35 else 2.0
+        _add_linear(
+            lora_sd,
+            key_map,
+            model_state,
+            f"fc2_{block}",
+            f"diffusion_model.blocks.{block}.mlp.fc2.weight",
+            fc2_magnitude,
+        )
+
+    targets, report = _analyze(nodes, lora_sd, key_map, model_state)
+
+    family_reference = (50 * 1.0 + 35 * 0.25 + 15 * 2.0) / 100.0
+    early_gain = family_reference / 0.25
+    late_gain = family_reference / 2.0
+    assert early_gain > 3.5
+    assert all(targets[f"fc2_{block}"] == pytest.approx(early_gain) for block in range(0, 32))
+    assert all(targets[f"fc2_{block}"] == pytest.approx(late_gain) for block in range(38, 50))
+
+    fc2_cohort = next(c for c in report["cohorts"] if c["semantic_role"] == "mlp.fc2")
+    assert fc2_cohort["depth_profile_eligible"] is True
+    assert fc2_cohort["depth_gain_max_raw"] == pytest.approx(early_gain)
+    assert fc2_cohort["depth_gain_min_raw"] == pytest.approx(late_gain)
 
 
 def test_role_gain_preserves_depth_profile_exactly(dora_modules):
@@ -146,7 +187,7 @@ def test_role_gain_preserves_depth_profile_exactly(dora_modules):
     )
 
 
-def test_weak_projection_composes_role_gain_with_isolated_outlier_correction(dora_modules):
+def test_weak_projection_composes_depth_gain_with_isolated_outlier_correction(dora_modules):
     nodes, _ = dora_modules
     lora_sd = {}
     key_map = {}
@@ -163,7 +204,7 @@ def test_weak_projection_composes_role_gain_with_isolated_outlier_correction(dor
     weak = "blocks_2_mlp_fc2"
     family_reference = (5 * 4.0 + 0.2 + 4 * 1.0) / 10.0
     qkv_gain = family_reference / 4.0
-    fc2_gain = family_reference / ((0.2 + 4.0) / 5.0)
+    fc2_depth_gain = family_reference / 1.0
 
     assert targets[weak] == pytest.approx(10.0)
     assert all(
@@ -171,20 +212,20 @@ def test_weak_projection_composes_role_gain_with_isolated_outlier_correction(dor
         for block in range(5)
     )
     assert all(
-        targets[f"blocks_{block}_mlp_fc2"] == pytest.approx(fc2_gain)
+        targets[f"blocks_{block}_mlp_fc2"] == pytest.approx(fc2_depth_gain)
         for block in (0, 1, 3, 4)
     )
     weak_report = _logical_report(report, weak)
     assert weak_report["semantic_role"] == "mlp.fc2"
     assert weak_report["block_identity"] == "blocks.2"
-    assert weak_report["cohort_reference_score"] == pytest.approx(1.0)
-    assert weak_report["role_gain_raw"] == pytest.approx(fc2_gain)
+    assert weak_report["depth_reference_score"] == pytest.approx(1.0)
+    assert weak_report["depth_gain_raw"] == pytest.approx(fc2_depth_gain)
     assert weak_report["anomaly_gain_raw"] == pytest.approx(5.0)
-    assert weak_report["ratio_raw"] == pytest.approx(fc2_gain * 5.0)
+    assert weak_report["ratio_raw"] == pytest.approx(fc2_depth_gain * 5.0)
     assert weak_report["ratio_applied"] == pytest.approx(10.0)
 
 
-def test_strong_projection_is_pulled_back_within_its_role(dora_modules):
+def test_strong_projection_uses_family_over_local_depth_reference(dora_modules):
     nodes, _ = dora_modules
     lora_sd = {}
     key_map = {}
@@ -198,11 +239,19 @@ def test_strong_projection_is_pulled_back_within_its_role(dora_modules):
     targets, report = _analyze(nodes, lora_sd, key_map, model_state)
 
     strong = "blocks_3_mlp_fc2"
-    assert targets[strong] == pytest.approx(0.2)
-    assert _logical_report(report, strong)["ratio_raw"] == pytest.approx(0.2)
+    family_reference = 9.0 / 5.0
+    assert targets[strong] == pytest.approx(family_reference / 5.0)
+    assert all(
+        targets[f"blocks_{block}_mlp_fc2"] == pytest.approx(family_reference)
+        for block in (0, 1, 2, 4)
+    )
+    strong_report = _logical_report(report, strong)
+    assert strong_report["depth_reference_score"] == pytest.approx(1.0)
+    assert strong_report["anomaly_gain_raw"] == pytest.approx(0.2)
+    assert strong_report["ratio_raw"] == pytest.approx(family_reference / 5.0)
 
 
-def test_mad_gate_detects_an_isolated_outlier_in_a_noisy_cohort(dora_modules):
+def test_mad_gate_composes_with_robust_local_depth_baseline(dora_modules):
     nodes, _ = dora_modules
     lora_sd = {}
     key_map = {}
@@ -219,15 +268,17 @@ def test_mad_gate_detects_an_isolated_outlier_in_a_noisy_cohort(dora_modules):
 
     targets, report = _analyze(nodes, lora_sd, key_map, model_state)
 
-    assert targets["block_4"] == pytest.approx(5.0)
-    assert all(targets[f"block_{block}"] == pytest.approx(1.0) for block in range(4))
+    family_reference = 0.85
+    assert targets["block_4"] == pytest.approx(family_reference / 0.2)
+    assert all(targets[f"block_{block}"] == pytest.approx(family_reference) for block in range(4))
     cohort = report["cohorts"][0]
     assert cohort["log_mad"] > 0.0
+    assert cohort["depth_profile_eligible"] is True
     assert cohort["outlier_candidate_count"] == 1
     assert cohort["corrected_logical_count"] == 1
 
 
-def test_bimodal_depth_regime_is_preserved(dora_modules):
+def test_bimodal_depth_regime_receives_coherent_local_gains(dora_modules):
     nodes, _ = dora_modules
     lora_sd = {}
     key_map = {}
@@ -246,25 +297,25 @@ def test_bimodal_depth_regime_is_preserved(dora_modules):
 
     targets, report = _analyze(nodes, lora_sd, key_map, model_state)
 
-    assert all(target == pytest.approx(1.0) for target in targets.values())
+    assert all(targets[f"block_{block}"] == pytest.approx(1.5) for block in range(25))
+    assert all(targets[f"block_{block}"] == pytest.approx(0.75) for block in range(25, 50))
     cohort = report["cohorts"][0]
-    assert cohort["redistribution_eligible"] is True
+    assert cohort["depth_profile_eligible"] is True
+    assert cohort["depth_profile_window_size"] == 7
     assert cohort["outlier_candidate_count"] == 0
     assert cohort["corrected_logical_count"] == 0
-    assert all(
-        item["decision_reason"] == "role_redistribution"
-        for item in report["logical_groups"]
-    )
 
 
-def test_smooth_depth_profile_is_preserved(dora_modules):
+def test_smooth_depth_profile_uses_smooth_local_baseline(dora_modules):
     nodes, _ = dora_modules
     lora_sd = {}
     key_map = {}
     model_state = {}
 
+    magnitudes = []
     for block in range(50):
         magnitude = 0.45 + (0.55 * block / 49.0)
+        magnitudes.append(magnitude)
         _add_linear(
             lora_sd,
             key_map,
@@ -276,11 +327,17 @@ def test_smooth_depth_profile_is_preserved(dora_modules):
 
     targets, report = _analyze(nodes, lora_sd, key_map, model_state)
 
-    assert all(target == pytest.approx(1.0) for target in targets.values())
-    assert report["cohorts"][0]["outlier_candidate_count"] == 0
+    family_reference = sum(magnitudes) / len(magnitudes)
+    for block in (3, 10, 24, 40, 46):
+        assert targets[f"block_{block}"] == pytest.approx(
+            family_reference / magnitudes[block]
+        )
+    assert targets["block_0"] == pytest.approx(family_reference / magnitudes[3])
+    assert targets["block_49"] == pytest.approx(family_reference / magnitudes[46])
+    assert report["cohorts"][0]["depth_profile_eligible"] is True
 
 
-def test_populous_tail_is_treated_as_a_coherent_regime(dora_modules):
+def test_populous_tail_is_redistributed_as_a_coherent_depth_regime(dora_modules):
     nodes, _ = dora_modules
     lora_sd = {}
     key_map = {}
@@ -299,28 +356,25 @@ def test_populous_tail_is_treated_as_a_coherent_regime(dora_modules):
 
     targets, report = _analyze(nodes, lora_sd, key_map, model_state)
 
-    assert all(target == pytest.approx(1.0) for target in targets.values())
+    assert all(targets[f"block_{block}"] == pytest.approx(1.6) for block in range(20))
+    assert all(targets[f"block_{block}"] == pytest.approx(0.8) for block in range(20, 50))
     cohort = report["cohorts"][0]
     assert cohort["redistribution_eligible"] is True
+    assert cohort["depth_profile_eligible"] is True
     assert cohort["outlier_candidate_count"] == 20
     assert cohort["outlier_candidate_limit"] == 1
     assert cohort["corrected_logical_count"] == 0
-    assert cohort["fallback_reason"] is None
     assert cohort["anomaly_fallback_reason"] == "multiple_outlier_candidates"
-    assert all(
-        _logical_report(report, f"block_{block}")["anomaly_fallback_reason"]
-        == "multiple_outlier_candidates"
-        for block in range(20)
-    )
 
 
-def test_multiple_outlier_candidates_are_left_unchanged(dora_modules):
+def test_multiple_outlier_candidates_suppress_only_individual_correction(dora_modules):
     nodes, _ = dora_modules
     lora_sd = {}
     key_map = {}
     model_state = {}
 
-    for block, magnitude in enumerate((0.2, 1.0, 1.0, 1.0, 1.0, 5.0)):
+    magnitudes = (0.2, 1.0, 1.0, 1.0, 1.0, 5.0)
+    for block, magnitude in enumerate(magnitudes):
         _add_linear(
             lora_sd,
             key_map,
@@ -332,12 +386,12 @@ def test_multiple_outlier_candidates_are_left_unchanged(dora_modules):
 
     targets, report = _analyze(nodes, lora_sd, key_map, model_state)
 
-    assert all(target == pytest.approx(1.0) for target in targets.values())
+    family_reference = sum(magnitudes) / len(magnitudes)
+    assert all(target == pytest.approx(family_reference) for target in targets.values())
     cohort = report["cohorts"][0]
     assert cohort["outlier_candidate_count"] == 2
     assert cohort["outlier_candidate_limit"] == 1
     assert cohort["corrected_logical_count"] == 0
-    assert cohort["fallback_reason"] is None
     assert cohort["anomaly_fallback_reason"] == "multiple_outlier_candidates"
 
 
@@ -492,8 +546,9 @@ def test_model_and_clip_roles_never_share_a_cohort(dora_modules):
 
     targets, report = _analyze(nodes, lora_sd, key_map, model_state, clip_state)
 
-    assert targets["model_0"] == pytest.approx(5.0)
-    assert all(targets[f"model_{block}"] == pytest.approx(1.0) for block in range(1, 5))
+    model_family_reference = 0.84
+    assert targets["model_0"] == pytest.approx(model_family_reference * 5.0)
+    assert all(targets[f"model_{block}"] == pytest.approx(model_family_reference) for block in range(1, 5))
     assert all(targets[f"clip_{block}"] == pytest.approx(1.0) for block in range(5))
     assert {cohort["group"] for cohort in report["cohorts"]} == {"model", "clip"}
 
@@ -521,17 +576,10 @@ def test_same_named_roles_with_different_shapes_do_not_share_a_cohort(dora_modul
     targets, report = _analyze(nodes, lora_sd, key_map, model_state)
 
     family_reference = (0.2 + 4 * 1.0 + 5 * 1.0) / 10.0
-    small_shape_gain = family_reference / ((0.2 + 4.0) / 5.0)
-    large_shape_gain = family_reference / 1.0
-
-    assert targets["shape_0"] == pytest.approx(small_shape_gain * 5.0)
+    assert targets["shape_0"] == pytest.approx(family_reference * 5.0)
     assert all(
-        targets[f"shape_{block}"] == pytest.approx(small_shape_gain)
-        for block in range(1, 5)
-    )
-    assert all(
-        targets[f"shape_{block}"] == pytest.approx(large_shape_gain)
-        for block in range(5, 10)
+        targets[f"shape_{block}"] == pytest.approx(family_reference)
+        for block in range(1, 10)
     )
     assert {cohort["destination_shape"] for cohort in report["cohorts"]} == {"2x2", "3x3"}
     assert len(report["cohorts"]) == 2
@@ -686,8 +734,10 @@ def test_zero_global_strength_and_ratio_clamps_are_safe(dora_modules):
     assert clamped_targets["mlp_fc2_0"] == pytest.approx(0.5)
     assert _logical_report(report, "mlp_fc1_0")["anomaly_gain_raw"] == pytest.approx(100.0)
     assert _logical_report(report, "mlp_fc2_0")["anomaly_gain_raw"] == pytest.approx(0.01)
-    assert _logical_report(report, "mlp_fc1_0")["ratio_raw"] > 100.0
-    assert _logical_report(report, "mlp_fc2_0")["ratio_raw"] < 0.01
+    assert _logical_report(report, "mlp_fc1_0")["depth_gain_raw"] > 10.0
+    assert _logical_report(report, "mlp_fc2_0")["depth_gain_raw"] > 10.0
+    assert _logical_report(report, "mlp_fc1_0")["ratio_raw"] > 1000.0
+    assert 0.1 < _logical_report(report, "mlp_fc2_0")["ratio_raw"] < 0.2
 
 
 def test_standard_lora_scoring_is_checkpoint_weight_independent(dora_modules):
