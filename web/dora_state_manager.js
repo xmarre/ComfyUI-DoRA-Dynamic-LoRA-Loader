@@ -25,6 +25,25 @@ const MIN_NODE_WIDTH = 820;
 const MIN_NODE_HEIGHT = 720;
 const THUMBNAIL_SUBFOLDER = "dora_state_manager";
 const AUTO_STRENGTH_DEVICE_CHOICES = ["auto", "cpu", "gpu"];
+const DORA_LOADER_GLOBAL_DEFAULTS = Object.freeze({
+  stack_enabled: true,
+  verbose: false,
+  log_unloaded_keys: false,
+  broadcast_auto_scale: true,
+  broadcast_modulations: true,
+  broadcast_include_dora_scale: false,
+  broadcast_scale: 1.0,
+  dora_decompose_debug: false,
+  dora_decompose_debug_n: 30,
+  dora_decompose_debug_stack_depth: 10,
+  dora_slice_fix: true,
+  dora_adaln_swap_fix: true,
+  zimage_lumina2_compat: true,
+  auto_strength_enabled: false,
+  auto_strength_device: "gpu",
+  auto_strength_ratio_floor: 0.30,
+  auto_strength_ratio_ceiling: 1.50,
+});
 const OUTPUT_NAMES = {
   control: ["state_control"],
   // Legacy/runtime outputs remain readable for compatibility, but Save/Load connected
@@ -408,7 +427,26 @@ function normalizeLoaderGlobals(globalsIn) {
     if (Object.prototype.hasOwnProperty.call(src, key)) out[key] = normalizeBoolean(src[key]);
   }
   for (const key of ["broadcast_scale", "auto_strength_ratio_floor", "auto_strength_ratio_ceiling"]) {
-    if (Object.prototype.hasOwnProperty.call(src, key)) out[key] = normalizeNumber(src[key], key === "broadcast_scale" ? 1.0 : 0.0);
+    if (!Object.prototype.hasOwnProperty.call(src, key)) continue;
+    const fallback = key === "broadcast_scale"
+      ? DORA_LOADER_GLOBAL_DEFAULTS.broadcast_scale
+      : DORA_LOADER_GLOBAL_DEFAULTS[key];
+    const value = normalizeNumber(src[key], fallback);
+    out[key] = key === "broadcast_scale" ? value : Math.max(0, value);
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(out, "auto_strength_ratio_floor")
+    || Object.prototype.hasOwnProperty.call(out, "auto_strength_ratio_ceiling")
+  ) {
+    let floor = Object.prototype.hasOwnProperty.call(out, "auto_strength_ratio_floor")
+      ? out.auto_strength_ratio_floor
+      : DORA_LOADER_GLOBAL_DEFAULTS.auto_strength_ratio_floor;
+    let ceiling = Object.prototype.hasOwnProperty.call(out, "auto_strength_ratio_ceiling")
+      ? out.auto_strength_ratio_ceiling
+      : DORA_LOADER_GLOBAL_DEFAULTS.auto_strength_ratio_ceiling;
+    if (ceiling < floor) [floor, ceiling] = [ceiling, floor];
+    out.auto_strength_ratio_floor = floor;
+    out.auto_strength_ratio_ceiling = ceiling;
   }
   for (const key of ["dora_decompose_debug_n", "dora_decompose_debug_stack_depth"]) {
     if (Object.prototype.hasOwnProperty.call(src, key)) out[key] = Math.floor(normalizeNumber(src[key], key === "dora_decompose_debug_n" ? 30 : 10));
@@ -831,8 +869,26 @@ function refreshNodeFromLibrary(node, { status = "" } = {}) {
   scheduleRender(node);
 }
 
-function refreshAllNodesFromLibrary() {
-  for (const node of stateLibraryClient.nodes) refreshNodeFromLibrary(node);
+function refreshAllNodesFromLibrary({ syncLoaders = false, skipLoaderSyncNode = null } = {}) {
+  for (const node of stateLibraryClient.nodes) {
+    refreshNodeFromLibrary(node);
+    if (!syncLoaders || node === skipLoaderSyncNode || !node?.__dsm) continue;
+    const current = getRenderableState(node);
+    const selection = ensureSelection(node, current.state);
+    const character = selection.character;
+    if (!character || character.__dsm_ephemeral) continue;
+    syncCharacterLoaderStacksToConnectedNodes(node, character);
+  }
+}
+
+function restoreNodeAndConnectedLoadersFromLibrary(node, { status = "" } = {}) {
+  refreshNodeFromLibrary(node, { status });
+  if (!node?.__dsm) return 0;
+  const current = getRenderableState(node);
+  const selection = ensureSelection(node, current.state);
+  const character = selection.character;
+  if (!character || character.__dsm_ephemeral) return 0;
+  return syncCharacterLoaderStacksToConnectedNodes(node, character);
 }
 
 function mergeScheduledLibraryUpdate(baseCharacters, desiredCharacters, currentCharacters, { allowOverwrite = false } = {}) {
@@ -871,9 +927,7 @@ function blockLibraryWrites(status) {
   stateLibraryClient.blocked = true;
   stateLibraryClient.pending = [];
   for (const node of stateLibraryClient.nodes) {
-    const current = getRenderableState(node);
-    cacheRenderableState(node, current.state, { ...current.uiState, status });
-    scheduleRender(node);
+    restoreNodeAndConnectedLoadersFromLibrary(node, { status });
   }
 }
 
@@ -908,7 +962,7 @@ async function writePendingLibrary() {
         });
         installLibrarySnapshot(snapshot);
         stateLibraryClient.lastAppliedNode = pending.node;
-        refreshAllNodesFromLibrary();
+        refreshAllNodesFromLibrary({ syncLoaders: true, skipLoaderSyncNode: pending.node });
       } catch (error) {
         if (error.status === 409) {
           blockLibraryWrites("Library changed in another tab or State Manager. Reload the library before editing again; the stale write was rejected.");
@@ -927,7 +981,7 @@ function scheduleLibraryPersist(node, state) {
   const desiredCharacters = persistentCharacters(state);
   const canonical = canonicalJson(desiredCharacters);
   if (stateLibraryClient.blocked) {
-    refreshNodeFromLibrary(node, {
+    restoreNodeAndConnectedLoadersFromLibrary(node, {
       status: "This edit was not applied. Reload the State Manager library before editing again.",
     });
     return;
@@ -950,7 +1004,7 @@ async function reloadStateLibrary(node, { status = "Reloaded State Manager libra
   stateLibraryClient.lastAppliedNode = null;
   const snapshot = await stateLibraryRequest();
   installLibrarySnapshot(snapshot, { force: true });
-  refreshAllNodesFromLibrary();
+  refreshAllNodesFromLibrary({ syncLoaders: true });
   refreshNodeFromLibrary(node, { status });
 }
 
@@ -1039,7 +1093,7 @@ async function importStateJsonFile(node, file) {
     body: JSON.stringify(parsed),
   });
   installLibrarySnapshot(result.snapshot);
-  refreshAllNodesFromLibrary();
+  refreshAllNodesFromLibrary({ syncLoaders: true });
   const characterId = result.character?.id || result.character_ids?.[0] || "";
   if (characterId) {
     const character = stateLibraryClient.state.characters.find((item) => item.id === characterId);
@@ -1047,7 +1101,7 @@ async function importStateJsonFile(node, file) {
     setWidgetValue(widgets.characterWidget, characterId);
     setWidgetValue(widgets.promptWidget, character?.prompts?.[0]?.id || "");
   }
-  refreshNodeFromLibrary(node, { status: `Imported ${file.name || "State Manager JSON"}.` });
+  restoreNodeAndConnectedLoadersFromLibrary(node, { status: `Imported ${file.name || "State Manager JSON"}.` });
 }
 
 function getWidgets(node) {
@@ -1172,6 +1226,18 @@ function updateState(node, state, uiState, opts = {}) {
   delete node.properties.dora_state_manager;
   delete node.properties.dora_state_manager_backup_node_uid;
   cacheRenderableState(node, normalizedState, nextUiState);
+  if (opts.renameLoaderSlotFrom != null) {
+    renameConnectedLoaderSlot(
+      node,
+      character,
+      opts.renameLoaderSlotFrom,
+      opts.syncLoaderSlot ?? opts.renameLoaderSlotFrom
+    );
+  } else if (opts.syncLoaders === true) {
+    syncCharacterLoaderStacksToConnectedNodes(node, character);
+  } else if (opts.syncLoaderSlot != null) {
+    syncCharacterLoaderStacksToConnectedNodes(node, character, opts.syncLoaderSlot);
+  }
   if (opts.persist !== false) scheduleLibraryPersist(node, normalizedState);
   if (opts.dirty !== false) markNodeDirty(node);
   if (opts.render !== false) scheduleRender(node);
@@ -1226,6 +1292,18 @@ function scheduleRender(node) {
     ctx.renderFrame = 0;
     renderNode(node);
   });
+}
+
+function schedulePostLoadLoaderSync(node) {
+  const ctx = node?.__dsm;
+  if (!ctx) return false;
+  if (ctx.postLoadSyncFrame) cancelAnimationFrame(ctx.postLoadSyncFrame);
+  ctx.postLoadSyncFrame = requestAnimationFrame(() => {
+    ctx.postLoadSyncFrame = 0;
+    if (!stateLibraryClient.nodes.has(node)) return;
+    synchronizeConnectedLoadersAfterLibraryLoad(node);
+  });
+  return true;
 }
 
 function chainNodeCallback(node, name, fn) {
@@ -1410,8 +1488,7 @@ function applyLoraStackToNode(targetNode, character) {
   };
   const loaderApi = globalThis.__doraPowerLoraLoaderApi;
   if (loaderApi?.setState) {
-    loaderApi.setSlot?.(targetNode, slot);
-    return !!loaderApi.setState(targetNode, payload);
+    return !!loaderApi.setState(targetNode, payload, { notifyStateManager: false });
   }
 
   const rows = (payload.loras || []).map((row) => ({
@@ -1469,6 +1546,212 @@ function uniqueNodes(targets) {
     out.push(node);
   }
   return out;
+}
+
+function getManagedLoaderNodes(managerNode) {
+  const controlled = getControlledNodes(managerNode).filter(isDoraLoaderNode);
+  if (controlled.length) return controlled;
+  return uniqueNodes(getOutputTargets(managerNode, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
+}
+
+function pickPrimarySettingsLoaderStack(managerNode, character) {
+  const stacks = getCharacterLoaderStacks(character);
+  for (const loader of getManagedLoaderNodes(managerNode)) {
+    const slot = normalizeLoaderSlot(getDoraLoaderSlot(loader), "default");
+    const matching = stacks.find(
+      (stack) => normalizeLoaderSlot(stack?.slot, "default") === slot
+    );
+    if (matching) return matching;
+  }
+  return stacks.find((stack) => normalizeLoaderSlot(stack?.slot, "default") === "default")
+    || stacks[0]
+    || defaultLoaderStack();
+}
+
+function syncCharacterLoaderStacksToConnectedNodes(managerNode, character, slot = null) {
+  const wanted = slot == null ? null : normalizeLoaderSlot(slot, "default");
+  let changed = 0;
+  for (const loader of getManagedLoaderNodes(managerNode)) {
+    if (wanted != null && normalizeLoaderSlot(getDoraLoaderSlot(loader), "default") !== wanted) continue;
+    if (applyLoraStackToNode(loader, character)) changed += 1;
+  }
+  return changed;
+}
+
+function renameConnectedLoaderSlot(managerNode, character, fromSlot, toSlot) {
+  const from = normalizeLoaderSlot(fromSlot, "default");
+  const to = normalizeLoaderSlot(toSlot, from);
+  const loaderApi = globalThis.__doraPowerLoraLoaderApi;
+  let changed = 0;
+  for (const loader of getManagedLoaderNodes(managerNode)) {
+    if (normalizeLoaderSlot(getDoraLoaderSlot(loader), "default") !== from) continue;
+    if (loaderApi?.setSlot) {
+      loaderApi.setSlot(loader, to, { notifyStateManager: false });
+    } else {
+      loader.properties = loader.properties || {};
+      loader.properties.dora_state_slot = to;
+    }
+    if (applyLoraStackToNode(loader, character)) changed += 1;
+  }
+  return changed;
+}
+
+function syncConnectedLoaderStateIntoManager(
+  managerNode,
+  onlyLoader = null,
+  { persist = true, status = "", render = true, dirty = true, previousSlot = null } = {}
+) {
+  if (!managerNode) return 0;
+  const loaders = getManagedLoaderNodes(managerNode);
+  const current = getRenderableState(managerNode);
+  const selection = ensureSelection(managerNode, current.state);
+  let changed = 0;
+
+  let syncStatus = status;
+  for (const [index, loader] of loaders.entries()) {
+    if (onlyLoader && loader !== onlyLoader) continue;
+    const stack = extractLoraStackFromNode(loader, index);
+    if (!stack) continue;
+    let incomingNormalized = normalizeLoaderStack(stack, index);
+
+    const oldSlot = onlyLoader && previousSlot != null
+      ? normalizeLoaderSlot(previousSlot, "")
+      : "";
+    const newSlot = normalizeLoaderSlot(incomingNormalized.slot, "default");
+    if (oldSlot && oldSlot !== newSlot) {
+      const stacks = getCharacterLoaderStacks(selection.character);
+      const oldIndex = stacks.findIndex(
+        (item) => normalizeLoaderSlot(item?.slot, "default") === oldSlot
+      );
+      const targetIndex = stacks.findIndex(
+        (item) => normalizeLoaderSlot(item?.slot, "default") === newSlot
+      );
+
+      if (oldIndex >= 0 && targetIndex >= 0 && targetIndex !== oldIndex) {
+        // A loader slot is an identity key. Never silently overwrite a different
+        // saved stack when the user renames a connected loader onto an occupied slot.
+        const loaderApi = globalThis.__doraPowerLoraLoaderApi;
+        loaderApi?.setSlot?.(loader, oldSlot, { notifyStateManager: false });
+        incomingNormalized = {
+          ...incomingNormalized,
+          slot: oldSlot,
+          label: stacks[oldIndex]?.label || incomingNormalized.label || oldSlot,
+        };
+        syncStatus = `State slot "${newSlot}" already exists in this preset; kept connected loader on "${oldSlot}".`;
+      } else if (oldIndex >= 0) {
+        // Preserve stack identity across a loader-side slot rename instead of
+        // appending a second stack and leaving the old slot stale.
+        stacks[oldIndex] = incomingNormalized;
+        syncLegacyLoaderMirror(selection.character);
+        changed += 1;
+        continue;
+      }
+    }
+
+    const existing = findCharacterLoaderStack(selection.character, incomingNormalized.slot, { allowFallback: false });
+    const existingNormalized = existing ? normalizeLoaderStack(existing, index) : null;
+    if (existingNormalized && canonicalJson(existingNormalized) === canonicalJson(incomingNormalized)) continue;
+
+    if (!existing && normalizeLoaderSlot(incomingNormalized.slot, "default") !== "default") {
+      const stacks = getCharacterLoaderStacks(selection.character);
+      const soleDefault = stacks.length === 1
+        && normalizeLoaderSlot(stacks[0]?.slot, "default") === "default"
+        && !loaderStackHasMeaningfulState(stacks[0]);
+      if (soleDefault) {
+        stacks[0] = incomingNormalized;
+        syncLegacyLoaderMirror(selection.character);
+        changed += 1;
+        continue;
+      }
+    }
+
+    setCharacterLoaderStack(selection.character, incomingNormalized);
+    changed += 1;
+  }
+
+  if (changed) {
+    updateState(managerNode, current.state, current.uiState, {
+      characterId: selection.character.id,
+      promptId: selection.prompt.id,
+      persist,
+      render,
+      dirty,
+      status: syncStatus || `Synced ${changed} connected DoRA loader${changed === 1 ? "" : "s"} into this preset.`,
+    });
+  }
+  return changed;
+}
+
+function loaderStackHasMeaningfulState(stack) {
+  const normalized = normalizeLoaderStack(stack || {});
+  if ((normalized.loras || []).some((row) => row?.name && row.name !== "None")) {
+    return true;
+  }
+  const globals = normalizeLoaderGlobals(normalized.loader_globals || {});
+  for (const [key, defaultValue] of Object.entries(DORA_LOADER_GLOBAL_DEFAULTS)) {
+    const value = Object.prototype.hasOwnProperty.call(globals, key)
+      ? globals[key]
+      : defaultValue;
+    if (value !== defaultValue) return true;
+  }
+  return false;
+}
+
+function synchronizeConnectedLoadersAfterLibraryLoad(managerNode) {
+  if (!managerNode) return 0;
+  const current = getRenderableState(managerNode);
+  const selection = ensureSelection(managerNode, current.state);
+  const character = selection.character;
+  const prompt = selection.prompt;
+
+  // A durable saved preset is authoritative when its workflow binding is restored:
+  // reflect the state that will execute into the visible loader immediately.
+  if (
+    character
+    && character.id !== "default_character"
+    && !character.__dsm_ephemeral
+    && prompt
+    && !prompt.__dsm_ephemeral
+  ) {
+    return syncCharacterLoaderStacksToConnectedNodes(managerNode, character);
+  }
+
+  // The built-in default is only a placeholder and is not stored in the library.
+  // If it controls a configured loader, capture that visible state and let the normal
+  // edited-default materialization path create a durable preset. This prevents the
+  // backend's empty default stack from silently replacing the visible loader at run time.
+  if (character?.id === "default_character" && !character.__dsm_ephemeral) {
+    const hasMeaningfulLoaderState = getManagedLoaderNodes(managerNode).some((loader, index) => {
+      const stack = extractLoraStackFromNode(loader, index);
+      return stack ? loaderStackHasMeaningfulState(stack) : false;
+    });
+    return hasMeaningfulLoaderState
+      ? syncConnectedLoaderStateIntoManager(managerNode)
+      : 0;
+  }
+
+  // Missing/ephemeral selections are intentionally not allowed to rewrite either side.
+  return 0;
+}
+
+function syncLoaderStateIntoConnectedManagers(loaderNode, details = {}) {
+  if (!loaderNode) return 0;
+  let changed = 0;
+  for (const managerNode of stateLibraryClient.nodes) {
+    if (!getManagedLoaderNodes(managerNode).includes(loaderNode)) continue;
+    changed += syncConnectedLoaderStateIntoManager(managerNode, loaderNode, {
+      previousSlot: details?.previousSlot ?? null,
+    });
+  }
+  return changed;
+}
+
+function installLoaderStateSyncApi() {
+  globalThis.__doraStateManagerSyncApi = {
+    loaderStateChanged(loaderNode, details = {}) {
+      return syncLoaderStateIntoConnectedManagers(loaderNode, details);
+    },
+  };
 }
 
 function getWidgetMap(node) {
@@ -2270,7 +2553,12 @@ function renderCharacterTile(node, state, uiState, character, selectedId, select
     const promptId = nextCharacter.id === currentSelection.character.id && nextCharacter.prompts.some((item) => item.id === currentSelection.prompt.id)
       ? currentSelection.prompt.id
       : nextCharacter.prompts[0]?.id || "";
-    updateState(node, current.state, current.uiState, { characterId: nextCharacter.id, promptId, status: `Editing ${nextCharacter.name}. Use Load/Apply to push it into connected nodes.` });
+    updateState(node, current.state, current.uiState, {
+      characterId: nextCharacter.id,
+      promptId,
+      syncLoaders: true,
+      status: `Editing ${nextCharacter.name}. Connected DoRA loaders were synchronized.`,
+    });
   };
   tile.addEventListener("click", selectCharacter);
   tile.addEventListener("keydown", (event) => {
@@ -3125,7 +3413,13 @@ function renderLoraStackEditor(section, node, state, uiState, character, prompt,
     const oldSlot = stack.slot;
     stack.slot = normalizeLoaderSlot(value, oldSlot || `loader_${stackIndex + 1}`);
     if (stack.slot !== oldSlot) syncLegacyLoaderMirror(character);
-    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Renamed loader slot ${oldSlot} -> ${stack.slot}. Update the matching DoRA loader's State slot too.` });
+    updateState(node, state, uiState, {
+      characterId: character.id,
+      promptId: prompt.id,
+      renameLoaderSlotFrom: oldSlot,
+      syncLoaderSlot: stack.slot,
+      status: `Renamed loader slot ${oldSlot} -> ${stack.slot} and synchronized the matching DoRA loader.`,
+    });
   });
   const label = makeInput(stack.label, (value) => {
     stack.label = String(value || stack.slot).trim() || stack.slot;
@@ -3138,7 +3432,7 @@ function renderLoraStackEditor(section, node, state, uiState, character, prompt,
     makeButton("Add row", () => {
       stack.loras.push({ enabled: true, name: "None", strength_model: 1.0, strength_clip: 1.0 });
       syncLegacyLoaderMirror(character);
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Added LoRA row to ${stack.slot}.` });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: stack.slot, status: `Added LoRA row to ${stack.slot}.` });
     }),
     makeButton("Delete stack", () => {
       const stacks = getCharacterLoaderStacks(character);
@@ -3160,19 +3454,23 @@ function renderLoraStackEditor(section, node, state, uiState, character, prompt,
   globalsLine.append(
     labelledControl("Stack enabled", makeCheckbox(globals.stack_enabled ?? true, (checked) => {
       updateCharacterLoaderGlobals(character, stack, { stack_enabled: checked });
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: stack.slot });
     })),
     labelledControl("Auto-strength", makeCheckbox(globals.auto_strength_enabled ?? false, (checked) => {
       updateCharacterLoaderGlobals(character, stack, { auto_strength_enabled: checked });
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: stack.slot });
     })),
     labelledControl("Analysis device", makeSelect(AUTO_STRENGTH_DEVICE_CHOICES, normalizeDevice(globals.auto_strength_device ?? "gpu"), (value) => {
       updateCharacterLoaderGlobals(character, stack, { auto_strength_device: value });
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: stack.slot });
     })),
+    labelledControl("Ratio floor", makeInput(globals.auto_strength_ratio_floor ?? 0.3, (value) => {
+      updateCharacterLoaderGlobals(character, stack, { auto_strength_ratio_floor: normalizeNumber(value, 0.3) });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: stack.slot });
+    }, { type: "number", step: "0.01" })),
     labelledControl("Ratio ceiling", makeInput(globals.auto_strength_ratio_ceiling ?? 1.5, (value) => {
       updateCharacterLoaderGlobals(character, stack, { auto_strength_ratio_ceiling: normalizeNumber(value, 1.5) });
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: stack.slot });
     }, { type: "number", step: "0.01" }))
   );
   box.appendChild(globalsLine);
@@ -3190,27 +3488,27 @@ function renderLoraStackEditor(section, node, state, uiState, character, prompt,
     const enabled = makeCheckbox(row.enabled, (checked) => {
       row.enabled = checked;
       syncLegacyLoaderMirror(character);
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: stack.slot });
     });
     const name = makeInput(row.name, (value) => {
       row.name = value.trim() || "None";
       syncLegacyLoaderMirror(character);
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: stack.slot });
     });
     const sm = makeInput(row.strength_model, (value) => {
       row.strength_model = normalizeNumber(value, row.strength_model);
       syncLegacyLoaderMirror(character);
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: stack.slot });
     }, { type: "number", step: "0.05" });
     const sc = makeInput(row.strength_clip, (value) => {
       row.strength_clip = normalizeNumber(value, row.strength_clip);
       syncLegacyLoaderMirror(character);
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: stack.slot });
     }, { type: "number", step: "0.05" });
     line.append(enabled, name, sm, sc, makeButton("×", () => {
       stack.loras.splice(index, 1);
       syncLegacyLoaderMirror(character);
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Removed LoRA row from ${stack.slot}.` });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: stack.slot, status: `Removed LoRA row from ${stack.slot}.` });
     }));
     box.appendChild(line);
   });
@@ -3262,44 +3560,48 @@ function renderLoraPanelContent(section, node, state, uiState, character, prompt
 
 
 function renderSettingsPanelContent(section, node, state, uiState, character, prompt) {
-  const primaryStack = findCharacterLoaderStack(character, "default") || getCharacterLoaderStacks(character)[0];
+  const primaryStack = pickPrimarySettingsLoaderStack(node, character);
   const globals = primaryStack.loader_globals || (primaryStack.loader_globals = {});
+  const loaderSettingsNote = document.createElement("div");
+  loaderSettingsNote.className = "dsm-muted";
+  loaderSettingsNote.textContent = `Loader settings shown for State slot: ${primaryStack.slot}`;
   const grid = document.createElement("div");
   grid.className = "dsm-grid2";
 
   const stackEnabled = makeCheckbox(globals.stack_enabled ?? true, (checked) => {
     updateCharacterLoaderGlobals(character, primaryStack, { stack_enabled: checked });
-    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: primaryStack.slot });
   });
   const autoStrength = makeCheckbox(globals.auto_strength_enabled ?? false, (checked) => {
     updateCharacterLoaderGlobals(character, primaryStack, { auto_strength_enabled: checked });
-    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: primaryStack.slot });
   });
   const device = makeSelect(AUTO_STRENGTH_DEVICE_CHOICES, normalizeDevice(globals.auto_strength_device ?? "gpu"), (value) => {
     updateCharacterLoaderGlobals(character, primaryStack, { auto_strength_device: value });
-    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: primaryStack.slot });
   });
   const broadcastMods = makeCheckbox(globals.broadcast_modulations ?? true, (checked) => {
     updateCharacterLoaderGlobals(character, primaryStack, { broadcast_modulations: checked });
-    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: primaryStack.slot });
   });
   const floor = makeInput(globals.auto_strength_ratio_floor ?? 0.3, (value) => {
     updateCharacterLoaderGlobals(character, primaryStack, { auto_strength_ratio_floor: normalizeNumber(value, 0.3) });
-    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: primaryStack.slot });
   }, { type: "number", step: "0.01" });
   const ceiling = makeInput(globals.auto_strength_ratio_ceiling ?? 1.5, (value) => {
     updateCharacterLoaderGlobals(character, primaryStack, { auto_strength_ratio_ceiling: normalizeNumber(value, 1.5) });
-    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: primaryStack.slot });
   }, { type: "number", step: "0.01" });
   const sliceFix = makeCheckbox(globals.dora_slice_fix ?? true, (checked) => {
     updateCharacterLoaderGlobals(character, primaryStack, { dora_slice_fix: checked });
-    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: primaryStack.slot });
   });
   const adalnFix = makeCheckbox(globals.dora_adaln_swap_fix ?? true, (checked) => {
     updateCharacterLoaderGlobals(character, primaryStack, { dora_adaln_swap_fix: checked });
-    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
+    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, syncLoaderSlot: primaryStack.slot });
   });
 
+  section.appendChild(loaderSettingsNote);
   grid.append(
     labelledControl("Stack enabled", stackEnabled),
     labelledControl("Auto-strength", autoStrength),
@@ -3660,7 +3962,10 @@ function initializeNode(node, widget) {
     const promptId = String(widgetValue(currentWidgets.promptWidget, "") || "");
     try {
       const loaded = await initializeStateLibrary(node, legacy, characterId, promptId, token);
-      if (loaded) delete node.__dsmPendingLegacyState;
+      if (loaded) {
+        delete node.__dsmPendingLegacyState;
+        schedulePostLoadLoaderSync(node);
+      }
     } catch (err) {
       if (node.__dsmLibraryLoadToken !== token) return;
       const fallback = stateViewForSelection(characterId, promptId);
@@ -3686,9 +3991,15 @@ function initializeNode(node, widget) {
   chainNodeCallback(node, "onRemoved", function () {
     stateLibraryClient.nodes.delete(node);
     const ctx = node.__dsm;
-    if (!ctx?.renderFrame) return;
-    cancelAnimationFrame(ctx.renderFrame);
-    ctx.renderFrame = 0;
+    if (!ctx) return;
+    if (ctx.renderFrame) {
+      cancelAnimationFrame(ctx.renderFrame);
+      ctx.renderFrame = 0;
+    }
+    if (ctx.postLoadSyncFrame) {
+      cancelAnimationFrame(ctx.postLoadSyncFrame);
+      ctx.postLoadSyncFrame = 0;
+    }
   });
 
   scheduleRender(node);
@@ -4406,6 +4717,8 @@ function maybeInjectWidgetInput(nodeData) {
   nodeData.input.required = { ...required, [CUSTOM_WIDGET_INPUT]: [CUSTOM_WIDGET_TYPE, {}] };
 }
 
+installLoaderStateSyncApi();
+
 app.registerExtension({
   name: EXT_NAME,
 
@@ -4418,6 +4731,7 @@ app.registerExtension({
         node.__dsm = {
           root,
           renderFrame: 0,
+          postLoadSyncFrame: 0,
           state: null,
           uiState: null,
           libraryMode: "presets",
