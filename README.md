@@ -71,7 +71,8 @@ This node includes optional **auto-strength** redistribution for loaded LoRAs / 
 When enabled, the loader:
 
 - measures a comparable per-base update magnitude
-- computes a per-base target relative to the mean of similar mapped destinations
+- groups repeated transformer projections by mapped destination role, exact tensor shape, and slice identity
+- detects isolated per-base magnitude anomalies against comparable logical sources
 - converts those absolute targets into **redistribution ratios**
 - bakes only that **ratio** into the LoRA tensors before loading
 
@@ -92,13 +93,32 @@ then enabling auto-strength is a true no-op.
 
 ### Current auto-strength behavior
 
-- compares mapped bases using a normalized magnitude score
+- scores ordinary LoRA with absolute `RMS(ΔW)` after LoRA alpha/rank scaling
+- scores DoRA with the RMS of its actual post-normalization weight update
+- keeps model and CLIP, tensor families, repeated-block projection roles, tensor shapes, and sliced destinations in separate cohorts
+- infers projection roles structurally from mapped destination paths such as repeated `blocks` / `layers` containers; it does not contain a MiniMax-H3 projection-name table
+- leaves unclassifiable linear destinations at their normal global strength instead of pooling unrelated linear layers
+- requires at least five measured logical sources before a linear role cohort can correct anomalies
+- models repeated-block linear roles in log space with a log-median center and MAD-based robust dispersion
+- leaves members inside that expected distribution at ratio `1.0`; the cohort center is not an automatic target
+- suppresses correction when more than one candidate is detected, preserving coherent depth-dependent or multimodal regimes
+- preserves the existing arithmetic-mean reference for non-linear tensor families such as convolution cohorts
 - keeps Flux / Flux2 compat-broadcasted logical sources from being over-counted during measurement
 - preserves the normal outer patch strength during final application
 - is intended to redistribute relative base strength, not replace the row's overall weight
 - `auto` resolves to CPU-safe analysis
 - `gpu` is the explicit accelerator path
 - default node UI state is `gpu`
+
+Ordinary LoRA scoring deliberately remains independent of the destination weight's
+numeric values. A base-relative score such as `RMS(ΔW) / RMS(W0)` would make the same
+LoRA redistribute differently across base checkpoints and can make quantized storage
+representations part of the result. Role-aware cohorts address the cross-projection
+scale problem, while the outlier gate preserves ordinary within-role variation and
+checkpoint-independent standard-LoRA analysis. DoRA is
+the exception because its update is defined by normalization against the live effective
+destination weight; its existing post-normalization measurement therefore remains
+base-dependent by design.
 
 ### Performance note
 

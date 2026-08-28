@@ -1478,7 +1478,13 @@ class DoraAutoStrengthReportWidget {
       ctx.fillText(fitText(ctx, topLine, cardWidth - 24), x + 12, y + 48);
 
       const cohortNames = Array.isArray(row.report?.cohorts)
-        ? row.report.cohorts.map((cohort) => `${cohort.group}/${cohort.family}`).join("  ·  ")
+        ? row.report.cohorts
+            .map((cohort) => {
+              const name = `${cohort.group}/${cohort.family}/${cohort.semantic_role || "unclassified"}`;
+              if (cohort.family !== "linear") return name;
+              return `${name} ${cohort.corrected_logical_count || 0}/${cohort.outlier_candidate_count || 0} corrected`;
+            })
+            .join("  ·  ")
         : "";
       ctx.fillText(fitText(ctx, cohortNames, cardWidth - 24), x + 12, y + 66);
 
