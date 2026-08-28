@@ -520,8 +520,19 @@ def test_same_named_roles_with_different_shapes_do_not_share_a_cohort(dora_modul
 
     targets, report = _analyze(nodes, lora_sd, key_map, model_state)
 
-    assert targets["shape_0"] == pytest.approx(5.0)
-    assert all(targets[f"shape_{block}"] == pytest.approx(1.0) for block in range(1, 10))
+    family_reference = (0.2 + 4 * 1.0 + 5 * 1.0) / 10.0
+    small_shape_gain = family_reference / ((0.2 + 4.0) / 5.0)
+    large_shape_gain = family_reference / 1.0
+
+    assert targets["shape_0"] == pytest.approx(small_shape_gain * 5.0)
+    assert all(
+        targets[f"shape_{block}"] == pytest.approx(small_shape_gain)
+        for block in range(1, 5)
+    )
+    assert all(
+        targets[f"shape_{block}"] == pytest.approx(large_shape_gain)
+        for block in range(5, 10)
+    )
     assert {cohort["destination_shape"] for cohort in report["cohorts"]} == {"2x2", "3x3"}
     assert len(report["cohorts"]) == 2
 
