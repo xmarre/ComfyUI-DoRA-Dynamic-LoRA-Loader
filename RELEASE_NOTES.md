@@ -1,3 +1,31 @@
+# DoRA Dynamic LoRA Loader v1.0.45
+
+This release fixes split state between the State Manager and connected DoRA Power LoRA Loader nodes so the visible loader configuration, saved preset, and runtime state remain consistent.
+
+## Bidirectional State Manager / loader synchronization
+
+- Synchronizes loader-owned edits back into the selected State Manager loader stack, including LoRA rows, model/CLIP strengths, Auto-strength, analysis device, ratio bounds, and persisted loader globals.
+- Pushes State Manager loader edits and character/preset changes into connected loaders immediately instead of leaving the visible loader stale until execution.
+- Restores connected loader state after persistent-library refreshes, imports, and write rollbacks.
+- Uses the actually connected loader State slot in the State Manager settings panel instead of an unrelated empty `default` stack.
+- Exposes both Auto-strength ratio floor and ceiling for each managed loader stack and normalizes their bounds with the same semantics as the loader.
+- Preserves State-slot identity across renames and rejects collisions without overwriting another saved stack.
+- On workflow load, keeps durable saved presets authoritative while preserving a configured loader when the State Manager is still on its unsaved default placeholder.
+
+## Synchronization hardening
+
+- Suppresses reverse notifications for State Manager-originated loader updates to prevent feedback loops.
+- Coalesces continuous loader edits with a short trailing debounce so weight dragging does not generate a burst of persistent-library writes.
+- Keeps State-slot changes immediate so identity changes are not delayed behind the debounce.
+- Tracks and cancels deferred post-load loader synchronization when a State Manager node is removed.
+- Removes a dead slot-realignment branch found during review and adds regression coverage for the corrected lifecycle and synchronization paths.
+
+## Validation
+
+- Frontend/package regression suite passes.
+- Compatibility and runtime-bypass suites pass against pinned ComfyUI v0.29.2, v0.30.2, v0.31.1, and the 2026-08-21 revision.
+- Existing workflows keep the same node and persisted state formats; no workflow migration is required.
+
 # DoRA Dynamic LoRA Loader v1.0.44
 
 This hotfix restores LoRA-row interaction on current ComfyUI frontend main when the displayed rows survive a dynamic loader rebuild.
