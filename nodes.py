@@ -495,6 +495,7 @@ _DORA_STATE_LOADER_GLOBAL_KEYS: Set[str] = {
     "auto_strength_device",
     "auto_strength_ratio_floor",
     "auto_strength_ratio_ceiling",
+    "auto_strength_residual_beta",
 }
 
 
@@ -1927,6 +1928,7 @@ _AUTO_STRENGTH_LINEAR_MIN_SAMPLE = 5
 _AUTO_STRENGTH_LINEAR_ROLE_MIN_SAMPLE = 2
 _AUTO_STRENGTH_LINEAR_DEPTH_MIN_SAMPLE = 5
 _AUTO_STRENGTH_LINEAR_DEPTH_WINDOW = 7
+_AUTO_STRENGTH_LINEAR_RESIDUAL_BETA = 0.50
 _AUTO_STRENGTH_LINEAR_MAD_Z = 3.5
 _AUTO_STRENGTH_LINEAR_MIN_FACTOR = 1.5
 _AUTO_STRENGTH_LINEAR_MAX_CANDIDATES = 1
@@ -3915,6 +3917,7 @@ def _auto_strength_analyze_base_targets(
     strength_clip: float,
     ratio_floor: float,
     ratio_ceiling: float,
+    residual_beta: float = _AUTO_STRENGTH_LINEAR_RESIDUAL_BETA,
     logical_groups: Optional[Dict[str, Tuple[str, float]]] = None,
     verbose: bool = False,
     current_model: Any = None,
@@ -3938,6 +3941,10 @@ def _auto_strength_analyze_base_targets(
     """
     ratio_floor = max(0.0, float(ratio_floor))
     ratio_ceiling = max(ratio_floor, float(ratio_ceiling))
+    try:
+        residual_beta = max(0.0, min(1.0, float(residual_beta)))
+    except Exception:
+        residual_beta = _AUTO_STRENGTH_LINEAR_RESIDUAL_BETA
     logical_groups = logical_groups or {}
 
     grouped_norms: Dict[Tuple[str, str, str], Dict[str, List[float]]] = {}
@@ -4212,16 +4219,30 @@ def _auto_strength_analyze_base_targets(
             ):
                 base_gain = float(family_reference / depth_reference)
 
-            anomaly_gain = 1.0
             model = cohort_models.get(cohort, {})
             correction_reference = depth_reference or cohort_anomaly_references.get(cohort)
+            residual_gain = 1.0
             if (
+                depth_reference is not None
+                and depth_reference > _AUTO_STRENGTH_EPS
+            ):
+                residual_exponent = (
+                    1.0
+                    if logical_id in model.get("candidate_ids", set())
+                    else residual_beta
+                )
+                residual_gain = float(
+                    math.exp(
+                        math.log(depth_reference / norm) * residual_exponent
+                    )
+                )
+            elif (
                 logical_id in model.get("candidate_ids", set())
                 and correction_reference is not None
                 and correction_reference > _AUTO_STRENGTH_EPS
             ):
-                anomaly_gain = float(correction_reference / norm)
-            ratio = float(base_gain * anomaly_gain)
+                residual_gain = float(correction_reference / norm)
+            ratio = float(base_gain * residual_gain)
         else:
             reference = cohort_anomaly_references.get(cohort)
             model = cohort_models.get(cohort, {})
@@ -4337,6 +4358,7 @@ def _auto_strength_analyze_base_targets(
                 "depth_profile_fallback_reason": depth_model.get("fallback_reason") if is_linear else None,
                 "depth_gain_min_raw": _auto_strength_safe_number(min(depth_gains)) if depth_gains else None,
                 "depth_gain_max_raw": _auto_strength_safe_number(max(depth_gains)) if depth_gains else None,
+                "residual_beta": residual_beta if is_linear else None,
                 "role_gain_at_bounds": (
                     _auto_strength_safe_number(max(ratio_floor, min(ratio_ceiling, role_gain)))
                     if role_gain is not None
@@ -4376,8 +4398,19 @@ def _auto_strength_analyze_base_targets(
         ):
             depth_gain_raw = float(family_reference / depth_reference)
 
+        direct_family_gain_raw = None
+        if (
+            family == "linear"
+            and logical_norm is not None
+            and family_reference is not None
+            and logical_norm > _AUTO_STRENGTH_EPS
+        ):
+            direct_family_gain_raw = float(family_reference / logical_norm)
+
         ratio_raw = None
         ratio_applied = None
+        residual_gain_raw = None
+        residual_exponent_applied = None
         anomaly_gain_raw = None
         decision_reason = None
         fallback_reason = None
@@ -4390,41 +4423,62 @@ def _auto_strength_analyze_base_targets(
                 fallback_reason = cohort_role_gain_reasons.get(cohort) or "role_redistribution_unavailable"
             else:
                 base_gain = depth_gain_raw if depth_gain_raw is not None else role_gain
-                anomaly_gain_raw = 1.0
                 correction_reference = depth_reference or anomaly_reference
+                isolated_candidate = logical_id in model.get("candidate_ids", set())
+                residual_gain_raw = 1.0
+                residual_exponent_applied = 0.0
+                anomaly_gain_raw = 1.0
+
                 if (
-                    logical_id in model.get("candidate_ids", set())
+                    depth_reference is not None
+                    and depth_reference > _AUTO_STRENGTH_EPS
+                ):
+                    residual_exponent_applied = 1.0 if isolated_candidate else residual_beta
+                    residual_gain_raw = float(
+                        math.exp(
+                            math.log(depth_reference / logical_norm)
+                            * residual_exponent_applied
+                        )
+                    )
+                    if isolated_candidate:
+                        anomaly_gain_raw = float(depth_reference / logical_norm)
+                elif (
+                    isolated_candidate
                     and correction_reference is not None
                     and correction_reference > _AUTO_STRENGTH_EPS
                 ):
-                    anomaly_gain_raw = float(correction_reference / logical_norm)
+                    residual_exponent_applied = 1.0
+                    residual_gain_raw = float(correction_reference / logical_norm)
+                    anomaly_gain_raw = residual_gain_raw
+
+                if isolated_candidate:
                     decision_reason = (
-                        "depth_profile_redistribution_plus_outlier_correction"
+                        "depth_profile_hybrid_plus_outlier_correction"
                         if depth_gain_raw is not None
                         else "role_redistribution_plus_outlier_correction"
                     )
                 elif logical_id in model.get("detected_candidate_ids", set()):
                     decision_reason = (
-                        "depth_profile_redistribution_anomaly_suppressed_candidate"
+                        "depth_profile_hybrid_anomaly_suppressed_candidate"
                         if depth_gain_raw is not None
                         else "role_redistribution_anomaly_suppressed_candidate"
                     )
                 elif model.get("fallback_reason") == "multiple_outlier_candidates":
                     decision_reason = (
-                        "depth_profile_redistribution_anomaly_suppressed"
+                        "depth_profile_hybrid_anomaly_suppressed"
                         if depth_gain_raw is not None
                         else "role_redistribution_anomaly_suppressed"
                     )
                 else:
                     decision_reason = (
-                        "depth_profile_redistribution"
+                        "depth_profile_hybrid_redistribution"
                         if depth_gain_raw is not None
                         else "role_redistribution"
                     )
 
                 if not bool(model.get("eligible")):
                     anomaly_fallback_reason = model.get("fallback_reason")
-                ratio_raw = float(base_gain * anomaly_gain_raw)
+                ratio_raw = float(base_gain * residual_gain_raw)
                 ratio_applied = float(max(ratio_floor, min(ratio_ceiling, ratio_raw)))
         else:
             if (
@@ -4476,6 +4530,10 @@ def _auto_strength_analyze_base_targets(
                     "role_gain_raw": _auto_strength_safe_number(role_gain),
                     "depth_reference_score": _auto_strength_safe_number(depth_reference),
                     "depth_gain_raw": _auto_strength_safe_number(depth_gain_raw),
+                    "direct_family_gain_raw": _auto_strength_safe_number(direct_family_gain_raw),
+                    "residual_beta": residual_beta if family == "linear" else None,
+                    "residual_exponent_applied": _auto_strength_safe_number(residual_exponent_applied),
+                    "residual_gain_raw": _auto_strength_safe_number(residual_gain_raw),
                     "anomaly_gain_raw": _auto_strength_safe_number(anomaly_gain_raw),
                     "ratio_applied": _auto_strength_safe_number(base_ratio),
                     "target_strength": base_target,
@@ -4553,6 +4611,10 @@ def _auto_strength_analyze_base_targets(
                 "role_gain_raw": _auto_strength_safe_number(role_gain),
                 "depth_reference_score": _auto_strength_safe_number(depth_reference),
                 "depth_gain_raw": _auto_strength_safe_number(depth_gain_raw),
+                "direct_family_gain_raw": _auto_strength_safe_number(direct_family_gain_raw),
+                "residual_beta": residual_beta if family == "linear" else None,
+                "residual_exponent_applied": _auto_strength_safe_number(residual_exponent_applied),
+                "residual_gain_raw": _auto_strength_safe_number(residual_gain_raw),
                 "anomaly_gain_raw": _auto_strength_safe_number(anomaly_gain_raw),
                 "log_deviation": _auto_strength_safe_number(log_deviation),
                 "robust_z": _auto_strength_safe_number(robust_z),
@@ -4617,7 +4679,11 @@ def _auto_strength_analyze_base_targets(
             "window_size": _AUTO_STRENGTH_LINEAR_DEPTH_WINDOW,
             "local_reference": "centered_moving_log_median",
             "gain": "family_reference_divided_by_local_depth_reference",
-            "preserves_local_residual_structure": True,
+            "residual_beta": residual_beta,
+            "residual_gain": "(local_depth_reference_divided_by_layer_score)_to_residual_beta",
+            "isolated_outlier_residual_exponent": 1.0,
+            "endpoint_beta_0": "local_depth_only",
+            "endpoint_beta_1": "direct_family_per_layer",
         },
         "linear_outlier_policy": {
             "minimum_sample": _AUTO_STRENGTH_LINEAR_MIN_SAMPLE,
@@ -4625,12 +4691,13 @@ def _auto_strength_analyze_base_targets(
             "minimum_deviation_factor": _AUTO_STRENGTH_LINEAR_MIN_FACTOR,
             "maximum_candidates": _AUTO_STRENGTH_LINEAR_MAX_CANDIDATES,
             "correction_target": "cohort_log_median",
-            "composition": "depth_or_role_gain_times_outlier_gain",
+            "composition": "depth_or_role_gain_times_residual_gain; isolated outliers promote residual exponent to 1",
         },
         "strength_model": float(strength_model),
         "strength_clip": float(strength_clip),
         "ratio_floor": ratio_floor,
         "ratio_ceiling": ratio_ceiling,
+        "residual_beta": residual_beta,
         "mapped_bases": total,
         "analyzable_bases": analyzable,
         "measured_bases": measured,
@@ -4706,7 +4773,7 @@ def _auto_strength_analyze_base_targets(
             }
 
         _LOG.info(
-            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (%s/%s logical groups) (scoring=absolute_update_rms linear_policy=family_local_depth_log_median_plus_single_outlier_gate family_references=%s cohorts=%s ratio_floor=%s ratio_ceiling=%s)",
+            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (%s/%s logical groups) (scoring=absolute_update_rms linear_policy=family_local_depth_plus_log_residual_hybrid family_references=%s cohorts=%s ratio_floor=%s ratio_ceiling=%s residual_beta=%s)",
             measured,
             total,
             measured_logical,
@@ -4715,10 +4782,11 @@ def _auto_strength_analyze_base_targets(
             cohort_summary,
             ratio_floor,
             ratio_ceiling,
+            residual_beta,
         )
         for item in logical_reports[:20]:
             _LOG.info(
-                "[DoRA Power LoRA Loader] auto-strength: logical=%s group=%s family=%s role=%s block=%s fanout=%s update_rms=%s role_reference=%s family_reference=%s role_gain=%s depth_reference=%s depth_gain=%s anomaly_gain=%s robust_z=%s outlier=%s corrected=%s ratio_raw=%s ratio_applied=%s target=%s decision=%s fallback=%s anomaly_fallback=%s",
+                "[DoRA Power LoRA Loader] auto-strength: logical=%s group=%s family=%s role=%s block=%s fanout=%s update_rms=%s role_reference=%s family_reference=%s role_gain=%s depth_reference=%s depth_gain=%s direct_gain=%s residual_beta=%s residual_exp=%s residual_gain=%s anomaly_gain=%s robust_z=%s outlier=%s corrected=%s ratio_raw=%s ratio_applied=%s target=%s decision=%s fallback=%s anomaly_fallback=%s",
                 item.get("logical_id"),
                 item.get("group"),
                 item.get("family"),
@@ -4731,6 +4799,10 @@ def _auto_strength_analyze_base_targets(
                 item.get("role_gain_raw"),
                 item.get("depth_reference_score"),
                 item.get("depth_gain_raw"),
+                item.get("direct_family_gain_raw"),
+                item.get("residual_beta"),
+                item.get("residual_exponent_applied"),
+                item.get("residual_gain_raw"),
                 item.get("anomaly_gain_raw"),
                 item.get("robust_z"),
                 item.get("outlier_candidate"),
@@ -4758,6 +4830,7 @@ def _auto_strength_compute_base_targets(
     strength_clip: float,
     ratio_floor: float,
     ratio_ceiling: float,
+    residual_beta: float = _AUTO_STRENGTH_LINEAR_RESIDUAL_BETA,
     logical_groups: Optional[Dict[str, Tuple[str, float]]] = None,
     verbose: bool = False,
     current_model: Any = None,
@@ -4775,6 +4848,7 @@ def _auto_strength_compute_base_targets(
         strength_clip=strength_clip,
         ratio_floor=ratio_floor,
         ratio_ceiling=ratio_ceiling,
+        residual_beta=residual_beta,
         logical_groups=logical_groups,
         verbose=verbose,
         current_model=current_model,
@@ -5996,6 +6070,7 @@ class DoraPowerLoraLoader:
                     "auto_strength_device": (["auto", "cpu", "gpu"], {"default": "gpu"}),
                     "auto_strength_ratio_floor": ("FLOAT", {"default": _AUTO_STRENGTH_RATIO_FLOOR, "min": 0.0, "max": 16.0, "step": 0.01}),
                     "auto_strength_ratio_ceiling": ("FLOAT", {"default": _AUTO_STRENGTH_RATIO_CEILING, "min": 0.0, "max": 16.0, "step": 0.01}),
+                    "auto_strength_residual_beta": ("FLOAT", {"default": _AUTO_STRENGTH_LINEAR_RESIDUAL_BETA, "min": 0.0, "max": 1.0, "step": 0.05}),
                 },
             ),
             "hidden": {},
@@ -6036,6 +6111,7 @@ class DoraPowerLoraLoader:
         auto_strength_device: str,
         auto_strength_ratio_floor: float,
         auto_strength_ratio_ceiling: float,
+        auto_strength_residual_beta: float,
     ):
         auto_strength_report: Optional[Dict[str, Any]] = None
         lora_path = folder_paths.get_full_path("loras", lora_name)
@@ -6202,6 +6278,7 @@ class DoraPowerLoraLoader:
                 strength_clip=strength_clip,
                 ratio_floor=auto_strength_ratio_floor,
                 ratio_ceiling=auto_strength_ratio_ceiling,
+                residual_beta=auto_strength_residual_beta,
                 logical_groups=auto_strength_logical_groups,
                 verbose=verbose,
                 current_model=model,
@@ -6318,6 +6395,18 @@ class DoraPowerLoraLoader:
             auto_strength_ratio_ceiling = _AUTO_STRENGTH_RATIO_CEILING
         if auto_strength_ratio_ceiling < auto_strength_ratio_floor:
             auto_strength_ratio_floor, auto_strength_ratio_ceiling = auto_strength_ratio_ceiling, auto_strength_ratio_floor
+        try:
+            auto_strength_residual_beta = float(
+                _state_payload_get_loader_global(
+                    state_payload,
+                    "auto_strength_residual_beta",
+                    kwargs.get("auto_strength_residual_beta", _AUTO_STRENGTH_LINEAR_RESIDUAL_BETA),
+                    state_slot,
+                )
+            )
+        except Exception:
+            auto_strength_residual_beta = _AUTO_STRENGTH_LINEAR_RESIDUAL_BETA
+        auto_strength_residual_beta = max(0.0, min(1.0, auto_strength_residual_beta))
 
         _set_dora_decomp_cfg(
             dbg=dora_dbg,
@@ -6351,6 +6440,7 @@ class DoraPowerLoraLoader:
             "auto_strength_device": auto_strength_device,
             "auto_strength_ratio_floor": auto_strength_ratio_floor,
             "auto_strength_ratio_ceiling": auto_strength_ratio_ceiling,
+            "auto_strength_residual_beta": auto_strength_residual_beta,
         }
         lora_stack_payload = _build_lora_stack_payload(entries, loader_globals_payload, state_slot)
 
@@ -6362,6 +6452,7 @@ class DoraPowerLoraLoader:
                 "auto_strength_device": auto_strength_device,
                 "ratio_floor": auto_strength_ratio_floor,
                 "ratio_ceiling": auto_strength_ratio_ceiling,
+                "residual_beta": auto_strength_residual_beta,
                 "rows": report_rows,
             }
             report_json = _auto_strength_json_dumps(stack_report, pretty=True)
@@ -6382,6 +6473,7 @@ class DoraPowerLoraLoader:
                 "auto_strength_device": auto_strength_device,
                 "ratio_floor": auto_strength_ratio_floor,
                 "ratio_ceiling": auto_strength_ratio_ceiling,
+                "residual_beta": auto_strength_residual_beta,
                 "rows": report_rows,
             }
             report_json = _auto_strength_json_dumps(stack_report, pretty=True)
@@ -6478,6 +6570,7 @@ class DoraPowerLoraLoader:
                 auto_strength_device=auto_strength_device,
                 auto_strength_ratio_floor=auto_strength_ratio_floor,
                 auto_strength_ratio_ceiling=auto_strength_ratio_ceiling,
+                auto_strength_residual_beta=auto_strength_residual_beta,
             )
             did_analyze = isinstance(auto_strength_report, dict)
             if did_analyze:
@@ -6506,6 +6599,7 @@ class DoraPowerLoraLoader:
             "auto_strength_device": auto_strength_device,
             "ratio_floor": auto_strength_ratio_floor,
             "ratio_ceiling": auto_strength_ratio_ceiling,
+            "residual_beta": auto_strength_residual_beta,
             "rows": report_rows,
         }
         report_json = _auto_strength_json_dumps(stack_report, pretty=True)

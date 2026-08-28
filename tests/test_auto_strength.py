@@ -30,6 +30,7 @@ def _analyze(
     strength_clip=1.0,
     ratio_floor=0.1,
     ratio_ceiling=10.0,
+    residual_beta=0.0,
     logical_groups=None,
 ):
     return nodes._auto_strength_analyze_base_targets(
@@ -44,6 +45,7 @@ def _analyze(
         strength_clip=strength_clip,
         ratio_floor=ratio_floor,
         ratio_ceiling=ratio_ceiling,
+        residual_beta=residual_beta,
         logical_groups=logical_groups,
     )
 
@@ -99,6 +101,121 @@ def test_minimax_projection_regimes_are_redistributed_by_uniform_role_gain(dora_
         assert cohort["role_gain_raw"] == pytest.approx(expected_gains[cohort["semantic_role"]])
         assert cohort["family_reference_score"] == pytest.approx(expected_family_reference)
 
+
+
+def test_residual_beta_endpoints_and_log_midpoint(dora_modules):
+    nodes, _ = dora_modules
+    lora_sd = {}
+    key_map = {}
+    model_state = {}
+
+    # Seven points keep the local reference stable at 1.0 for the center block,
+    # while the center layer itself is 0.25.
+    magnitudes = (1.0, 1.0, 1.0, 0.25, 1.0, 1.0, 1.0)
+    for block, magnitude in enumerate(magnitudes):
+        _add_linear(
+            lora_sd,
+            key_map,
+            model_state,
+            f"block_{block}",
+            f"diffusion_model.blocks.{block}.mlp.fc2.weight",
+            magnitude,
+        )
+
+    family_reference = sum(magnitudes) / len(magnitudes)
+    center = "block_3"
+    local_only, local_report = _analyze(
+        nodes, lora_sd, key_map, model_state, residual_beta=0.0
+    )
+    hybrid, hybrid_report = _analyze(
+        nodes, lora_sd, key_map, model_state, residual_beta=0.5
+    )
+    direct, direct_report = _analyze(
+        nodes, lora_sd, key_map, model_state, residual_beta=1.0
+    )
+
+    # The center is the cohort's single statistical outlier, so it is deliberately
+    # promoted to full residual correction at every beta.
+    assert local_only[center] == pytest.approx(family_reference / 0.25)
+    assert hybrid[center] == pytest.approx(family_reference / 0.25)
+    assert direct[center] == pytest.approx(family_reference / 0.25)
+    assert _logical_report(hybrid_report, center)["residual_exponent_applied"] == pytest.approx(1.0)
+
+    # A non-outlier layer with score 1.0 has no residual and therefore stays at the
+    # local depth gain for all beta values.
+    for report in (local_report, hybrid_report, direct_report):
+        item = _logical_report(report, "block_2")
+        assert item["residual_gain_raw"] == pytest.approx(1.0)
+
+
+def test_residual_beta_partially_restores_non_outlier_per_layer_correction(dora_modules):
+    nodes, _ = dora_modules
+    lora_sd = {}
+    key_map = {}
+    model_state = {}
+
+    # Smooth local variation: block 3 is not an outlier, local median is 1.0, and
+    # the direct old-style gain differs from the local-depth gain.
+    magnitudes = (0.8, 0.9, 1.0, 0.7, 1.0, 1.1, 1.2)
+    for block, magnitude in enumerate(magnitudes):
+        _add_linear(
+            lora_sd,
+            key_map,
+            model_state,
+            f"block_{block}",
+            f"diffusion_model.blocks.{block}.mlp.fc2.weight",
+            magnitude,
+        )
+
+    family_reference = sum(magnitudes) / len(magnitudes)
+    local_gain = family_reference / 1.0
+    direct_gain = family_reference / 0.7
+
+    local, _ = _analyze(nodes, lora_sd, key_map, model_state, residual_beta=0.0)
+    half, half_report = _analyze(nodes, lora_sd, key_map, model_state, residual_beta=0.5)
+    direct, _ = _analyze(nodes, lora_sd, key_map, model_state, residual_beta=1.0)
+
+    expected_half = local_gain * math.sqrt(1.0 / 0.7)
+    assert local["block_3"] == pytest.approx(local_gain)
+    assert half["block_3"] == pytest.approx(expected_half)
+    assert direct["block_3"] == pytest.approx(direct_gain)
+    item = _logical_report(half_report, "block_3")
+    assert item["residual_beta"] == pytest.approx(0.5)
+    assert item["residual_exponent_applied"] == pytest.approx(0.5)
+    assert item["residual_gain_raw"] == pytest.approx(math.sqrt(1.0 / 0.7))
+    assert item["direct_family_gain_raw"] == pytest.approx(direct_gain)
+
+
+def test_analyzer_default_residual_beta_is_half(dora_modules):
+    nodes, _ = dora_modules
+    lora_sd = {}
+    key_map = {}
+    model_state = {}
+    for block, magnitude in enumerate((0.8, 0.9, 1.0, 0.7, 1.0, 1.1, 1.2)):
+        _add_linear(
+            lora_sd,
+            key_map,
+            model_state,
+            f"block_{block}",
+            f"diffusion_model.blocks.{block}.mlp.fc2.weight",
+            magnitude,
+        )
+
+    _, report = nodes._auto_strength_analyze_base_targets(
+        lora_sd=lora_sd,
+        lora_bases=sorted(nodes._extract_lora_bases(lora_sd)),
+        key_map=key_map,
+        model_state_dict=model_state,
+        clip_state_dict=None,
+        analysis_device_mode="cpu",
+        analysis_load_device=None,
+        strength_model=1.0,
+        strength_clip=1.0,
+        ratio_floor=0.1,
+        ratio_ceiling=10.0,
+    )
+    assert report["residual_beta"] == pytest.approx(0.5)
+    assert report["linear_depth_redistribution_policy"]["residual_beta"] == pytest.approx(0.5)
 
 
 def test_h3_like_weak_fc2_depth_region_recovers_large_boosts(dora_modules):

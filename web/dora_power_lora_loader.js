@@ -584,6 +584,7 @@ function defaultState() {
       auto_strength_device: "gpu",
       auto_strength_ratio_floor: 0.30,
       auto_strength_ratio_ceiling: 1.50,
+      auto_strength_residual_beta: 0.50,
       dora_decompose_debug: false,
       dora_decompose_debug_n: 30,
       dora_decompose_debug_stack_depth: 10,
@@ -627,6 +628,9 @@ function sanitizeState(st) {
     auto_strength_ratio_ceiling: Number.isFinite(+globalsIn.auto_strength_ratio_ceiling)
       ? Math.max(0, +globalsIn.auto_strength_ratio_ceiling)
       : 1.50,
+    auto_strength_residual_beta: Number.isFinite(+globalsIn.auto_strength_residual_beta)
+      ? Math.max(0, Math.min(1, +globalsIn.auto_strength_residual_beta))
+      : 0.50,
     dora_decompose_debug: globalsIn.dora_decompose_debug !== undefined ? !!globalsIn.dora_decompose_debug : false,
     dora_decompose_debug_n: Number.isFinite(+globalsIn.dora_decompose_debug_n)
       ? Math.max(0, Math.floor(+globalsIn.dora_decompose_debug_n))
@@ -1849,6 +1853,20 @@ function buildUI(node, state, loraValues) {
   );
   wAutoStrengthCeiling.label = "Auto-strength ratio ceiling";
 
+  const wAutoStrengthResidualBeta = node.addWidget(
+    "number",
+    "auto_strength_residual_beta",
+    Number.isFinite(+node._doraGlobals.auto_strength_residual_beta)
+      ? +node._doraGlobals.auto_strength_residual_beta
+      : 0.50,
+    (v) => {
+      node._doraGlobals.auto_strength_residual_beta = Math.max(0, Math.min(1, +v || 0));
+      persistNodeState(node);
+    },
+    { min: 0.0, max: 1.0, step: 0.05 }
+  );
+  wAutoStrengthResidualBeta.label = "Auto-strength residual β (0=local, 1=old per-layer)";
+
   const autoStrengthReportWidget =
     reusableCustomWidgets.report || new DoraAutoStrengthReportWidget("auto_strength_visualization", node);
   autoStrengthReportWidget.parentNode = node;
@@ -1920,6 +1938,7 @@ app.registerExtension({
               auto_strength_device: "gpu",
               auto_strength_ratio_floor: 0.30,
               auto_strength_ratio_ceiling: 1.50,
+              auto_strength_residual_beta: 0.50,
               dora_decompose_debug: false,
               dora_decompose_debug_n: 30,
               dora_decompose_debug_stack_depth: 10,

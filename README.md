@@ -100,10 +100,12 @@ then enabling auto-strength is a true no-op.
 - derives linear cohort shape from the adapter's logical update matrix when possible, so packed/quantized checkpoint storage does not split an otherwise identical role
 - retains the legacy broad **family arithmetic reference** across eligible linear logical sources
 - for ordered repeated-block roles, builds a robust **local depth reference** with a centered 7-member moving log-median
-- applies `family_reference / local_depth_reference` as the main gain, so a coherently weak depth region can still receive the large boosts that made the original Auto-strength useful
+- applies `family_reference / local_depth_reference` as the robust regional baseline, so a coherently weak depth region can still receive the large boosts that made the original Auto-strength useful
+- restores a configurable fraction of the remaining per-layer residual in log space: `final_gain = depth_gain * (local_depth_reference / layer_score)^β`
+- exposes **Auto-strength residual β** in the node and State Manager, clamped to `0…1`, with default `0.50`
+- `β = 0` reproduces the local-depth-only behavior; `β = 1` reproduces the original direct family/per-layer gain; intermediate values are geometric/log-space blends rather than linear ratio interpolation
 - uses one role-wide arithmetic-mean gain only as a fallback when a reliable depth profile cannot be inferred
-- preserves local residual structure because neighboring blocks share the same robust local trend instead of each block being independently forced to the family mean
-- optionally composes one isolated-member correction on top; when a true isolated outlier is detected, the local reference is used as its correction target
+- isolated statistical outliers are promoted to residual exponent `1.0` regardless of β, preserving the conservative full correction already used for a single clearly broken member
 - multiple anomaly candidates suppress only the isolated-member correction; they do not suppress coherent depth redistribution
 - requires at least five ordered logical sources for depth profiling and at least five for isolated-outlier inference
 - leaves unclassifiable linear destinations at their normal global strength
@@ -121,8 +123,11 @@ The first role-aware redesign protected depth structure too aggressively and cou
 collapse Auto-strength to a near no-op.
 
 The current policy keeps the original family target but estimates a robust local trend
-inside each semantic role. Coherent weak regions therefore keep strong corrections,
-while isolated layer noise does not define the baseline for its neighbors.
+inside each semantic role. It then restores a controlled fraction of the remaining
+layer-to-layer residual in multiplicative/log space. This makes the behavior explicitly
+testable between the two useful endpoints instead of hard-coding another smoothing
+choice: β=0 is the current regional correction, β=1 is the old direct per-layer
+correction, and the default β=0.5 is their geometric midpoint for ordinary members.
 
 Ordinary LoRA scoring remains independent of destination weight numeric values.
 A base-relative score such as `RMS(ΔW) / RMS(W0)` would make the same LoRA
