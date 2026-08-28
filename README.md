@@ -95,30 +95,34 @@ then enabling auto-strength is a true no-op.
 
 - scores ordinary LoRA with absolute `RMS(ΔW)` after LoRA alpha/rank scaling
 - scores DoRA with the RMS of its actual post-normalization weight update
-- keeps model and CLIP, tensor families, repeated-block projection roles, tensor shapes, and sliced destinations in separate cohorts
-- infers projection roles structurally from mapped destination paths such as repeated `blocks` / `layers` containers; it does not contain a MiniMax-H3 projection-name table
-- leaves unclassifiable linear destinations at their normal global strength instead of pooling unrelated linear layers
-- requires at least five measured logical sources before a linear role cohort can correct anomalies
-- models repeated-block linear roles in log space with a log-median center and MAD-based robust dispersion
-- leaves members inside that expected distribution at ratio `1.0`; the cohort center is not an automatic target
-- suppresses correction when more than one candidate is detected, preserving coherent depth-dependent or multimodal regimes
-- preserves the existing arithmetic-mean reference for non-linear tensor families such as convolution cohorts
+- separates model and CLIP and keeps non-linear tensor families isolated
+- infers repeated-block projection roles structurally from mapped destination paths; there is no MiniMax-H3 role table
+- derives linear cohort shape from the adapter's logical update matrix when possible, so packed/quantized checkpoint storage does not split an otherwise identical role
+- computes the legacy broad **family arithmetic reference** across eligible linear logical sources
+- computes one **uniform role gain** as `family_reference / role_reference`, where the role reference is that role's arithmetic mean
+- applies the same role gain to every block in the role, preserving the LoRA's trained within-role depth profile instead of forcing every block toward one magnitude
+- keeps exact semantic role, logical shape, and slice identity for within-role anomaly analysis
+- optionally composes the role gain with a conservative log-median/MAD correction for one isolated member
+- suppresses only the per-member anomaly correction when multiple candidates form a coherent tail or multimodal regime; the role-level redistribution still applies
+- requires at least two measured logical sources for role redistribution and at least five for isolated-outlier inference
+- leaves unclassifiable linear destinations at their normal global strength
+- preserves the existing arithmetic-mean redistribution for non-linear families such as convolution cohorts
 - keeps Flux / Flux2 compat-broadcasted logical sources from being over-counted during measurement
 - preserves the normal outer patch strength during final application
-- is intended to redistribute relative base strength, not replace the row's overall weight
 - `auto` resolves to CPU-safe analysis
 - `gpu` is the explicit accelerator path
 - default node UI state is `gpu`
 
-Ordinary LoRA scoring deliberately remains independent of the destination weight's
-numeric values. A base-relative score such as `RMS(ΔW) / RMS(W0)` would make the same
-LoRA redistribute differently across base checkpoints and can make quantized storage
-representations part of the result. Role-aware cohorts address the cross-projection
-scale problem, while the outlier gate preserves ordinary within-role variation and
-checkpoint-independent standard-LoRA analysis. DoRA is
-the exception because its update is defined by normalization against the live effective
-destination weight; its existing post-normalization measurement therefore remains
-base-dependent by design.
+This deliberately keeps the useful behavior of the original broad Auto-strength
+implementation—different projection roles can receive substantial relative boosts or
+pullbacks—without flattening learned block-to-block structure inside a role. For a
+linear role, Auto-strength first applies one role-wide scalar. Only a genuinely
+isolated statistical anomaly may receive an additional per-member correction.
+
+Ordinary LoRA scoring remains independent of destination weight numeric values.
+A base-relative score such as `RMS(ΔW) / RMS(W0)` would make the same LoRA
+redistribute differently across base checkpoints. DoRA remains the exception because
+its update is defined by normalization against the live effective destination weight.
 
 ### Performance note
 
