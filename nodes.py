@@ -1923,6 +1923,13 @@ _AUTO_STRENGTH_RATIO_FLOOR = 0.30
 _AUTO_STRENGTH_RATIO_CEILING = 1.50
 _AUTO_STRENGTH_DISPLAY_RATIO_EPS = 1e-3
 _AUTO_STRENGTH_EPS = 1e-8
+_AUTO_STRENGTH_LINEAR_MIN_SAMPLE = 5
+_AUTO_STRENGTH_LINEAR_ROLE_MIN_SAMPLE = 2
+_AUTO_STRENGTH_LINEAR_DEPTH_MIN_SAMPLE = 5
+_AUTO_STRENGTH_LINEAR_DEPTH_WINDOW = 7
+_AUTO_STRENGTH_LINEAR_MAD_Z = 3.5
+_AUTO_STRENGTH_LINEAR_MIN_FACTOR = 1.5
+_AUTO_STRENGTH_LINEAR_MAX_CANDIDATES = 1
 _AUTO_STRENGTH_ANALYSIS_MIN_NUMEL = 65536
 
 
@@ -3327,6 +3334,339 @@ def _auto_strength_destination_family(weight: Optional[torch.Tensor]) -> str:
     return f"tensor:{ndim}d"
 
 
+_AUTO_STRENGTH_REPEAT_CONTAINER_NAMES = {
+    "block",
+    "blocks",
+    "cell",
+    "cells",
+    "group",
+    "groups",
+    "h",
+    "layer",
+    "layers",
+    "resblock",
+    "resblocks",
+    "resnet",
+    "resnets",
+    "stage",
+    "stages",
+}
+
+
+def _auto_strength_is_repeat_container(token: str) -> bool:
+    """Return whether a path component conventionally owns repeated block indices."""
+    normalized = str(token or "").strip().lower().replace("-", "_")
+    if normalized in _AUTO_STRENGTH_REPEAT_CONTAINER_NAMES:
+        return True
+    return any(part in _AUTO_STRENGTH_REPEAT_CONTAINER_NAMES for part in normalized.split("_") if part)
+
+
+def _auto_strength_destination_shape(weight: Optional[torch.Tensor]) -> str:
+    if not isinstance(weight, torch.Tensor):
+        return "unknown"
+    try:
+        return "x".join(str(int(dim)) for dim in weight.shape)
+    except Exception:
+        return "unknown"
+
+
+def _auto_strength_logical_destination_shape(
+    lora_sd: Dict[str, Any],
+    base: str,
+    weight: Optional[torch.Tensor],
+) -> Tuple[str, str]:
+    """Return the logical update shape without depending on packed weight storage."""
+    for suffix in (".diff", ".diff_b", ".set_weight"):
+        tensor = lora_sd.get(base + suffix)
+        if isinstance(tensor, torch.Tensor):
+            shape = _auto_strength_destination_shape(tensor)
+            if shape != "unknown":
+                return shape, "adapter_update"
+
+    for up_suffix, down_suffix in _LORA_DIRECTION_SUFFIX_PAIRS:
+        up = lora_sd.get(base + up_suffix)
+        down = lora_sd.get(base + down_suffix)
+        if not isinstance(up, torch.Tensor) or not isinstance(down, torch.Tensor):
+            continue
+        try:
+            up_rows = int(up.shape[0])
+            down_rows = int(down.shape[0])
+            up_cols = int(up.numel()) // max(1, up_rows)
+            down_cols = int(down.numel()) // max(1, down_rows)
+        except Exception:
+            continue
+        if up_rows > 0 and down_cols > 0 and up_cols == down_rows:
+            return f"{up_rows}x{down_cols}", "adapter_update"
+
+    return _auto_strength_destination_shape(weight), "destination_tensor"
+
+
+def _auto_strength_projection_metadata(
+    base: str,
+    key_map: Dict[str, Any],
+    weight: Optional[torch.Tensor],
+    *,
+    destination_shape: Optional[str] = None,
+    destination_shape_source: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Infer a repeatable linear projection role from the mapped destination path.
+
+    The inference is deliberately structural. Numeric indices are abstracted only
+    when their path component is owned by a conventional repeated-block container
+    (``blocks``, ``layers``, ``transformer_blocks``, ``down_blocks``, and similar).
+    Names such as ``attn1`` and ``fc2`` remain semantic role components.
+
+    Exact destination shape and slice identity are retained in the cohort key so
+    similarly named projections with incompatible layouts are never pooled.
+    """
+    dest, sl = _unwrap_key_map_target(key_map.get(base))
+    shape = str(destination_shape or _auto_strength_destination_shape(weight))
+    shape_source = str(destination_shape_source or "destination_tensor")
+    result: Dict[str, Any] = {
+        "destination": dest,
+        "destination_shape": shape,
+        "destination_shape_source": shape_source,
+        "destination_slice": list(sl) if sl is not None else None,
+        "semantic_role": None,
+        "role_path": None,
+        "block_identity": None,
+        "cohort_id": f"linear:unclassified|shape={shape}",
+        "cohort_eligible": False,
+        "fallback_reason": "semantic_role_unresolved",
+    }
+    if not dest:
+        return result
+
+    path = str(dest)
+    if path.endswith(".weight"):
+        path = path[:-len(".weight")]
+    parts = [part for part in path.split(".") if part]
+    if not parts:
+        return result
+
+    normalized = list(parts)
+    repeated_positions: List[int] = []
+    block_identities: List[str] = []
+
+    for index, token in enumerate(parts):
+        if token.isdigit() and index > 0 and _auto_strength_is_repeat_container(parts[index - 1]):
+            normalized[index] = "*"
+            repeated_positions.append(index)
+            block_identities.append(f"{parts[index - 1]}.{token}")
+            continue
+
+        embedded = re.match(r"^(?P<container>.+?)[_-](?P<index>\d+)$", token)
+        if embedded and _auto_strength_is_repeat_container(embedded.group("container")):
+            container = embedded.group("container")
+            block_index = embedded.group("index")
+            separator = "_" if "_" in token else "-"
+            normalized[index] = f"{container}{separator}*"
+            repeated_positions.append(index)
+            block_identities.append(f"{container}.{block_index}")
+
+    if not repeated_positions:
+        return result
+
+    role_parts = parts[repeated_positions[-1] + 1 :]
+    if not role_parts:
+        return result
+
+    semantic_role = ".".join(role_parts)
+    role_path = ".".join(normalized)
+    slice_suffix = ""
+    if sl is not None:
+        slice_suffix = f"|slice={int(sl[0])}:{int(sl[1])}:{int(sl[2])}"
+
+    result.update(
+        {
+            "semantic_role": semantic_role,
+            "role_path": role_path,
+            "block_identity": "/".join(block_identities),
+            "cohort_id": f"{role_path}|shape={shape}{slice_suffix}",
+            "cohort_eligible": True,
+            "fallback_reason": None,
+        }
+    )
+    return result
+
+
+def _auto_strength_log_median(values: Iterable[float]) -> Optional[float]:
+    """Return a robust multiplicative center for positive magnitude scores."""
+    logs: List[float] = []
+    for value in values:
+        try:
+            value_f = float(value)
+        except Exception:
+            continue
+        if value_f > _AUTO_STRENGTH_EPS and math.isfinite(value_f):
+            logs.append(math.log(value_f))
+    logs.sort()
+    if not logs:
+        return None
+    middle = len(logs) // 2
+    if len(logs) % 2:
+        center = logs[middle]
+    else:
+        center = (logs[middle - 1] + logs[middle]) * 0.5
+    return float(math.exp(center))
+
+
+def _auto_strength_median(values: Iterable[float]) -> Optional[float]:
+    finite = sorted(float(value) for value in values if math.isfinite(float(value)))
+    if not finite:
+        return None
+    middle = len(finite) // 2
+    if len(finite) % 2:
+        return finite[middle]
+    return (finite[middle - 1] + finite[middle]) * 0.5
+
+
+def _auto_strength_linear_outlier_model(values_by_logical: Dict[str, float]) -> Dict[str, Any]:
+    """Fit a conservative log-space anomaly gate for one linear role cohort.
+
+    The cohort center describes the expected distribution; it is not an automatic
+    target for every member. A member is correctable only when it is outside a
+    robust MAD envelope and it is the cohort's only candidate. The single-candidate
+    guard prevents a coherent depth regime from being mistaken for bad layers.
+    """
+    filtered = {
+        str(logical_id): float(value)
+        for logical_id, value in values_by_logical.items()
+        if math.isfinite(float(value)) and float(value) > _AUTO_STRENGTH_EPS
+    }
+    reference = _auto_strength_log_median(filtered.values())
+    sample_count = len(filtered)
+    candidate_limit = _AUTO_STRENGTH_LINEAR_MAX_CANDIDATES
+    result: Dict[str, Any] = {
+        "reference": reference,
+        "sample_count": sample_count,
+        "log_mad": None,
+        "robust_sigma": None,
+        "log_deviation_threshold": None,
+        "candidate_ids": set(),
+        "detected_candidate_ids": set(),
+        "candidate_count": 0,
+        "candidate_limit": candidate_limit,
+        "eligible": False,
+        "fallback_reason": "insufficient_outlier_sample",
+    }
+    if reference is None or sample_count < _AUTO_STRENGTH_LINEAR_MIN_SAMPLE:
+        return result
+
+    log_center = math.log(reference)
+    logs = {logical_id: math.log(value) for logical_id, value in filtered.items()}
+    log_mad = _auto_strength_median(abs(value - log_center) for value in logs.values())
+    if log_mad is None:
+        return result
+    robust_sigma = 1.4826 * log_mad
+    threshold = max(
+        _AUTO_STRENGTH_LINEAR_MAD_Z * robust_sigma,
+        math.log(_AUTO_STRENGTH_LINEAR_MIN_FACTOR),
+    )
+    candidate_ids = {
+        logical_id
+        for logical_id, value in logs.items()
+        if abs(value - log_center) > threshold
+    }
+    result.update(
+        {
+            "log_mad": float(log_mad),
+            "robust_sigma": float(robust_sigma),
+            "log_deviation_threshold": float(threshold),
+            "detected_candidate_ids": candidate_ids,
+            "candidate_count": len(candidate_ids),
+        }
+    )
+    if len(candidate_ids) > candidate_limit:
+        result["fallback_reason"] = "multiple_outlier_candidates"
+        return result
+
+    result.update(
+        {
+            "candidate_ids": candidate_ids,
+            "eligible": True,
+            "fallback_reason": None,
+        }
+    )
+    return result
+
+
+def _auto_strength_block_coordinate(block_identity: Optional[str]) -> Optional[Tuple[int, ...]]:
+    """Extract a stable repeated-block coordinate from structural block metadata."""
+    if not block_identity:
+        return None
+    coords: List[int] = []
+    for component in str(block_identity).split("/"):
+        match = re.search(r"\.(\d+)$", component)
+        if match is None:
+            return None
+        coords.append(int(match.group(1)))
+    return tuple(coords) if coords else None
+
+
+def _auto_strength_linear_depth_model(
+    values_by_logical: Dict[str, float],
+    coordinates_by_logical: Dict[str, Tuple[int, ...]],
+) -> Dict[str, Any]:
+    """Build robust local depth baselines without reacting to single-layer noise.
+
+    A centered moving log-median recovers the useful part of legacy per-layer
+    redistribution while making neighboring layers share one local trend. Coherent
+    weak/strong depth regions can therefore receive substantial family-level
+    correction without forcing every individual member to the same magnitude.
+    """
+    ordered = [
+        (coordinates_by_logical[logical_id], logical_id, float(value))
+        for logical_id, value in values_by_logical.items()
+        if logical_id in coordinates_by_logical
+        and math.isfinite(float(value))
+        and float(value) > _AUTO_STRENGTH_EPS
+    ]
+    ordered.sort(key=lambda item: (item[0], item[1]))
+    result: Dict[str, Any] = {
+        "eligible": False,
+        "sample_count": len(ordered),
+        "window_size": None,
+        "local_references": {},
+        "fallback_reason": "insufficient_depth_sample",
+    }
+    if len(ordered) < _AUTO_STRENGTH_LINEAR_DEPTH_MIN_SAMPLE:
+        return result
+
+    window_size = min(_AUTO_STRENGTH_LINEAR_DEPTH_WINDOW, len(ordered))
+    if window_size % 2 == 0 and window_size > 1:
+        window_size -= 1
+    window_size = max(1, window_size)
+    radius = window_size // 2
+    local_references: Dict[str, float] = {}
+
+    for index, (_coord, logical_id, _value) in enumerate(ordered):
+        start = index - radius
+        end = index + radius + 1
+        if start < 0:
+            end = min(len(ordered), end - start)
+            start = 0
+        if end > len(ordered):
+            start = max(0, start - (end - len(ordered)))
+            end = len(ordered)
+        reference = _auto_strength_log_median(entry[2] for entry in ordered[start:end])
+        if reference is not None and reference > _AUTO_STRENGTH_EPS:
+            local_references[logical_id] = float(reference)
+
+    if len(local_references) < _AUTO_STRENGTH_LINEAR_DEPTH_MIN_SAMPLE:
+        return result
+
+    result.update(
+        {
+            "eligible": True,
+            "window_size": window_size,
+            "local_references": local_references,
+            "fallback_reason": None,
+        }
+    )
+    return result
+
+
 def _auto_strength_measure_dora_effect(
     weight: torch.Tensor,
     delta: torch.Tensor,
@@ -3580,36 +3920,38 @@ def _auto_strength_analyze_base_targets(
     current_model: Any = None,
     current_clip: Any = None,
 ) -> Tuple[Dict[str, float], Dict[str, Any]]:
-    """
-    Compute per-base target strengths and preserve a structured report that matches
-    the loader's real logical-group-aware measurement model.
+    """Compute role-preserving Auto-strength targets and a structured report.
 
-    Invariants:
-      - auto-strength must modulate the same *linear delta* that standard LoRA and
-        DoRA feed into Comfy's patch loader.
-      - auto-strength must be invariant to synthetic compat expansion. Broadcasting one
-        logical source into N per-block bases must not change its measured target just
-        because the loader expanded the keys before comfy.lora.load_lora(...).
+    Linear adapters use two independent layers of inference:
 
-    We therefore compute a base-local score from the linear update representation, fold
-    compat-broadcast clones back into their logical source groups for measurement, and
-    then convert those absolute targets into per-base redistribution ratios before
-    comfy.lora.load_lora(...).
+    1. Role redistribution projects the legacy broad family equalization onto one
+       uniform gain per structural role/shape/slice cohort. The arithmetic mean of
+       each role is moved toward the legacy family arithmetic reference while every
+       within-role block-to-block ratio is preserved.
+    2. A conservative log-median/MAD gate may additionally correct one isolated
+       member inside a role. Coherent tails or multimodal depth regimes are never
+       flattened by this secondary correction.
+
+    Model/CLIP groups, logical fanout, tensor families, sliced mappings, outer patch
+    strength, LoRA alpha semantics, and DoRA post-normalization measurement remain
+    unchanged.
     """
     ratio_floor = max(0.0, float(ratio_floor))
     ratio_ceiling = max(ratio_floor, float(ratio_ceiling))
     logical_groups = logical_groups or {}
 
-    grouped_norms: Dict[Tuple[str, str], Dict[str, List[float]]] = {}
+    grouped_norms: Dict[Tuple[str, str, str], Dict[str, List[float]]] = {}
     base_groups: Dict[str, str] = {}
     base_families: Dict[str, str] = {}
-    base_cohorts: Dict[str, Tuple[str, str]] = {}
+    base_cohorts: Dict[str, Tuple[str, str, str]] = {}
+    base_metadata: Dict[str, Dict[str, Any]] = {}
+    base_measurement_kinds: Dict[str, str] = {}
     base_norms: Dict[str, float] = {}
     base_logical_ids: Dict[str, str] = {}
     base_logical_scales: Dict[str, float] = {}
-    logical_norms: Dict[Tuple[str, str, str], float] = {}
-    logical_members: Dict[Tuple[str, str, str], List[str]] = {}
-    skipped_zero_strength_members: Dict[Tuple[str, str, str], List[str]] = {}
+    logical_norms: Dict[Tuple[str, str, str, str], float] = {}
+    logical_members: Dict[Tuple[str, str, str, str], List[str]] = {}
+    skipped_zero_strength_members: Dict[Tuple[str, str, str, str], List[str]] = {}
     skipped_zero_strength_bases: List[str] = []
     targets: Dict[str, float] = {}
 
@@ -3621,8 +3963,41 @@ def _auto_strength_analyze_base_targets(
         dest_weight = _auto_strength_get_destination_weight(base, key_map, model_state_dict, clip_state_dict)
         family = _auto_strength_destination_family(dest_weight)
         base_families[base] = family
-        cohort = (group, family)
+
+        if family == "linear":
+            logical_shape, shape_source = _auto_strength_logical_destination_shape(
+                lora_sd, base, dest_weight
+            )
+            metadata = _auto_strength_projection_metadata(
+                base,
+                key_map,
+                dest_weight,
+                destination_shape=logical_shape,
+                destination_shape_source=shape_source,
+            )
+        else:
+            dest, sl = _unwrap_key_map_target(key_map.get(base))
+            metadata = {
+                "destination": dest,
+                "destination_shape": _auto_strength_destination_shape(dest_weight),
+                "destination_shape_source": "destination_tensor",
+                "destination_slice": list(sl) if sl is not None else None,
+                "semantic_role": None,
+                "role_path": None,
+                "block_identity": None,
+                "cohort_id": family,
+                "cohort_eligible": family != "unknown",
+                "fallback_reason": None if family != "unknown" else "unsupported_destination_family",
+            }
+
+        base_metadata[base] = metadata
+        cohort = (group, family, str(metadata.get("cohort_id") or family))
         base_cohorts[base] = cohort
+        base_measurement_kinds[base] = (
+            "dora_post_normalization_update_rms"
+            if isinstance(lora_sd.get(base + ".dora_scale"), torch.Tensor)
+            else "update_rms"
+        )
         global_strength = float(strength_model if group == "model" else strength_clip)
         targets[base] = global_strength
 
@@ -3640,7 +4015,7 @@ def _auto_strength_analyze_base_targets(
             logical_scale = 1.0
         base_logical_ids[base] = logical_id
         base_logical_scales[base] = logical_scale
-        logical_key = (cohort[0], cohort[1], logical_id)
+        logical_key = (cohort[0], cohort[1], cohort[2], logical_id)
 
         if abs(global_strength) < _AUTO_STRENGTH_EPS:
             skipped_zero_strength_members.setdefault(logical_key, []).append(base)
@@ -3661,20 +4036,151 @@ def _auto_strength_analyze_base_targets(
             current_model=current_model,
             current_clip=current_clip,
         )
-        if norm is None or not (norm > _AUTO_STRENGTH_EPS):
+        if norm is None or not math.isfinite(float(norm)) or not (norm > _AUTO_STRENGTH_EPS):
             continue
         base_norms[base] = norm
         logical_norm = float(norm / logical_scale)
         logical_norms[logical_key] = logical_norm
         grouped_norms.setdefault(cohort, {}).setdefault(logical_id, []).append(logical_norm)
 
-    group_means: Dict[Tuple[str, str], Optional[float]] = {}
+    cohort_logical_values: Dict[Tuple[str, str, str], Dict[str, float]] = {}
+    cohort_anomaly_references: Dict[Tuple[str, str, str], Optional[float]] = {}
+    cohort_role_references: Dict[Tuple[str, str, str], Optional[float]] = {}
+    cohort_models: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    cohort_reference_statistics: Dict[Tuple[str, str, str], str] = {}
+    cohort_role_eligible: Dict[Tuple[str, str, str], bool] = {}
+    cohort_depth_models: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    family_values: Dict[Tuple[str, str], List[float]] = {}
+
     for cohort, vals_by_logical in grouped_norms.items():
-        logical_vals = [float(sum(vals) / len(vals)) for vals in vals_by_logical.values() if vals]
-        group_means[cohort] = float(sum(logical_vals) / len(logical_vals)) if logical_vals else None
-        for logical_id, vals in vals_by_logical.items():
-            if vals:
-                logical_norms[(cohort[0], cohort[1], logical_id)] = float(sum(vals) / len(vals))
+        logical_values = {
+            str(logical_id): float(sum(vals) / len(vals))
+            for logical_id, vals in vals_by_logical.items()
+            if vals
+        }
+        cohort_logical_values[cohort] = logical_values
+        for logical_id, logical_value in logical_values.items():
+            logical_norms[(cohort[0], cohort[1], cohort[2], logical_id)] = logical_value
+
+        cohort_is_eligible = any(
+            bool(base_metadata.get(base, {}).get("cohort_eligible"))
+            for base, base_cohort in base_cohorts.items()
+            if base_cohort == cohort
+        )
+        logical_vals = list(logical_values.values())
+
+        if cohort[1] == "linear":
+            anomaly_model = _auto_strength_linear_outlier_model(logical_values)
+            if not cohort_is_eligible:
+                anomaly_model["eligible"] = False
+                anomaly_model["candidate_ids"] = set()
+                anomaly_model["fallback_reason"] = "cohort_ineligible"
+            cohort_models[cohort] = anomaly_model
+            cohort_anomaly_references[cohort] = anomaly_model.get("reference")
+            cohort_reference_statistics[cohort] = "log_median"
+
+            role_reference = (
+                float(sum(logical_vals) / len(logical_vals))
+                if logical_vals
+                else None
+            )
+            role_eligible = (
+                cohort_is_eligible
+                and role_reference is not None
+                and role_reference > _AUTO_STRENGTH_EPS
+                and len(logical_vals) >= _AUTO_STRENGTH_LINEAR_ROLE_MIN_SAMPLE
+            )
+            cohort_role_references[cohort] = role_reference
+            cohort_role_eligible[cohort] = role_eligible
+
+            coordinates_by_logical: Dict[str, Tuple[int, ...]] = {}
+            for logical_id in logical_values.keys():
+                logical_key = (cohort[0], cohort[1], cohort[2], logical_id)
+                coords = {
+                    _auto_strength_block_coordinate(
+                        base_metadata.get(base, {}).get("block_identity")
+                    )
+                    for base in logical_members.get(logical_key, [])
+                }
+                coords.discard(None)
+                if len(coords) == 1:
+                    coordinates_by_logical[logical_id] = next(iter(coords))
+            depth_model = _auto_strength_linear_depth_model(
+                logical_values,
+                coordinates_by_logical,
+            )
+            if not cohort_is_eligible:
+                depth_model["eligible"] = False
+                depth_model["local_references"] = {}
+                depth_model["fallback_reason"] = "cohort_ineligible"
+            cohort_depth_models[cohort] = depth_model
+
+            if role_eligible:
+                family_values.setdefault((cohort[0], cohort[1]), []).extend(logical_vals)
+        else:
+            reference = float(sum(logical_vals) / len(logical_vals)) if logical_vals else None
+            eligible = cohort_is_eligible and len(logical_vals) >= 2 and reference is not None
+            cohort_models[cohort] = {
+                "reference": reference,
+                "sample_count": len(logical_vals),
+                "candidate_ids": set(logical_values.keys()) if eligible else set(),
+                "detected_candidate_ids": set(logical_values.keys()) if eligible else set(),
+                "candidate_count": len(logical_vals) if eligible else 0,
+                "candidate_limit": None,
+                "eligible": eligible,
+                "fallback_reason": None if eligible else "insufficient_comparable_members",
+                "log_mad": None,
+                "robust_sigma": None,
+                "log_deviation_threshold": None,
+            }
+            cohort_anomaly_references[cohort] = reference
+            cohort_role_references[cohort] = reference
+            cohort_role_eligible[cohort] = eligible
+            cohort_depth_models[cohort] = {
+                "eligible": False,
+                "sample_count": len(logical_vals),
+                "window_size": None,
+                "local_references": {},
+                "fallback_reason": "non_linear_family",
+            }
+            cohort_reference_statistics[cohort] = "arithmetic_mean"
+
+    family_references: Dict[Tuple[str, str], Optional[float]] = {}
+    for family_key, values in family_values.items():
+        family_references[family_key] = (
+            float(sum(values) / len(values)) if values else None
+        )
+
+    cohort_role_gains: Dict[Tuple[str, str, str], Optional[float]] = {}
+    cohort_role_gain_reasons: Dict[Tuple[str, str, str], Optional[str]] = {}
+    for cohort in set(base_cohorts.values()):
+        if cohort[1] != "linear":
+            cohort_role_gains[cohort] = None
+            cohort_role_gain_reasons[cohort] = None
+            continue
+        role_reference = cohort_role_references.get(cohort)
+        family_reference = family_references.get((cohort[0], cohort[1]))
+        if not cohort_role_eligible.get(cohort, False):
+            cohort_role_gains[cohort] = None
+            metadata_base = next(
+                (base for base, base_cohort in base_cohorts.items() if base_cohort == cohort),
+                None,
+            )
+            metadata = base_metadata.get(metadata_base, {}) if metadata_base else {}
+            cohort_role_gain_reasons[cohort] = str(
+                metadata.get("fallback_reason")
+                or "insufficient_role_sample"
+            )
+        elif (
+            role_reference is None
+            or family_reference is None
+            or not (role_reference > _AUTO_STRENGTH_EPS)
+        ):
+            cohort_role_gains[cohort] = None
+            cohort_role_gain_reasons[cohort] = "unmeasurable_role_reference"
+        else:
+            cohort_role_gains[cohort] = float(family_reference / role_reference)
+            cohort_role_gain_reasons[cohort] = None
 
     for base, group in base_groups.items():
         global_strength = float(strength_model if group == "model" else strength_clip)
@@ -3683,113 +4189,444 @@ def _auto_strength_analyze_base_targets(
             continue
 
         family = base_families.get(base, "unknown")
-        cohort = base_cohorts.get(base, (group, family))
+        cohort = base_cohorts.get(base, (group, family, family))
         logical_id = base_logical_ids.get(base, base)
-        norm = logical_norms.get((cohort[0], cohort[1], logical_id))
-        mean_norm = group_means.get(cohort)
-        if norm is None or mean_norm is None or not (norm > _AUTO_STRENGTH_EPS):
+        norm = logical_norms.get((cohort[0], cohort[1], cohort[2], logical_id))
+        if norm is None or not (norm > _AUTO_STRENGTH_EPS):
             targets[base] = global_strength
             continue
 
-        ratio = mean_norm / norm
+        if family == "linear":
+            role_gain = cohort_role_gains.get(cohort)
+            if role_gain is None:
+                targets[base] = global_strength
+                continue
+            family_reference = family_references.get((cohort[0], cohort[1]))
+            depth_model = cohort_depth_models.get(cohort, {})
+            depth_reference = depth_model.get("local_references", {}).get(logical_id)
+            base_gain = role_gain
+            if (
+                depth_reference is not None
+                and family_reference is not None
+                and depth_reference > _AUTO_STRENGTH_EPS
+            ):
+                base_gain = float(family_reference / depth_reference)
+
+            anomaly_gain = 1.0
+            model = cohort_models.get(cohort, {})
+            correction_reference = depth_reference or cohort_anomaly_references.get(cohort)
+            if (
+                logical_id in model.get("candidate_ids", set())
+                and correction_reference is not None
+                and correction_reference > _AUTO_STRENGTH_EPS
+            ):
+                anomaly_gain = float(correction_reference / norm)
+            ratio = float(base_gain * anomaly_gain)
+        else:
+            reference = cohort_anomaly_references.get(cohort)
+            model = cohort_models.get(cohort, {})
+            if (
+                reference is None
+                or not bool(model.get("eligible"))
+                or logical_id not in model.get("candidate_ids", set())
+            ):
+                targets[base] = global_strength
+                continue
+            ratio = float(reference / norm)
+
         ratio = max(ratio_floor, min(ratio_ceiling, ratio))
         targets[base] = float(global_strength * ratio)
 
     measured = len(base_norms)
     total = len(base_groups)
     analyzable = sum(len(v) for v in logical_members.values())
-    measured_logical = sum(1 for logical_key in logical_members.keys() if logical_norms.get(logical_key, 0.0) > _AUTO_STRENGTH_EPS)
+    measured_logical = sum(
+        1
+        for logical_key in logical_members.keys()
+        if logical_norms.get(logical_key, 0.0) > _AUTO_STRENGTH_EPS
+    )
 
     cohorts_report: List[Dict[str, Any]] = []
     for cohort in sorted(set(base_cohorts.values())):
-        group, family = cohort
-        cohort_members = [k for k in logical_members.keys() if k[0] == group and k[1] == family]
-        measured_members = [k for k in cohort_members if logical_norms.get(k, 0.0) > _AUTO_STRENGTH_EPS]
-        total_bases = sum(len(logical_members.get(k, [])) for k in cohort_members)
-        measured_bases = sum(sum(1 for base in logical_members.get(k, []) if base in base_norms) for k in cohort_members)
-        skipped_bases = sum(
-            len(skipped_zero_strength_members.get(k, []))
-            for k in skipped_zero_strength_members.keys()
-            if k[0] == group and k[1] == family
+        group, family, cohort_id = cohort
+        cohort_members = [key for key in logical_members.keys() if key[:3] == cohort]
+        measured_members = [
+            key for key in cohort_members if logical_norms.get(key, 0.0) > _AUTO_STRENGTH_EPS
+        ]
+        total_bases = sum(len(logical_members.get(key, [])) for key in cohort_members)
+        measured_bases = sum(
+            sum(1 for base in logical_members.get(key, []) if base in base_norms)
+            for key in cohort_members
         )
+        skipped_bases = sum(
+            len(skipped_zero_strength_members.get(key, []))
+            for key in skipped_zero_strength_members.keys()
+            if key[:3] == cohort
+        )
+        cohort_bases = [base for base, base_cohort in base_cohorts.items() if base_cohort == cohort]
+        metadata = base_metadata.get(cohort_bases[0], {}) if cohort_bases else {}
+        model = cohort_models.get(cohort, {})
+        depth_model = cohort_depth_models.get(cohort, {})
+        anomaly_reference = cohort_anomaly_references.get(cohort)
+        role_reference = cohort_role_references.get(cohort)
+        family_reference = family_references.get((group, family))
+        role_gain = cohort_role_gains.get(cohort)
+        depth_references = depth_model.get("local_references", {}) if family == "linear" else {}
+        depth_gains = [
+            float(family_reference / reference)
+            for reference in depth_references.values()
+            if family_reference is not None and reference > _AUTO_STRENGTH_EPS
+        ]
+        is_linear = family == "linear"
+
+        if is_linear:
+            redistribution_eligible = role_gain is not None
+            fallback_reason = cohort_role_gain_reasons.get(cohort)
+            anomaly_fallback_reason = (
+                None if bool(model.get("eligible")) else model.get("fallback_reason")
+            )
+        else:
+            redistribution_eligible = bool(model.get("eligible"))
+            fallback_reason = (
+                None if redistribution_eligible else model.get("fallback_reason")
+            )
+            anomaly_fallback_reason = None
+
         cohorts_report.append(
             {
                 "group": group,
                 "family": family,
-                "mean_norm": _auto_strength_safe_number(group_means.get(cohort)),
+                "destination_group": group,
+                "tensor_family": family,
+                "semantic_role": metadata.get("semantic_role"),
+                "role_path": metadata.get("role_path"),
+                "destination_shape": metadata.get("destination_shape"),
+                "destination_shape_source": metadata.get("destination_shape_source"),
+                "destination_slice": metadata.get("destination_slice"),
+                "cohort_id": cohort_id,
+                "redistribution_eligible": redistribution_eligible,
+                "role_redistribution_eligible": redistribution_eligible if is_linear else None,
+                "anomaly_detection_eligible": bool(model.get("eligible")) if is_linear else None,
+                "outlier_gate": "log_median_mad_single" if is_linear else None,
+                "minimum_sample": _AUTO_STRENGTH_LINEAR_MIN_SAMPLE if is_linear else 2,
+                "minimum_role_sample": _AUTO_STRENGTH_LINEAR_ROLE_MIN_SAMPLE if is_linear else None,
+                "log_mad": _auto_strength_safe_number(model.get("log_mad")),
+                "robust_sigma": _auto_strength_safe_number(model.get("robust_sigma")),
+                "log_deviation_threshold": _auto_strength_safe_number(
+                    model.get("log_deviation_threshold")
+                ),
+                "minimum_deviation_factor": _AUTO_STRENGTH_LINEAR_MIN_FACTOR if is_linear else None,
+                "outlier_candidate_count": (
+                    int(model.get("candidate_count", 0)) if is_linear else None
+                ),
+                "outlier_candidate_limit": (
+                    int(model.get("candidate_limit", 0)) if is_linear else None
+                ),
+                "corrected_logical_count": len(model.get("candidate_ids", set())) if is_linear else len(model.get("candidate_ids", set())),
+                "scoring_basis": "absolute_update_rms",
+                "reference_statistic": cohort_reference_statistics.get(cohort),
+                "reference_score": _auto_strength_safe_number(anomaly_reference),
+                "role_reference_statistic": "arithmetic_mean" if is_linear else None,
+                "role_reference_score": _auto_strength_safe_number(role_reference),
+                "family_reference_statistic": "arithmetic_mean" if is_linear else None,
+                "family_reference_score": _auto_strength_safe_number(family_reference),
+                "role_gain_raw": _auto_strength_safe_number(role_gain),
+                "depth_profile_eligible": bool(depth_model.get("eligible")) if is_linear else None,
+                "depth_profile_sample_count": int(depth_model.get("sample_count", 0)) if is_linear else None,
+                "depth_profile_window_size": depth_model.get("window_size") if is_linear else None,
+                "depth_profile_fallback_reason": depth_model.get("fallback_reason") if is_linear else None,
+                "depth_gain_min_raw": _auto_strength_safe_number(min(depth_gains)) if depth_gains else None,
+                "depth_gain_max_raw": _auto_strength_safe_number(max(depth_gains)) if depth_gains else None,
+                "role_gain_at_bounds": (
+                    _auto_strength_safe_number(max(ratio_floor, min(ratio_ceiling, role_gain)))
+                    if role_gain is not None
+                    else None
+                ),
+                # Compatibility aliases retained for existing report readers.
+                "mean_norm": _auto_strength_safe_number(anomaly_reference),
                 "logical_count": len(cohort_members),
                 "measured_logical_count": len(measured_members),
                 "base_count": total_bases,
                 "skipped_zero_strength_base_count": skipped_bases,
                 "measured_base_count": measured_bases,
+                "fallback_reason": fallback_reason,
+                "anomaly_fallback_reason": anomaly_fallback_reason,
             }
         )
 
     logical_reports: List[Dict[str, Any]] = []
     for logical_key, members in logical_members.items():
-        group, family, logical_id = logical_key
+        group, family, cohort_id, logical_id = logical_key
+        cohort = (group, family, cohort_id)
         global_strength = float(strength_model if group == "model" else strength_clip)
         logical_norm = logical_norms.get(logical_key)
-        cohort_mean = group_means.get((group, family))
+        model = cohort_models.get(cohort, {})
+        metadata = base_metadata.get(members[0], {}) if members else {}
+        anomaly_reference = cohort_anomaly_references.get(cohort)
+        role_reference = cohort_role_references.get(cohort)
+        family_reference = family_references.get((group, family))
+        role_gain = cohort_role_gains.get(cohort)
+        depth_model = cohort_depth_models.get(cohort, {})
+        depth_reference = depth_model.get("local_references", {}).get(logical_id)
+        depth_gain_raw = None
+        if (
+            depth_reference is not None
+            and family_reference is not None
+            and depth_reference > _AUTO_STRENGTH_EPS
+        ):
+            depth_gain_raw = float(family_reference / depth_reference)
+
         ratio_raw = None
         ratio_applied = None
-        if logical_norm is not None and cohort_mean is not None and logical_norm > _AUTO_STRENGTH_EPS:
-            ratio_raw = float(cohort_mean / logical_norm)
-            ratio_applied = float(max(ratio_floor, min(ratio_ceiling, ratio_raw)))
+        anomaly_gain_raw = None
+        decision_reason = None
+        fallback_reason = None
+        anomaly_fallback_reason = None
+
+        if logical_norm is None or not (logical_norm > _AUTO_STRENGTH_EPS):
+            fallback_reason = "unmeasurable_update"
+        elif family == "linear":
+            if role_gain is None:
+                fallback_reason = cohort_role_gain_reasons.get(cohort) or "role_redistribution_unavailable"
+            else:
+                base_gain = depth_gain_raw if depth_gain_raw is not None else role_gain
+                anomaly_gain_raw = 1.0
+                correction_reference = depth_reference or anomaly_reference
+                if (
+                    logical_id in model.get("candidate_ids", set())
+                    and correction_reference is not None
+                    and correction_reference > _AUTO_STRENGTH_EPS
+                ):
+                    anomaly_gain_raw = float(correction_reference / logical_norm)
+                    decision_reason = (
+                        "depth_profile_redistribution_plus_outlier_correction"
+                        if depth_gain_raw is not None
+                        else "role_redistribution_plus_outlier_correction"
+                    )
+                elif logical_id in model.get("detected_candidate_ids", set()):
+                    decision_reason = (
+                        "depth_profile_redistribution_anomaly_suppressed_candidate"
+                        if depth_gain_raw is not None
+                        else "role_redistribution_anomaly_suppressed_candidate"
+                    )
+                elif model.get("fallback_reason") == "multiple_outlier_candidates":
+                    decision_reason = (
+                        "depth_profile_redistribution_anomaly_suppressed"
+                        if depth_gain_raw is not None
+                        else "role_redistribution_anomaly_suppressed"
+                    )
+                else:
+                    decision_reason = (
+                        "depth_profile_redistribution"
+                        if depth_gain_raw is not None
+                        else "role_redistribution"
+                    )
+
+                if not bool(model.get("eligible")):
+                    anomaly_fallback_reason = model.get("fallback_reason")
+                ratio_raw = float(base_gain * anomaly_gain_raw)
+                ratio_applied = float(max(ratio_floor, min(ratio_ceiling, ratio_raw)))
+        else:
+            if (
+                anomaly_reference is not None
+                and bool(model.get("eligible"))
+                and logical_id in model.get("candidate_ids", set())
+            ):
+                ratio_raw = float(anomaly_reference / logical_norm)
+                ratio_applied = float(max(ratio_floor, min(ratio_ceiling, ratio_raw)))
+                decision_reason = "family_redistribution"
+            else:
+                fallback_reason = str(model.get("fallback_reason") or "unmeasurable_cohort")
+
         fallback_to_global = ratio_applied is None
-        target_strength = float(global_strength if fallback_to_global else global_strength * ratio_applied)
+        if fallback_to_global:
+            decision_reason = fallback_reason
+        target_strength = float(
+            global_strength if fallback_to_global else global_strength * ratio_applied
+        )
+
         bases_report = []
         measured_base_count = 0
         for base in sorted(members):
             base_target = float(targets.get(base, global_strength))
-            base_ratio = None
-            if abs(global_strength) > _AUTO_STRENGTH_EPS:
+            base_ratio = ratio_applied
+            if base_ratio is not None and abs(global_strength) > _AUTO_STRENGTH_EPS:
                 base_ratio = float(base_target / global_strength)
             if base in base_norms:
                 measured_base_count += 1
+            base_meta = base_metadata.get(base, {})
             bases_report.append(
                 {
                     "base": base,
+                    "destination": base_meta.get("destination"),
+                    "destination_group": group,
+                    "tensor_family": family,
+                    "semantic_role": base_meta.get("semantic_role"),
+                    "block_identity": base_meta.get("block_identity"),
+                    "destination_shape": base_meta.get("destination_shape"),
+                    "destination_shape_source": base_meta.get("destination_shape_source"),
+                    "destination_slice": base_meta.get("destination_slice"),
+                    "measurement_kind": base_measurement_kinds.get(base, "update_rms"),
                     "norm": _auto_strength_safe_number(base_norms.get(base)),
+                    "update_rms": _auto_strength_safe_number(base_norms.get(base)),
+                    "base_weight_rms": None,
+                    "relative_perturbation": None,
                     "logical_scale": _auto_strength_safe_number(base_logical_scales.get(base, 1.0)),
                     "measured": base in base_norms,
+                    "role_gain_raw": _auto_strength_safe_number(role_gain),
+                    "depth_reference_score": _auto_strength_safe_number(depth_reference),
+                    "depth_gain_raw": _auto_strength_safe_number(depth_gain_raw),
+                    "anomaly_gain_raw": _auto_strength_safe_number(anomaly_gain_raw),
                     "ratio_applied": _auto_strength_safe_number(base_ratio),
                     "target_strength": base_target,
+                    "decision_reason": decision_reason,
+                    "fallback_reason": fallback_reason,
+                    "anomaly_fallback_reason": anomaly_fallback_reason,
                 }
             )
+
+        block_identities = sorted(
+            {
+                str(base_metadata.get(base, {}).get("block_identity"))
+                for base in members
+                if base_metadata.get(base, {}).get("block_identity")
+            }
+        )
+        destinations = sorted(
+            {
+                str(base_metadata.get(base, {}).get("destination"))
+                for base in members
+                if base_metadata.get(base, {}).get("destination")
+            }
+        )
+        measurement_kinds = sorted(
+            {base_measurement_kinds.get(base, "update_rms") for base in members}
+        )
+        log_deviation = None
+        if (
+            logical_norm is not None
+            and anomaly_reference is not None
+            and logical_norm > _AUTO_STRENGTH_EPS
+        ):
+            log_deviation = abs(math.log(logical_norm) - math.log(anomaly_reference))
+        robust_sigma = _auto_strength_safe_number(model.get("robust_sigma"))
+        robust_z = None
+        if (
+            log_deviation is not None
+            and robust_sigma is not None
+            and robust_sigma > _AUTO_STRENGTH_EPS
+        ):
+            robust_z = float(log_deviation / robust_sigma)
 
         logical_reports.append(
             {
                 "group": group,
                 "family": family,
+                "destination_group": group,
+                "tensor_family": family,
+                "semantic_role": metadata.get("semantic_role"),
+                "role_path": metadata.get("role_path"),
+                "cohort_id": cohort_id,
                 "logical_id": logical_id,
+                "block_identity": block_identities[0] if len(block_identities) == 1 else None,
+                "block_identities": block_identities,
+                "destinations": destinations,
+                "destination_shape": metadata.get("destination_shape"),
+                "destination_shape_source": metadata.get("destination_shape_source"),
+                "destination_slice": metadata.get("destination_slice"),
+                "measurement_kind": (
+                    measurement_kinds[0] if len(measurement_kinds) == 1 else "mixed_update_rms"
+                ),
+                "scoring_basis": "absolute_update_rms",
                 "fanout": len(members),
                 "measured_base_count": measured_base_count,
+                "update_rms": _auto_strength_safe_number(logical_norm),
+                "base_weight_rms": None,
+                "relative_perturbation": None,
+                "score": _auto_strength_safe_number(logical_norm),
                 "mean_norm": _auto_strength_safe_number(logical_norm),
-                "cohort_mean_norm": _auto_strength_safe_number(cohort_mean),
+                "cohort_reference_statistic": cohort_reference_statistics.get(cohort),
+                "cohort_reference_score": _auto_strength_safe_number(anomaly_reference),
+                "cohort_mean_norm": _auto_strength_safe_number(anomaly_reference),
+                "role_reference_score": _auto_strength_safe_number(role_reference),
+                "family_reference_score": _auto_strength_safe_number(family_reference),
+                "role_gain_raw": _auto_strength_safe_number(role_gain),
+                "depth_reference_score": _auto_strength_safe_number(depth_reference),
+                "depth_gain_raw": _auto_strength_safe_number(depth_gain_raw),
+                "anomaly_gain_raw": _auto_strength_safe_number(anomaly_gain_raw),
+                "log_deviation": _auto_strength_safe_number(log_deviation),
+                "robust_z": _auto_strength_safe_number(robust_z),
+                "outlier_candidate": logical_id in model.get("detected_candidate_ids", set()),
+                "outlier_corrected": logical_id in model.get("candidate_ids", set()),
                 "ratio_raw": _auto_strength_safe_number(ratio_raw),
                 "ratio_applied": _auto_strength_safe_number(ratio_applied),
                 "global_strength": global_strength,
                 "target_strength": target_strength,
                 "fallback_to_global": fallback_to_global,
+                "decision_reason": decision_reason,
+                "fallback_reason": fallback_reason,
+                "anomaly_fallback_reason": anomaly_fallback_reason,
                 "bases": bases_report,
             }
         )
 
-    logical_reports.sort(
-        key=lambda item: (
-            -abs((_auto_strength_safe_number(item.get("ratio_applied")) or 1.0) - 1.0),
+    def _report_sort_key(item: Dict[str, Any]) -> Tuple[Any, ...]:
+        if item.get("outlier_corrected"):
+            priority = 0
+        elif item.get("outlier_candidate"):
+            priority = 1
+        else:
+            priority = 2
+
+        ratio = _auto_strength_safe_number(item.get("ratio_raw"))
+        if ratio is not None and ratio > _AUTO_STRENGTH_EPS:
+            deviation = abs(math.log(ratio))
+        else:
+            deviation = _auto_strength_safe_number(item.get("log_deviation")) or 0.0
+
+        return (
+            priority,
+            -float(deviation),
             str(item.get("group") or ""),
             str(item.get("family") or ""),
             str(item.get("logical_id") or ""),
         )
-    )
+
+    logical_reports.sort(key=_report_sort_key)
 
     report = {
-        "schema": 1,
+        "schema": 2,
         "kind": "dora_auto_strength_report",
         "analysis_device_mode": str(analysis_device_mode),
         "analysis_load_device": _auto_strength_describe_device(analysis_load_device),
+        "scoring_basis": "absolute_update_rms",
+        "base_relative_scoring": False,
+        "cohort_reference_policy": {
+            "repeated_block_linear": "family_arithmetic_local_depth_log_median_plus_single_outlier_gate",
+            "other_tensor_families": "arithmetic_mean",
+        },
+        "linear_cohorting": "repeated_block_semantic_role_logical_shape_and_slice",
+        "linear_role_redistribution_policy": {
+            "family_reference": "arithmetic_mean_of_eligible_logical_sources",
+            "role_reference": "arithmetic_mean_fallback",
+            "minimum_role_sample": _AUTO_STRENGTH_LINEAR_ROLE_MIN_SAMPLE,
+            "fallback_gain": "family_reference_divided_by_role_reference",
+        },
+        "linear_depth_redistribution_policy": {
+            "minimum_sample": _AUTO_STRENGTH_LINEAR_DEPTH_MIN_SAMPLE,
+            "window_size": _AUTO_STRENGTH_LINEAR_DEPTH_WINDOW,
+            "local_reference": "centered_moving_log_median",
+            "gain": "family_reference_divided_by_local_depth_reference",
+            "preserves_local_residual_structure": True,
+        },
+        "linear_outlier_policy": {
+            "minimum_sample": _AUTO_STRENGTH_LINEAR_MIN_SAMPLE,
+            "mad_z_threshold": _AUTO_STRENGTH_LINEAR_MAD_Z,
+            "minimum_deviation_factor": _AUTO_STRENGTH_LINEAR_MIN_FACTOR,
+            "maximum_candidates": _AUTO_STRENGTH_LINEAR_MAX_CANDIDATES,
+            "correction_target": "cohort_log_median",
+            "composition": "depth_or_role_gain_times_outlier_gain",
+        },
         "strength_model": float(strength_model),
         "strength_clip": float(strength_clip),
         "ratio_floor": ratio_floor,
@@ -3800,42 +4637,110 @@ def _auto_strength_analyze_base_targets(
         "logical_groups_total": len(logical_members),
         "logical_groups_measured": measured_logical,
         "logical_groups_skipped_zero_strength": len(skipped_zero_strength_members),
+        "family_references": {
+            f"{group}/{family}": _auto_strength_safe_number(reference)
+            for (group, family), reference in sorted(family_references.items())
+        },
         "cohorts": cohorts_report,
         "logical_groups": logical_reports,
         "skipped_zero_strength_bases": sorted(skipped_zero_strength_bases),
         "unmeasured_bases": sorted(
-            base for base in base_groups.keys()
+            base
+            for base in base_groups.keys()
             if base not in base_norms and base not in skipped_zero_strength_bases
         ),
     }
 
     if verbose:
-        cohort_summary = {
-            f"{group}/{family}": mean
-            for (group, family), mean in sorted(group_means.items())
-        }
+        cohort_summary = {}
+        for cohort in sorted(set(base_cohorts.values())):
+            group, family, cohort_id = cohort
+            cohort_summary[f"{group}/{family}/{cohort_id}"] = {
+                "role_reference": _auto_strength_safe_number(
+                    cohort_role_references.get(cohort)
+                ),
+                "family_reference": _auto_strength_safe_number(
+                    family_references.get((group, family))
+                ),
+                "role_gain": _auto_strength_safe_number(cohort_role_gains.get(cohort)),
+                "depth_profile": {
+                    "eligible": bool(cohort_depth_models.get(cohort, {}).get("eligible")),
+                    "window_size": cohort_depth_models.get(cohort, {}).get("window_size"),
+                    "gain_min": _auto_strength_safe_number(
+                        min(
+                            [
+                                family_references.get((group, family)) / reference
+                                for reference in cohort_depth_models.get(cohort, {}).get("local_references", {}).values()
+                                if family_references.get((group, family)) is not None
+                                and reference > _AUTO_STRENGTH_EPS
+                            ],
+                            default=None,
+                        )
+                    ),
+                    "gain_max": _auto_strength_safe_number(
+                        max(
+                            [
+                                family_references.get((group, family)) / reference
+                                for reference in cohort_depth_models.get(cohort, {}).get("local_references", {}).values()
+                                if family_references.get((group, family)) is not None
+                                and reference > _AUTO_STRENGTH_EPS
+                            ],
+                            default=None,
+                        )
+                    ),
+                } if family == "linear" else None,
+                "anomaly_reference": _auto_strength_safe_number(
+                    cohort_anomaly_references.get(cohort)
+                ),
+                "outlier_candidates": int(
+                    cohort_models.get(cohort, {}).get("candidate_count", 0)
+                )
+                if family == "linear"
+                else None,
+                "anomaly_fallback": (
+                    cohort_models.get(cohort, {}).get("fallback_reason")
+                    if family == "linear"
+                    and not bool(cohort_models.get(cohort, {}).get("eligible"))
+                    else None
+                ),
+            }
+
         _LOG.info(
-            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (%s/%s logical groups) (cohort_means=%s ratio_floor=%s ratio_ceiling=%s)",
+            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (%s/%s logical groups) (scoring=absolute_update_rms linear_policy=family_local_depth_log_median_plus_single_outlier_gate family_references=%s cohorts=%s ratio_floor=%s ratio_ceiling=%s)",
             measured,
             total,
             measured_logical,
             len(logical_members),
+            report["family_references"],
             cohort_summary,
             ratio_floor,
             ratio_ceiling,
         )
-        sample = logical_reports[:20]
-        for item in sample:
+        for item in logical_reports[:20]:
             _LOG.info(
-                "[DoRA Power LoRA Loader] auto-strength: logical=%s group=%s family=%s fanout=%s mean_norm=%s cohort_mean=%s ratio=%s target=%s",
+                "[DoRA Power LoRA Loader] auto-strength: logical=%s group=%s family=%s role=%s block=%s fanout=%s update_rms=%s role_reference=%s family_reference=%s role_gain=%s depth_reference=%s depth_gain=%s anomaly_gain=%s robust_z=%s outlier=%s corrected=%s ratio_raw=%s ratio_applied=%s target=%s decision=%s fallback=%s anomaly_fallback=%s",
                 item.get("logical_id"),
                 item.get("group"),
                 item.get("family"),
+                item.get("semantic_role"),
+                item.get("block_identity") or item.get("block_identities"),
                 item.get("fanout"),
                 item.get("mean_norm"),
-                item.get("cohort_mean_norm"),
+                item.get("role_reference_score"),
+                item.get("family_reference_score"),
+                item.get("role_gain_raw"),
+                item.get("depth_reference_score"),
+                item.get("depth_gain_raw"),
+                item.get("anomaly_gain_raw"),
+                item.get("robust_z"),
+                item.get("outlier_candidate"),
+                item.get("outlier_corrected"),
+                item.get("ratio_raw"),
                 item.get("ratio_applied"),
                 item.get("target_strength"),
+                item.get("decision_reason"),
+                item.get("fallback_reason"),
+                item.get("anomaly_fallback_reason"),
             )
 
     return targets, report
@@ -4541,9 +5446,18 @@ def _auto_strength_report_line_for_group(item: Dict[str, Any]) -> str:
     target_text = "?" if target is None else f"{target:.4f}"
     norm_text = "?" if mean_norm is None else f"{mean_norm:.6g}"
     cohort_text = "?" if cohort_mean is None else f"{cohort_mean:.6g}"
+    role = str(item.get("semantic_role") or "unclassified")
+    block = item.get("block_identity")
+    fallback = item.get("fallback_reason")
+    decision = item.get("decision_reason")
+    reference_statistic = str(item.get("cohort_reference_statistic") or "reference")
+    block_text = f", block={block}" if block else ""
+    decision_text = f", decision={decision}" if decision else ""
+    fallback_text = f", fallback={fallback}" if fallback else ""
     return (
-        f"    - {item.get('group')}/{item.get('family')} :: {logical_id} "
-        f"(fanout={fanout}, ratio={ratio_text}, target={target_text}, norm={norm_text}, cohort={cohort_text})"
+        f"    - {item.get('group')}/{item.get('family')}/{role} :: {logical_id} "
+        f"(fanout={fanout}{block_text}, ratio={ratio_text}, target={target_text}, "
+        f"update_rms={norm_text}, cohort_{reference_statistic}={cohort_text}{decision_text}{fallback_text})"
     )
 
 
@@ -4605,6 +5519,8 @@ def _build_auto_strength_row_text_report(row: Dict[str, Any]) -> str:
     lines.extend(
         [
             f"  Analysis device  : {report.get('analysis_device_mode')} (load_device={report.get('analysis_load_device')})",
+            f"  Scoring          : {report.get('scoring_basis', 'absolute_update_rms')} (base_relative={bool(report.get('base_relative_scoring', False))})",
+            f"  Cohort reference : {report.get('cohort_reference_policy', {})}",
             f"  Ratio window     : {float(report.get('ratio_floor', 0.0)):.4f} .. {float(report.get('ratio_ceiling', 0.0)):.4f}",
             f"  Bases            : mapped={int(report.get('mapped_bases', 0))} analyzable={int(report.get('analyzable_bases', 0))} measured={int(report.get('measured_bases', 0))}",
             f"  Logical groups   : total={int(report.get('logical_groups_total', 0))} measured={int(report.get('logical_groups_measured', 0))} skipped_zero_strength={int(report.get('logical_groups_skipped_zero_strength', 0))}",
@@ -4614,18 +5530,33 @@ def _build_auto_strength_row_text_report(row: Dict[str, Any]) -> str:
     cohorts = report.get("cohorts") if isinstance(report.get("cohorts"), list) else []
     if cohorts:
         for cohort in cohorts:
-            mean_norm = _auto_strength_safe_number(cohort.get("mean_norm"))
-            mean_text = "?" if mean_norm is None else f"{mean_norm:.6g}"
+            reference = _auto_strength_safe_number(cohort.get("reference_score", cohort.get("mean_norm")))
+            reference_text = "?" if reference is None else f"{reference:.6g}"
+            role = cohort.get("semantic_role") or "unclassified"
+            statistic = cohort.get("reference_statistic") or "reference"
+            fallback = cohort.get("fallback_reason")
+            fallback_text = f" fallback={fallback}" if fallback else ""
+            outlier_text = ""
+            if cohort.get("family") == "linear":
+                outlier_text = " outliers={corrected}/{candidates} limit={limit}".format(
+                    corrected=int(cohort.get("corrected_logical_count", 0)),
+                    candidates=int(cohort.get("outlier_candidate_count", 0)),
+                    limit=int(cohort.get("outlier_candidate_limit", 0)),
+                )
             lines.append(
-                "    - {group}/{family}: mean={mean} logical={logical} measured_logical={measured_logical} bases={bases} measured_bases={measured_bases} skipped_zero_strength_bases={skipped}".format(
+                "    - {group}/{family}/{role}: {statistic}={reference} logical={logical} measured_logical={measured_logical} bases={bases} measured_bases={measured_bases} skipped_zero_strength_bases={skipped}{outliers}{fallback}".format(
                     group=cohort.get("group"),
                     family=cohort.get("family"),
-                    mean=mean_text,
+                    role=role,
+                    statistic=statistic,
+                    reference=reference_text,
                     logical=int(cohort.get("logical_count", 0)),
                     measured_logical=int(cohort.get("measured_logical_count", 0)),
                     bases=int(cohort.get("base_count", 0)),
                     measured_bases=int(cohort.get("measured_base_count", 0)),
                     skipped=int(cohort.get("skipped_zero_strength_base_count", 0)),
+                    outliers=outlier_text,
+                    fallback=fallback_text,
                 )
             )
     else:

@@ -1478,7 +1478,24 @@ class DoraAutoStrengthReportWidget {
       ctx.fillText(fitText(ctx, topLine, cardWidth - 24), x + 12, y + 48);
 
       const cohortNames = Array.isArray(row.report?.cohorts)
-        ? row.report.cohorts.map((cohort) => `${cohort.group}/${cohort.family}`).join("  ·  ")
+        ? row.report.cohorts
+            .map((cohort) => {
+              const name = `${cohort.group}/${cohort.family}/${cohort.semantic_role || "unclassified"}`;
+              if (cohort.family !== "linear") return name;
+              const minDepthGain = toFiniteNumberOrNull(cohort.depth_gain_min_raw);
+              const maxDepthGain = toFiniteNumberOrNull(cohort.depth_gain_max_raw);
+              const roleGain = toFiniteNumberOrNull(cohort.role_gain_raw);
+              let gainText = "gain —";
+              if (minDepthGain !== null && maxDepthGain !== null) {
+                gainText = Math.abs(maxDepthGain - minDepthGain) <= 1e-6
+                  ? `depth ×${formatNumber(minDepthGain, 2)}`
+                  : `depth ×${formatNumber(minDepthGain, 2)}–${formatNumber(maxDepthGain, 2)}`;
+              } else if (roleGain !== null) {
+                gainText = `role ×${formatNumber(roleGain, 2)}`;
+              }
+              return `${name} ${gainText} · ${cohort.corrected_logical_count || 0}/${cohort.outlier_candidate_count || 0} outliers corrected`;
+            })
+            .join("  ·  ")
         : "";
       ctx.fillText(fitText(ctx, cohortNames, cardWidth - 24), x + 12, y + 66);
 
