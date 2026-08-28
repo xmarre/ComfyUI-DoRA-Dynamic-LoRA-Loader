@@ -71,7 +71,8 @@ This node includes optional **auto-strength** redistribution for loaded LoRAs / 
 When enabled, the loader:
 
 - measures a comparable per-base update magnitude
-- computes a per-base target relative to the mean of similar mapped destinations
+- groups repeated transformer projections by mapped destination role, exact tensor shape, and slice identity
+- detects isolated per-base magnitude anomalies against comparable logical sources
 - converts those absolute targets into **redistribution ratios**
 - bakes only that **ratio** into the LoRA tensors before loading
 
@@ -92,13 +93,46 @@ then enabling auto-strength is a true no-op.
 
 ### Current auto-strength behavior
 
-- compares mapped bases using a normalized magnitude score
+- scores ordinary LoRA with absolute `RMS(ΔW)` after LoRA alpha/rank scaling
+- scores DoRA with the RMS of its actual post-normalization weight update
+- separates model and CLIP and keeps tensor families isolated
+- infers repeated-block projection roles structurally from mapped destination paths; there is no MiniMax-H3 role table
+- derives linear cohort shape from the adapter's logical update matrix when possible, so packed/quantized checkpoint storage does not split an otherwise identical role
+- retains the legacy broad **family arithmetic reference** across eligible linear logical sources
+- for ordered repeated-block roles, builds a robust **local depth reference** with a centered 7-member moving log-median
+- applies `family_reference / local_depth_reference` as the robust regional baseline, so a coherently weak depth region can still receive the large boosts that made the original Auto-strength useful
+- restores a configurable fraction of the remaining per-layer residual in log space: `final_gain = depth_gain * (local_depth_reference / layer_score)^β`
+- exposes **Auto-strength residual β** in the node and State Manager, clamped to `0…1`, with default `0.50`
+- `β = 0` reproduces the local-depth-only behavior; `β = 1` reproduces the original direct family/per-layer gain; intermediate values are geometric/log-space blends rather than linear ratio interpolation
+- uses one role-wide arithmetic-mean gain only as a fallback when a reliable depth profile cannot be inferred
+- isolated statistical outliers are promoted to residual exponent `1.0` regardless of β, preserving the conservative full correction already used for a single clearly broken member
+- multiple anomaly candidates suppress only the isolated-member correction; they do not suppress coherent depth redistribution
+- requires at least five ordered logical sources for depth profiling and at least five for isolated-outlier inference
+- leaves unclassifiable linear destinations at their normal global strength
+- preserves arithmetic-mean redistribution for non-linear families such as convolution cohorts
 - keeps Flux / Flux2 compat-broadcasted logical sources from being over-counted during measurement
 - preserves the normal outer patch strength during final application
-- is intended to redistribute relative base strength, not replace the row's overall weight
 - `auto` resolves to CPU-safe analysis
 - `gpu` is the explicit accelerator path
 - default node UI state is `gpu`
+
+The linear policy deliberately sits between the two previous extremes. The original
+implementation compared every individual layer directly with one broad family mean,
+which could produce useful 4–5× boosts but also reacted to every layer independently.
+The first role-aware redesign protected depth structure too aggressively and could
+collapse Auto-strength to a near no-op.
+
+The current policy keeps the original family target but estimates a robust local trend
+inside each semantic role. It then restores a controlled fraction of the remaining
+layer-to-layer residual in multiplicative/log space. This makes the behavior explicitly
+testable between the two useful endpoints instead of hard-coding another smoothing
+choice: β=0 is the current regional correction, β=1 is the old direct per-layer
+correction, and the default β=0.5 is their geometric midpoint for ordinary members.
+
+Ordinary LoRA scoring remains independent of destination weight numeric values.
+A base-relative score such as `RMS(ΔW) / RMS(W0)` would make the same LoRA
+redistribute differently across base checkpoints. DoRA remains the exception because
+its update is defined by normalization against the live effective destination weight.
 
 ### Performance note
 
