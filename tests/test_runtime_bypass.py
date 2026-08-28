@@ -250,6 +250,69 @@ def test_stacked_runtime_loras_match_additive_lora_math_and_restore_forward(dora
     torch.testing.assert_close(model.layer(x), base)
 
 
+def test_auto_strength_ratio_has_runtime_and_materialized_parity(dora_modules):
+    nodes, runtime = dora_modules
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = torch.nn.Linear(3, 2, bias=False)
+
+    source = {
+        "adapter.lora_up.weight": torch.tensor([[0.8], [-0.3]], dtype=torch.float32),
+        "adapter.lora_down.weight": torch.tensor([[0.4, -0.2, 0.6]], dtype=torch.float32),
+        "adapter.alpha": torch.tensor(1.0, dtype=torch.float32),
+    }
+    auto_ratio = 2.5
+    outer_strength = 0.65
+    scaled, changed = nodes._apply_base_strength_ratios(source, {"adapter": auto_ratio})
+    assert changed is True
+    adapter = nodes.comfy.lora.load_lora(
+        scaled,
+        {"adapter": "layer.weight"},
+    )["layer.weight"]
+
+    model = TinyModel()
+    with torch.no_grad():
+        model.layer.weight.copy_(
+            torch.tensor(
+                [[0.20, -0.40, 0.10], [0.50, 0.30, -0.20]],
+                dtype=torch.float32,
+            )
+        )
+    x = torch.tensor([[0.2, -0.7, 1.1], [1.3, 0.4, -0.2]], dtype=torch.float32)
+    base_output = model.layer(x).detach().clone()
+    expected_delta = (
+        F.linear(F.linear(x, source["adapter.lora_down.weight"]), source["adapter.lora_up.weight"])
+        * auto_ratio
+        * outer_strength
+    )
+
+    injections, hook_count = runtime._make_stacked_injection(
+        model,
+        [
+            {
+                "key": "layer.weight",
+                "adapter": adapter,
+                "strength": outer_strength,
+                "lora_name": "auto.safetensors",
+            }
+        ],
+    )
+    assert hook_count == 1
+    injections[0].inject(None)
+    try:
+        torch.testing.assert_close(model.layer(x), base_output + expected_delta)
+    finally:
+        injections[0].eject(None)
+
+    materialized_weight = model.layer.weight.detach() + (
+        source["adapter.lora_up.weight"] @ source["adapter.lora_down.weight"]
+    ) * auto_ratio * outer_strength
+    torch.testing.assert_close(F.linear(x, materialized_weight), base_output + expected_delta)
+    torch.testing.assert_close(model.layer(x), base_output)
+
+
 def test_load_loras_intercepts_cloned_patcher_end_to_end(dora_modules, monkeypatch):
     _, runtime = dora_modules
     comfy_weight_adapter = runtime.comfy.weight_adapter
