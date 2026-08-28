@@ -659,9 +659,45 @@ function setState(node, st) {
   node.properties.dora_power_lora = sanitizeState(st);
 }
 
+function notifyStateManagerOfLoaderChange(node, details = {}) {
+  if (!node) return false;
+  cancelScheduledStateManagerNotify(node);
+  const syncApi = globalThis.__doraStateManagerSyncApi;
+  if (typeof syncApi?.loaderStateChanged !== "function") return false;
+  try {
+    return !!syncApi.loaderStateChanged(node, details);
+  } catch (err) {
+    console.warn(`[${EXT_NAME}] Failed to synchronize loader state into State Manager`, err);
+    return false;
+  }
+}
+
+const STATE_MANAGER_NOTIFY_DELAY_MS = 150;
+const _stateManagerNotifyTimers = new WeakMap();
+
+function cancelScheduledStateManagerNotify(node) {
+  const timer = node ? _stateManagerNotifyTimers.get(node) : null;
+  if (timer == null) return false;
+  clearTimeout(timer);
+  _stateManagerNotifyTimers.delete(node);
+  return true;
+}
+
+function scheduleStateManagerNotify(node) {
+  if (!node) return false;
+  cancelScheduledStateManagerNotify(node);
+  const timer = setTimeout(() => {
+    _stateManagerNotifyTimers.delete(node);
+    notifyStateManagerOfLoaderChange(node);
+  }, STATE_MANAGER_NOTIFY_DELAY_MS);
+  _stateManagerNotifyTimers.set(node, timer);
+  return true;
+}
+
 function persistNodeState(node) {
   setState(node, { rows: node._doraRows || [], globals: node._doraGlobals || {} });
   clearExecutionReport(node);
+  scheduleStateManagerNotify(node);
 }
 
 
@@ -698,7 +734,7 @@ function installGlobalStateApi() {
       const state = getState(node);
       return { ...state, slot: getStateSlot(node), label: String(node?.title || getStateSlot(node)) };
     },
-    setState(node, externalState) {
+    setState(node, externalState, options = {}) {
       if (!node) return false;
       const next = normalizeExternalDoraState(externalState);
       if (externalState && Object.prototype.hasOwnProperty.call(externalState, "slot")) {
@@ -715,16 +751,21 @@ function installGlobalStateApi() {
       }
       node.setDirtyCanvas?.(true, true);
       node.graph?.change?.();
+      if (options?.notifyStateManager !== false) notifyStateManagerOfLoaderChange(node);
       return true;
     },
     getSlot(node) {
       return getStateSlot(node);
     },
-    setSlot(node, value) {
+    setSlot(node, value, options = {}) {
+      const previousSlot = getStateSlot(node);
       const slot = setStateSlot(node, value);
       try { rebuild(node); } catch (_) {}
       node?.setDirtyCanvas?.(true, true);
       node?.graph?.change?.();
+      if (options?.notifyStateManager !== false) {
+        notifyStateManagerOfLoaderChange(node, { previousSlot });
+      }
       return slot;
     },
   };
@@ -1577,9 +1618,11 @@ function buildUI(node, state, loraValues) {
   wRefresh.serialize = false;
 
   const wStateSlot = node.addWidget("text", "state_slot", getStateSlot(node), (v) => {
+    const previousSlot = getStateSlot(node);
     wStateSlot.value = setStateSlot(node, v);
     node.setDirtyCanvas?.(true, true);
     node.graph?.change?.();
+    notifyStateManagerOfLoaderChange(node, { previousSlot });
   });
   wStateSlot.label = "State slot";
 
@@ -1832,6 +1875,12 @@ app.registerExtension({
       this.resizable = true;
       rebuild(this);
       return r;
+    };
+
+    const origOnRemoved = nodeType.prototype.onRemoved;
+    nodeType.prototype.onRemoved = function () {
+      cancelScheduledStateManagerNotify(this);
+      return origOnRemoved?.apply(this, arguments);
     };
 
     const origConfigure = nodeType.prototype.configure;

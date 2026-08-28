@@ -31,6 +31,8 @@ async function loadLoaderExtension() {
   let extension = null;
   const previousFetch = globalThis.fetch;
   const previousLiteGraph = globalThis.LiteGraph;
+  const previousStateManagerSyncApi = globalThis.__doraStateManagerSyncApi;
+  const syncCalls = [];
 
   globalThis.fetch = async () => ({
     ok: true,
@@ -49,6 +51,12 @@ async function loadLoaderExtension() {
   globalThis.__doraWidgetCompatibilityTestApi = {
     addEventListener() {},
   };
+  globalThis.__doraStateManagerSyncApi = {
+    loaderStateChanged(node, details = {}) {
+      syncCalls.push({ node, details });
+      return 1;
+    },
+  };
 
   source = source
     .replace(
@@ -65,6 +73,8 @@ async function loadLoaderExtension() {
     delete globalThis.__doraWidgetCompatibilityTestApi;
     globalThis.fetch = previousFetch;
     globalThis.LiteGraph = previousLiteGraph;
+    if (previousStateManagerSyncApi === undefined) delete globalThis.__doraStateManagerSyncApi;
+    else globalThis.__doraStateManagerSyncApi = previousStateManagerSyncApi;
   };
 
   try {
@@ -76,7 +86,7 @@ async function loadLoaderExtension() {
   }
 
   assert.ok(extension, "loader extension should register");
-  return { cleanup, extension };
+  return { cleanup, extension, syncCalls };
 }
 
 function makeNodeType() {
@@ -228,6 +238,52 @@ test("frontend normalization and rebuilds preserve live DoRA custom widget behav
     assert.equal(typeof reportWidget.draw, "function");
     assert.equal(typeof reportWidget.mouse, "function");
     assert.equal(typeof reportWidget._displayRows, "function");
+  } finally {
+    cleanup();
+  }
+});
+
+
+test("loader-owned settings debounce continuous edits while discrete slot changes stay immediate", async () => {
+  const { cleanup, extension, syncCalls } = await loadLoaderExtension();
+  try {
+    const NodeType = makeNodeType();
+    await extension.beforeRegisterNodeDef(NodeType, {
+      display_name: NODE_CLASS,
+      name: NODE_CLASS,
+    });
+
+    const node = new NodeType();
+    node.onNodeCreated();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    syncCalls.length = 0;
+
+    const autoStrength = node.widgets.find((widget) => widget.name === "auto_strength_enabled");
+    assert.equal(typeof autoStrength?.callback, "function");
+    autoStrength.callback(true);
+    autoStrength.callback(false);
+    autoStrength.callback(true);
+    assert.equal(node.properties.dora_power_lora.globals.auto_strength_enabled, true);
+    assert.equal(syncCalls.length, 0, "continuous loader edits should be coalesced before notifying State Manager");
+
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    assert.equal(syncCalls.length, 1);
+    assert.strictEqual(syncCalls[0]?.node, node);
+
+    const stateSlot = node.widgets.find((widget) => widget.name === "state_slot");
+    assert.equal(typeof stateSlot?.callback, "function");
+    stateSlot.callback("character_style");
+    assert.equal(node.properties.dora_state_slot, "character_style");
+    assert.equal(syncCalls.length, 2, "State slot identity changes should synchronize immediately");
+    assert.strictEqual(syncCalls.at(-1)?.node, node);
+    assert.equal(syncCalls.at(-1)?.details?.previousSlot, "loader_42");
+
+    autoStrength.callback(false);
+    assert.equal(syncCalls.length, 2);
+    node.onRemoved?.();
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    assert.equal(syncCalls.length, 2, "removing the loader must cancel a pending debounced notification");
   } finally {
     cleanup();
   }
