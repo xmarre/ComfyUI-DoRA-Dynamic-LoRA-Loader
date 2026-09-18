@@ -1767,7 +1767,7 @@ async function waitForStateManagerLibraryIdle(timeoutMs = 10000) {
   }
 }
 
-async function updateManagedStateTextBox(managerNode, textNode, text, { persist = true } = {}) {
+async function updateManagedStateTextBox(managerNode, textNode, text, { persist = true, render = true } = {}) {
   if (!isStateManagerNode(managerNode)) {
     throw new Error("The connected state_control source is not a State Manager node.");
   }
@@ -1793,6 +1793,7 @@ async function updateManagedStateTextBox(managerNode, textNode, text, { persist 
   updateState(managerNode, nextState, current.uiState, {
     status: "Updated managed prompt text from an external integration.",
     persist,
+    render,
   });
   applyTextToNode(textNode, value, role);
   mirrorStateTextToDownstreamWidgets(textNode, value, role);
