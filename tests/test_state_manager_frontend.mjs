@@ -187,6 +187,8 @@ test("managed State Manager external write is server-confirmed before reporting 
   helpers.stateLibraryClient.blocked = false;
 
   const calls = [];
+  const previousRaf = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = () => 1;
   globalThis.__dsmTestFetchApi = async (path, options = {}) => {
     calls.push({ path, options });
     const request = JSON.parse(options.body);
@@ -239,6 +241,8 @@ test("managed State Manager external write is server-confirmed before reporting 
     );
   } finally {
     delete globalThis.__dsmTestFetchApi;
+    if (previousRaf === undefined) delete globalThis.requestAnimationFrame;
+    else globalThis.requestAnimationFrame = previousRaf;
   }
 });
 
