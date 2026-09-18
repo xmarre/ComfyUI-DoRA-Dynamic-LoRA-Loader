@@ -1,5 +1,6 @@
 import logging
 import json
+import hashlib
 import math
 import random
 import os
@@ -4880,9 +4881,20 @@ class StateManagerTextBox:
     def emit(self, role: Any, text: Any = "", state_slot: Any = "default", state_control: Any = None):
         state_payload = _normalize_runtime_dora_state_payload(state_control)
         controlled_text = _state_payload_text_for_box(state_payload, role, state_slot)
-        if controlled_text is not None:
-            return (controlled_text,)
-        return (str(text or ""),)
+        source = "controlled" if controlled_text is not None else "local"
+        effective_text = str(controlled_text if controlled_text is not None else (text or ""))
+        digest = hashlib.sha256(effective_text.encode("utf-8")).hexdigest()
+        timeline = bool(re.search(r"(?m)^\s*\[[0-9]+(?:\.[0-9]+)?-[0-9]+(?:\.[0-9]+)?s\]\s*$", effective_text))
+        _LOG.info(
+            "[State Manager] text-box runtime receipt role=%r slot=%r source=%s chars=%d timeline=%s digest=%s",
+            str(role),
+            str(state_slot),
+            source,
+            len(effective_text),
+            timeline,
+            digest,
+        )
+        return (effective_text,)
 
 
 class StateManagerSeed:
