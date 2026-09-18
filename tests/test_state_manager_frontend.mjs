@@ -10,7 +10,7 @@ async function loadStateManagerHelpers() {
     .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
     .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi() { throw new Error('not used'); }, apiURL(value) { return value; } };")
     .replace('import "../../scripts/domWidget.js";', "");
-  source += `\nexport { capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, updateManagedStateTextBox };\n`;
+  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, updateManagedStateTextBox, mutatePromptForStateManagers };\n`;
   const encoded = Buffer.from(source, "utf8").toString("base64");
   return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
 }
@@ -106,6 +106,124 @@ test("managed State Manager text integration updates the authoritative selected 
     selected.text_boxes.find((box) => box.role === "positive" && box.slot === "default").text,
     timeline,
   );
+});
+
+
+test("ordinary queues materialize managed State Manager text into Impact wildcard runtime inputs", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const timeline = "Global.\n\n[0-7s]\nOne.\n\n[7-14s]\nTwo.";
+  const state = {
+    version: 3,
+    characters: [{
+      id: "character-a",
+      name: "Character A",
+      prompts: [{
+        id: "prompt-a",
+        name: "Prompt A",
+        positive: timeline,
+        negative: "",
+        text_boxes: [
+          { role: "positive", slot: "default", label: "Default positive", text: timeline },
+          { role: "negative", slot: "default", label: "Default negative", text: "" },
+        ],
+        settings: {},
+      }],
+    }],
+  };
+
+  for (const mode of ["fixed", "populate", "reproduce"]) {
+    const manager = {
+      id: 1,
+      type: "State Manager",
+      comfyClass: "State Manager",
+      inputs: [],
+      outputs: [{ name: "state_control", type: "STATE_MANAGER_CONTROL", links: [12] }],
+      widgets: [
+        { name: "state_json", value: helpers.serializeBinding() },
+        { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+        { name: "selected_character_id", value: "character-a" },
+        { name: "selected_prompt_id", value: "prompt-a" },
+      ],
+      __dsm: { state: structuredClone(state), uiState: {} },
+    };
+    const textNode = {
+      id: 2,
+      type: "State Manager Text Box",
+      comfyClass: "State Manager Text Box",
+      inputs: [{ name: "state_control", type: "STATE_MANAGER_CONTROL", link: 12 }],
+      outputs: [{ name: "text", type: "STRING", links: [13] }],
+      widgets: [
+        { name: "role", value: "positive" },
+        { name: "text", value: "stale local text" },
+        { name: "state_slot", value: "default" },
+      ],
+    };
+    const impact = {
+      id: 3,
+      type: "ImpactWildcardProcessor",
+      comfyClass: "ImpactWildcardProcessor",
+      inputs: [{ name: "wildcard_text", type: "STRING", link: 13 }],
+      outputs: [{ name: "STRING", type: "STRING", links: [] }],
+      widgets: [
+        { name: "wildcard_text", value: "stale wildcard" },
+        { name: "populated_text", value: "stale populated" },
+        { name: "mode", value: mode },
+        { name: "seed", value: 123 },
+      ],
+    };
+    const nodes = [manager, textNode, impact];
+    const graph = {
+      _nodes: nodes,
+      links: {
+        12: { origin_id: 1, origin_slot: 0, target_id: 2, target_slot: 0 },
+        13: { origin_id: 2, origin_slot: 0, target_id: 3, target_slot: 0 },
+      },
+      getNodeById(id) { return nodes.find((node) => node.id === id) || null; },
+      change() {},
+    };
+    nodes.forEach((node) => { node.graph = graph; });
+    helpers.app.graph = graph;
+
+    const promptPayload = {
+      output: {
+        "1": {
+          class_type: "StateManager",
+          inputs: {
+            state_json: helpers.serializeBinding(),
+            ui_state_json: helpers.serializeWorkflowUiState({}),
+            selected_character_id: "character-a",
+            selected_prompt_id: "prompt-a",
+          },
+        },
+        "2": {
+          class_type: "StateManagerTextBox",
+          inputs: {
+            role: "positive",
+            text: "stale local text",
+            state_slot: "default",
+            state_control: ["1", 7],
+          },
+        },
+        "3": {
+          class_type: "ImpactWildcardProcessor",
+          inputs: {
+            wildcard_text: ["2", 0],
+            populated_text: "stale populated",
+            mode,
+            seed: 123,
+          },
+        },
+      },
+      workflow: { nodes: [] },
+    };
+
+    const changed = helpers.mutatePromptForStateManagers(promptPayload, 0, 1);
+    assert.ok(changed >= 3);
+    assert.equal(promptPayload.output["2"].inputs.text, timeline);
+    assert.equal(promptPayload.output["3"].inputs.wildcard_text, timeline);
+    assert.equal(promptPayload.output["3"].inputs.populated_text, timeline);
+    assert.equal(promptPayload.output["3"].inputs.mode, mode);
+  }
 });
 
 
