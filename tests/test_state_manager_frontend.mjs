@@ -10,7 +10,7 @@ async function loadStateManagerHelpers() {
     .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
     .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi() { throw new Error('not used'); }, apiURL(value) { return value; } };")
     .replace('import "../../scripts/domWidget.js";', "");
-  source += `\nexport { capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary };\n`;
+  source += `\nexport { capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, updateManagedStateTextBox };\n`;
   const encoded = Buffer.from(source, "utf8").toString("base64");
   return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
 }
@@ -23,6 +23,89 @@ function privateCharacter(id, name, promptText) {
     prompts: [{ id: `${id}-prompt`, name: "Private preset", positive: promptText }],
   };
 }
+
+
+test("managed State Manager text integration updates the authoritative selected prompt", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const state = {
+    version: 3,
+    characters: [{
+      id: "character-a",
+      name: "Character A",
+      prompts: [{
+        id: "prompt-a",
+        name: "Prompt A",
+        positive: "old prompt",
+        negative: "",
+        text_boxes: [
+          { role: "positive", slot: "default", label: "Default positive", text: "old prompt" },
+          { role: "negative", slot: "default", label: "Default negative", text: "" },
+        ],
+        settings: {},
+      }],
+    }],
+  };
+  const nodes = new Map();
+  const graph = {
+    links: {
+      12: { origin_id: 1, origin_slot: 0, target_id: 2, target_slot: 0 },
+    },
+    getNodeById(id) { return nodes.get(id) || null; },
+    change() {},
+  };
+  const manager = {
+    id: 1,
+    type: "State Manager",
+    comfyClass: "State Manager",
+    outputs: [{ name: "state_control", type: "STATE_MANAGER_CONTROL", links: [12] }],
+    widgets: [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: "character-a" },
+      { name: "selected_prompt_id", value: "prompt-a" },
+    ],
+    properties: {},
+    __dsm: { state, uiState: {}, renderFrame: 0 },
+    graph,
+  };
+  const textWidget = { name: "text", value: "old prompt" };
+  const textNode = {
+    id: 2,
+    type: "State Manager Text Box",
+    comfyClass: "State Manager Text Box",
+    inputs: [{ name: "state_control", type: "STATE_MANAGER_CONTROL", link: 12 }],
+    outputs: [{ name: "text", type: "STRING", links: [] }],
+    widgets: [
+      { name: "role", value: "positive" },
+      textWidget,
+      { name: "state_slot", value: "default" },
+    ],
+    graph,
+  };
+  nodes.set(1, manager);
+  nodes.set(2, textNode);
+
+  const timeline = "Global.\n\n[0-7s]\nOne.\n\n[7-14s]\nTwo.";
+  const result = await helpers.updateManagedStateTextBox(
+    manager,
+    textNode,
+    timeline,
+    { persist: false, render: false },
+  );
+
+  assert.equal(result.status, "updated");
+  assert.equal(result.role, "positive");
+  assert.equal(result.slot, "default");
+  assert.equal(textWidget.value, timeline);
+  const selected = manager.__dsm.state.characters
+    .find((character) => character.id === "character-a")
+    .prompts.find((prompt) => prompt.id === "prompt-a");
+  assert.equal(selected.positive, timeline);
+  assert.equal(
+    selected.text_boxes.find((box) => box.role === "positive" && box.slot === "default").text,
+    timeline,
+  );
+});
 
 
 test("workflow binding contains IDs/configuration only and no private library payload", async () => {
