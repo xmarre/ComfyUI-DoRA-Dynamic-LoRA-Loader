@@ -4424,23 +4424,6 @@ function mutateQueuedDoraLoaders(promptPayload, managerNode, character) {
   return changed;
 }
 
-function mutateQueuedImpactWildcardTargets(promptPayload, textNode, text) {
-  const value = String(text ?? "");
-  let changed = 0;
-  for (const target of getOutputTargets(textNode, STATE_TEXT_OUTPUT_NAMES)) {
-    if (!target?.node || !isImpactWildcardNode(target.node)) continue;
-
-    // ImpactWildcardProcessor/Encode execute from populated_text. In populate mode,
-    // Impact Pack's server-side queue hook processes wildcard_text before execution.
-    // A connected STRING is serialized as a link, so make the State Manager's
-    // authoritative concrete text explicit in the queued processor inputs. The
-    // editor graph remains connected; this mutation is queue-local.
-    changed += setQueuedInput(promptPayload, target.node, "wildcard_text", value, { addIfMissing: true, syncWidget: false });
-    changed += setQueuedInput(promptPayload, target.node, "populated_text", value, { addIfMissing: true, syncWidget: false });
-  }
-  return changed;
-}
-
 function mutateQueuedStateTextBoxes(promptPayload, managerNode, prompt) {
   const controlled = getControlledNodes(managerNode).filter((node) => node && node !== managerNode);
   const textNodes = controlled.filter(isStateTextNode);
@@ -4451,8 +4434,10 @@ function mutateQueuedStateTextBoxes(promptPayload, managerNode, prompt) {
     const saved = findPromptTextBox(prompt, role, slot, { allowRoleFallback: false }) || findPromptTextBox(prompt, role, slot, { allowRoleFallback: true });
     if (!saved) continue;
     const value = String(saved.text ?? "");
+    // Keep the submitted STRING link intact. The backend prompt bridge resolves
+    // the authoritative persistent value and materializes downstream Impact
+    // wildcard inputs server-side, after ComfyUI has serialized the graph.
     changed += setQueuedWidgetInput(promptPayload, textNode, "text", value);
-    changed += mutateQueuedImpactWildcardTargets(promptPayload, textNode, value);
   }
   return changed;
 }
@@ -4523,9 +4508,9 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
     if (!character || !prompt) continue;
 
     // State Manager Text Boxes are runtime-owned even in an ordinary queue with
-    // no prompt/character wildcarding. Always materialize their selected saved
-    // text into the queued API payload, including queue-local Impact wildcard
-    // mirrors, before considering the optional queue-variation features below.
+    // no prompt/character wildcarding. Materialize their selected saved text into
+    // the queued Text Box input while preserving downstream STRING links. The
+    // backend prompt bridge owns final Impact wildcard materialization.
     changed += mutateQueuedStateTextBoxes(promptPayload, node, prompt);
 
     const hasQueueOverrides = !!(
