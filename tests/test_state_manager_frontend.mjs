@@ -223,6 +223,8 @@ test("managed State Manager external write is server-confirmed before reporting 
     assert.equal(result.status, "updated");
     assert.equal(result.persistent_verified, true);
     assert.equal(result.library_revision, 8);
+    assert.equal(result.contract_version, 4);
+    assert.equal(result.write_revision, "backend-write-v1");
     assert.equal(textWidget.value, timeline);
     assert.equal(calls.length, 1);
     assert.equal(
@@ -456,6 +458,8 @@ test("ordinary queues preserve Impact links and carry request-local persistent i
     assert.equal(queuedUi.__dsm_library_user_id, "queue-user");
     assert.equal(queuedUi.__dsm_queued_runtime_character_id, "character-a");
     assert.equal(queuedUi.__dsm_queued_runtime_prompt_id, "prompt-a");
+    assert.equal(queuedUi.__dsm_frontend_prompt_contract_version, 4);
+    assert.equal(queuedUi.__dsm_frontend_prompt_contract_revision, "backend-write-v1");
     assert.equal(Object.prototype.hasOwnProperty.call(queuedUi, "__dsm_queued_runtime_nonce"), false);
     assert.equal(Object.prototype.hasOwnProperty.call(JSON.parse(manager.widgets[1].value), "__dsm_library_user_id"), false);
   }
@@ -745,6 +749,8 @@ test("queued manager override carries a runtime seed and selection metadata only
   assert.equal(parsed.__dsm_library_user_id, "default");
   assert.equal(parsed.__dsm_queued_runtime_character_id, "8e7dd506-439d-4040-b5ba-d9e258259abc");
   assert.equal(parsed.__dsm_queued_runtime_prompt_id, "0a4f988a-4f17-4df6-9d2f-5f0042e9306b");
+  assert.equal(parsed.__dsm_frontend_prompt_contract_version, 4);
+  assert.equal(parsed.__dsm_frontend_prompt_contract_revision, "backend-write-v1");
   assert.equal(Object.prototype.hasOwnProperty.call(parsed, "__dsm_queued_runtime_state"), false);
   assert.equal(serialized.includes("Private Character"), false);
 });
