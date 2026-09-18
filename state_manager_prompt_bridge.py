@@ -262,7 +262,7 @@ def materialize_state_manager_impact_prompts(
                     impact_changed = True
 
             _LOG.info(
-                "[State Manager] backend Impact prompt bridge text_node=%s manager=%s impact_node=%s impact_class=%s mode=%r role=%r slot=%r selection_source=%s character=%r prompt=%r queued_match=%s chars=%d timeline=%s digest=%s changed=%s",
+                "[State Manager] backend Impact prompt bridge revision=identity-v2 text_node=%s manager=%s impact_node=%s impact_class=%s mode=%r role=%r slot=%r selection_source=%s character=%r prompt=%r queued_match=%s chars=%d timeline=%s digest=%s changed=%s",
                 text_id,
                 manager_id,
                 impact_id,
@@ -313,3 +313,4 @@ def register_prompt_bridge(
 
     server.add_on_prompt_handler(on_prompt)
     setattr(server, marker, True)
+    _LOG.info("[State Manager] backend Impact prompt bridge registered revision=identity-v2")
