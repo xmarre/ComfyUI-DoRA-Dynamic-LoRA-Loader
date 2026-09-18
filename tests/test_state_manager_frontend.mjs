@@ -27,10 +27,14 @@ function privateCharacter(id, name, promptText) {
 
 test("managed State Manager text integration updates the authoritative selected prompt", async () => {
   const helpers = await loadStateManagerHelpers();
-  assert.equal(globalThis.__doraStateManagerPromptApi?.contract_version, 2);
+  assert.equal(globalThis.__doraStateManagerPromptApi?.contract_version, 3);
   assert.deepEqual(
     [...(globalThis.__doraStateManagerPromptApi?.capabilities || [])],
-    ["authoritative_persistent_text_v1", "impact_wildcard_queue_bridge_v1"],
+    [
+      "authoritative_persistent_text_v1",
+      "impact_wildcard_queue_bridge_v1",
+      "backend_impact_prompt_bridge_v1",
+    ],
   );
   assert.equal(typeof globalThis.__doraStateManagerPromptApi?.setTextBox, "function");
   const state = {
