@@ -108,6 +108,57 @@ def test_backend_bridge_materializes_authoritative_timeline_for_impact_modes(
     assert payload["prompt"]["251"]["inputs"]["seed"] == 123
 
 
+def test_backend_bridge_recovers_source_after_frontend_literalized_impact_input(configured_nodes, bridge):
+    nodes = configured_nodes
+    timeline = "[0-7s]\nRecovered from persistent State Manager text."
+    character = _persistent_character(timeline)
+    nodes._get_state_manager_store().replace([character], 0)
+    payload = _prompt(nodes, character)
+
+    # Simulate the previous frontend bridge: it replaced the API-prompt link
+    # with a concrete (and potentially stale) string after prompt serialization.
+    payload["prompt"]["251"]["inputs"]["wildcard_text"] = "stale frontend literal"
+    payload["prompt"]["251"]["inputs"]["populated_text"] = "stale frontend literal"
+    payload["extra_data"] = {
+        "extra_pnginfo": {
+            "workflow": {
+                "nodes": [
+                    {
+                        "id": 250,
+                        "type": "State Manager Text Box",
+                        "inputs": [
+                            {"name": "state_control", "type": "STATE_MANAGER_CONTROL", "link": 12},
+                        ],
+                    },
+                    {
+                        "id": 251,
+                        "type": "ImpactWildcardProcessor",
+                        "inputs": [
+                            {"name": "wildcard_text", "type": "STRING", "link": 13},
+                        ],
+                    },
+                ],
+                "links": [
+                    [12, 249, 7, 250, 0, "STATE_MANAGER_CONTROL"],
+                    [13, 250, 0, 251, 0, "STRING"],
+                ],
+            }
+        }
+    }
+
+    changed = bridge.materialize_state_manager_impact_prompts(
+        payload,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=nodes._state_payload_text_for_box,
+    )
+
+    assert changed == 3
+    assert payload["prompt"]["250"]["inputs"]["text"] == timeline
+    assert payload["prompt"]["251"]["inputs"]["wildcard_text"] == timeline
+    assert payload["prompt"]["251"]["inputs"]["populated_text"] == timeline
+
+
 def test_backend_bridge_uses_queued_library_user(configured_nodes, bridge):
     nodes = configured_nodes
     first = _persistent_character("wrong")
