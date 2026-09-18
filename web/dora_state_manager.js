@@ -1877,11 +1877,12 @@ async function updateManagedStateTextBox(managerNode, textNode, text, { persist 
 
 function installStateManagerPromptIntegrationApi() {
   globalThis.__doraStateManagerPromptApi = {
-    contract_version: 3,
+    contract_version: 4,
     capabilities: Object.freeze([
       "authoritative_persistent_text_v1",
       "impact_wildcard_queue_bridge_v1",
       "backend_impact_prompt_bridge_v1",
+      "backend_persistent_text_write_v1",
     ]),
     async setTextBox(managerNode, textNode, text) {
       return updateManagedStateTextBox(managerNode, textNode, text, { persist: true });
