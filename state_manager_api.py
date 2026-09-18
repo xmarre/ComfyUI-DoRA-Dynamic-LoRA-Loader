@@ -126,6 +126,7 @@ def register_routes(
             slot = str(payload.get("slot", "default") or "default")
             text = str(payload.get("text", "") or "")
             label = str(payload.get("label", "") or "")
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
             LOGGER.info(
                 "[State Manager] managed prompt write request revision=backend-write-v1 character=%r prompt=%r role=%r slot=%r expected_revision=%r chars=%d timeline=%s digest=%s",
                 character_id,
@@ -148,7 +149,6 @@ def register_routes(
                 label,
             )
 
-            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
             LOGGER.info(
                 "[State Manager] managed prompt write revision=backend-write-v1 character=%r prompt=%r role=%r slot=%r chars=%d timeline=%s digest=%s library_revision=%d",
                 character_id,
