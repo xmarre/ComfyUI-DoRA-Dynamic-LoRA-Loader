@@ -182,6 +182,14 @@ def test_backend_bridge_uses_queued_library_user(configured_nodes, bridge):
     assert payload["prompt"]["251"]["inputs"]["populated_text"] == second_text
 
 
+def test_backend_bridge_reads_frontend_contract_provenance(bridge):
+    assert bridge._queued_frontend_contract(json.dumps({
+        "__dsm_frontend_prompt_contract_version": 4,
+        "__dsm_frontend_prompt_contract_revision": "backend-write-v1",
+    })) == (4, "backend-write-v1")
+    assert bridge._queued_frontend_contract("{}") == (0, "")
+
+
 def test_backend_bridge_uses_request_local_selection_metadata(configured_nodes, bridge):
     nodes = configured_nodes
     stale = _persistent_character("stale prompt")
