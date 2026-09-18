@@ -172,6 +172,63 @@ def test_revision_conflict_prevents_stale_update_loss(store):
     assert store.snapshot() == current
 
 
+def test_atomic_prompt_text_box_update_preserves_unrelated_library_state(store):
+    selected = make_character("Selected")
+    unrelated = make_character("Unrelated")
+    first = store.replace([selected, unrelated], 0)
+    before_unrelated = first["characters"][1]
+
+    timeline = "Global.\n\n[0-7s]\nOne.\n\n[7-14s]\nTwo."
+    updated = store.update_prompt_text_box(
+        selected["id"],
+        selected["prompts"][0]["id"],
+        "positive",
+        "default",
+        timeline,
+        first["revision"],
+        "Canonical Timeline",
+    )
+
+    assert updated["revision"] == first["revision"] + 1
+    selected_after = updated["characters"][0]
+    prompt_after = selected_after["prompts"][0]
+    box_after = next(
+        box for box in prompt_after["text_boxes"]
+        if box["role"] == "positive" and box["slot"] == "default"
+    )
+    assert box_after["text"] == timeline
+    assert box_after["label"] == "Canonical Timeline"
+    assert prompt_after["positive"] == timeline
+    assert updated["characters"][1] == before_unrelated
+
+    with pytest.raises(StateLibraryRevisionConflict):
+        store.update_prompt_text_box(
+            selected["id"],
+            selected["prompts"][0]["id"],
+            "positive",
+            "default",
+            "stale overwrite",
+            first["revision"],
+        )
+    assert store.snapshot() == updated
+
+
+def test_atomic_prompt_text_box_update_rejects_missing_exact_selection(store):
+    selected = make_character("Selected")
+    first = store.replace([selected], 0)
+
+    with pytest.raises(StatePresetNotFound, match="character preset"):
+        store.update_prompt_text_box(
+            str(uuid.uuid4()),
+            selected["prompts"][0]["id"],
+            "positive",
+            "default",
+            "must not fall back",
+            first["revision"],
+        )
+    assert store.snapshot() == first
+
+
 def test_concurrent_writers_have_one_winner(store):
     barrier = threading.Barrier(2)
     results = []
