@@ -65,6 +65,25 @@ def _queued_runtime_selection(
     return str(fallback_character_id or ""), str(fallback_prompt_id or ""), "manager_inputs"
 
 
+def _queued_frontend_contract(ui_state_json: Any) -> tuple[int, str]:
+    parsed: Dict[str, Any] = {}
+    if isinstance(ui_state_json, dict):
+        parsed = ui_state_json
+    elif isinstance(ui_state_json, str) and ui_state_json.strip():
+        try:
+            value = json.loads(ui_state_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value = {}
+        if isinstance(value, dict):
+            parsed = value
+    try:
+        version = int(parsed.get("__dsm_frontend_prompt_contract_version", 0) or 0)
+    except (TypeError, ValueError):
+        version = 0
+    revision = str(parsed.get("__dsm_frontend_prompt_contract_revision", "") or "")
+    return version, revision
+
+
 def _text_fingerprint(value: Any) -> tuple[int, bool, str]:
     text = str(value or "")
     return (
@@ -205,6 +224,7 @@ def materialize_state_manager_impact_prompts(
                 manager_inputs.get("selected_character_id", ""),
                 manager_inputs.get("selected_prompt_id", ""),
             )
+            frontend_contract_version, frontend_contract_revision = _queued_frontend_contract(ui_state_json)
             payload = resolve_payload(
                 manager_inputs.get("state_json", ""),
                 selected_character_id,
@@ -235,12 +255,14 @@ def materialize_state_manager_impact_prompts(
 
         if not queued_matches_persistent:
             _LOG.warning(
-                "[State Manager] managed text queue/persistent mismatch text_node=%s manager=%s selection_source=%s character=%r prompt=%r queued_chars=%d queued_timeline=%s queued_digest=%s persistent_chars=%d persistent_timeline=%s persistent_digest=%s",
+                "[State Manager] managed text queue/persistent mismatch text_node=%s manager=%s selection_source=%s character=%r prompt=%r frontend_contract=%d frontend_revision=%r queued_chars=%d queued_timeline=%s queued_digest=%s persistent_chars=%d persistent_timeline=%s persistent_digest=%s",
                 text_id,
                 manager_id,
                 selection_source,
                 selected_character_id,
                 selected_prompt_id,
+                frontend_contract_version,
+                frontend_contract_revision,
                 queued_chars,
                 queued_timeline,
                 queued_digest,
@@ -262,7 +284,9 @@ def materialize_state_manager_impact_prompts(
                     impact_changed = True
 
             _LOG.info(
-                "[State Manager] backend Impact prompt bridge revision=identity-v2 text_node=%s manager=%s impact_node=%s impact_class=%s mode=%r role=%r slot=%r selection_source=%s character=%r prompt=%r queued_match=%s chars=%d timeline=%s digest=%s changed=%s",
+                "[State Manager] backend Impact prompt bridge revision=identity-v2 contract=v4 frontend_contract=%d frontend_revision=%r text_node=%s manager=%s impact_node=%s impact_class=%s mode=%r role=%r slot=%r selection_source=%s character=%r prompt=%r queued_match=%s chars=%d timeline=%s digest=%s changed=%s",
+                frontend_contract_version,
+                frontend_contract_revision,
                 text_id,
                 manager_id,
                 impact_id,
@@ -313,4 +337,4 @@ def register_prompt_bridge(
 
     server.add_on_prompt_handler(on_prompt)
     setattr(server, marker, True)
-    _LOG.info("[State Manager] backend Impact prompt bridge registered revision=identity-v2")
+    _LOG.info("[State Manager] backend Impact prompt bridge registered revision=identity-v2 contract=v4 backend_write=backend-write-v1")
