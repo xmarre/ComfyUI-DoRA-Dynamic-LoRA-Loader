@@ -1778,33 +1778,49 @@ async function updateManagedStateTextBox(managerNode, textNode, text, { persist 
     throw new Error("The State Manager does not own the connected Text Box through state_control.");
   }
 
-  const current = getRenderableState(managerNode);
-  const nextState = structuredCloneCompat(current.state);
-  const { prompt } = ensureSelection(managerNode, nextState);
-  if (!prompt || prompt.__dsm_ephemeral) {
-    throw new Error("The selected State Manager prompt is not available locally.");
-  }
-
   const role = getStateTextRole(textNode);
   const slot = getStateTextSlot(textNode, role, "default");
   const value = String(text ?? "");
-  setPromptTextBox(prompt, role, slot, value, stateTextLabel(textNode, role, slot));
+  const label = stateTextLabel(textNode, role, slot);
 
-  updateState(managerNode, nextState, current.uiState, {
-    status: "Updated managed prompt text from an external integration.",
-    persist,
-    render,
-  });
-  applyTextToNode(textNode, value, role);
-  mirrorStateTextToDownstreamWidgets(textNode, value, role);
-  markDownstreamDirty(textNode);
-
-  if (persist) await waitForStateManagerLibraryIdle();
-
-  const widgets = getWidgets(managerNode);
-  const characterId = String(widgetValue(widgets.characterWidget, "") || "");
-  const promptId = String(widgetValue(widgets.promptWidget, "") || "");
   if (persist) {
+    // Drain ordinary State Manager edits first. External integrations then update
+    // exactly one persistent text box through the request-user-scoped backend
+    // store instead of replacing the whole library from browser state.
+    await waitForStateManagerLibraryIdle();
+
+    const current = getRenderableState(managerNode);
+    const nextState = structuredCloneCompat(current.state);
+    const { prompt } = ensureSelection(managerNode, nextState);
+    if (!prompt || prompt.__dsm_ephemeral) {
+      throw new Error("The selected State Manager prompt is not available locally.");
+    }
+
+    const widgets = getWidgets(managerNode);
+    const characterId = String(widgetValue(widgets.characterWidget, "") || "");
+    const promptId = String(widgetValue(widgets.promptWidget, "") || "");
+    const snapshot = await stateLibraryRequest(
+      `/characters/${encodeURIComponent(characterId)}/prompts/${encodeURIComponent(promptId)}/text-box`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          expected_revision: stateLibraryClient.revision,
+          role,
+          slot,
+          label,
+          text: value,
+        }),
+      },
+    );
+
+    if (!installLibrarySnapshot(snapshot)) {
+      throw new Error("State Manager rejected the managed prompt snapshot as stale.");
+    }
+    refreshNodeFromLibrary(managerNode, {
+      status: "Updated managed prompt text from an external integration.",
+    });
+
     const persistedCharacter = (stateLibraryClient.state?.characters || []).find((item) => item?.id === characterId);
     const persistedPrompt = persistedCharacter?.prompts?.find((item) => item?.id === promptId);
     const persistedBox = persistedPrompt
@@ -1815,15 +1831,47 @@ async function updateManagedStateTextBox(managerNode, textNode, text, { persist 
         `State Manager prompt write did not persist the selected ${role}/${slot} text exactly; refusing to report success.`
       );
     }
+
+    applyTextToNode(textNode, value, role);
+    mirrorStateTextToDownstreamWidgets(textNode, value, role);
+    markDownstreamDirty(textNode);
+    if (render) scheduleRender(managerNode);
+
+    return {
+      status: "updated",
+      role,
+      slot,
+      character_id: characterId,
+      prompt_id: promptId,
+      persistent_verified: true,
+      library_revision: stateLibraryClient.revision,
+    };
   }
 
+  const current = getRenderableState(managerNode);
+  const nextState = structuredCloneCompat(current.state);
+  const { prompt } = ensureSelection(managerNode, nextState);
+  if (!prompt || prompt.__dsm_ephemeral) {
+    throw new Error("The selected State Manager prompt is not available locally.");
+  }
+  setPromptTextBox(prompt, role, slot, value, label);
+  updateState(managerNode, nextState, current.uiState, {
+    status: "Updated managed prompt text from an external integration.",
+    persist: false,
+    render,
+  });
+  applyTextToNode(textNode, value, role);
+  mirrorStateTextToDownstreamWidgets(textNode, value, role);
+  markDownstreamDirty(textNode);
+
+  const widgets = getWidgets(managerNode);
   return {
     status: "updated",
     role,
     slot,
-    character_id: characterId,
-    prompt_id: promptId,
-    persistent_verified: !!persist,
+    character_id: String(widgetValue(widgets.characterWidget, "") || ""),
+    prompt_id: String(widgetValue(widgets.promptWidget, "") || ""),
+    persistent_verified: false,
   };
 }
 
