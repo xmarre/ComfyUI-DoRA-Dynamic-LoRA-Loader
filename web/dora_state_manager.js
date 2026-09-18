@@ -4204,13 +4204,22 @@ function firstControlledStateSeed(managerNode, promptPayload) {
   return null;
 }
 
-function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, queueIndex, total) {
+function serializeQueuedUiStateIdentity(uiState, characterId, promptId) {
   return JSON.stringify({
     ...safeJsonParse(serializeWorkflowUiState(uiState), {}),
+    // The persistent library is request-user scoped. Prompt handlers do not have
+    // the original HTTP request, so carry the resolved browser/API user only in
+    // the queued payload. serializeWorkflowUiState() intentionally omits it.
     __dsm_library_user_id: stateLibraryClient.userId,
-    ...(runtimeSeed == null ? {} : { __dsm_runtime_seed: runtimeSeed }),
     __dsm_queued_runtime_character_id: String(characterId ?? ""),
     __dsm_queued_runtime_prompt_id: String(promptId ?? ""),
+  }, null, 0);
+}
+
+function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, queueIndex, total) {
+  return JSON.stringify({
+    ...safeJsonParse(serializeQueuedUiStateIdentity(uiState, characterId, promptId), {}),
+    ...(runtimeSeed == null ? {} : { __dsm_runtime_seed: runtimeSeed }),
     __dsm_queued_runtime_queue_index: Math.max(0, Number(queueIndex) || 0),
     __dsm_queued_runtime_queue_total: Math.max(1, Number(total) || 1),
     // The runtime override must differ per queued prompt even if the same prompt
@@ -4518,7 +4527,19 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
       || uiState.queue_character_wildcard
       || uiState.queue_randomize_saved_seed
     );
-    if (!hasQueueOverrides) continue;
+    if (!hasQueueOverrides) {
+      // Backend prompt handlers execute outside the originating HTTP request.
+      // Preserve the exact persistent-library tenant and selected preset in the
+      // request-local queue payload even for an ordinary queue.
+      changed += setQueuedInput(
+        promptPayload,
+        node,
+        UI_STATE_WIDGET,
+        serializeQueuedUiStateIdentity(uiState, character.id, prompt.id),
+        { addIfMissing: true, syncWidget: false },
+      );
+      continue;
+    }
 
     let payload = buildQueuedDoraStatePayload(character, prompt);
     let runtimeSeed = null;
