@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import re
 from typing import Any, Callable, Dict, Optional
@@ -38,6 +39,39 @@ def _link_source(value: Any) -> Optional[str]:
     if source is None:
         return None
     return str(source)
+
+
+def _queued_runtime_selection(
+    ui_state_json: Any,
+    fallback_character_id: Any,
+    fallback_prompt_id: Any,
+) -> tuple[str, str, str]:
+    """Return the exact request-local selection when the frontend supplied it."""
+    parsed: Dict[str, Any] = {}
+    if isinstance(ui_state_json, dict):
+        parsed = ui_state_json
+    elif isinstance(ui_state_json, str) and ui_state_json.strip():
+        try:
+            value = json.loads(ui_state_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            value = {}
+        if isinstance(value, dict):
+            parsed = value
+
+    queued_character = str(parsed.get("__dsm_queued_runtime_character_id", "") or "")
+    queued_prompt = str(parsed.get("__dsm_queued_runtime_prompt_id", "") or "")
+    if queued_character and queued_prompt:
+        return queued_character, queued_prompt, "queue_metadata"
+    return str(fallback_character_id or ""), str(fallback_prompt_id or ""), "manager_inputs"
+
+
+def _text_fingerprint(value: Any) -> tuple[int, bool, str]:
+    text = str(value or "")
+    return (
+        len(text),
+        bool(_TIMELINE_HEADER.search(text)),
+        hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    )
 
 
 def _workflow(json_data: Any) -> Dict[str, Any]:
@@ -166,10 +200,15 @@ def materialize_state_manager_impact_prompts(
         try:
             ui_state_json = manager_inputs.get("ui_state_json", "")
             library_user_id = library_user_from_ui_state(ui_state_json)
-            payload = resolve_payload(
-                manager_inputs.get("state_json", ""),
+            selected_character_id, selected_prompt_id, selection_source = _queued_runtime_selection(
+                ui_state_json,
                 manager_inputs.get("selected_character_id", ""),
                 manager_inputs.get("selected_prompt_id", ""),
+            )
+            payload = resolve_payload(
+                manager_inputs.get("state_json", ""),
+                selected_character_id,
+                selected_prompt_id,
                 library_user_id,
             )
             controlled_text = text_for_box(
@@ -188,13 +227,31 @@ def materialize_state_manager_impact_prompts(
         if controlled_text is None:
             continue
 
+        queued_text = text_inputs.get("text", "")
+        queued_chars, queued_timeline, queued_digest = _text_fingerprint(queued_text)
         effective_text = str(controlled_text)
+        persistent_chars, timeline, digest = _text_fingerprint(effective_text)
+        queued_matches_persistent = str(queued_text) == effective_text
+
+        if not queued_matches_persistent:
+            _LOG.warning(
+                "[State Manager] managed text queue/persistent mismatch text_node=%s manager=%s selection_source=%s character=%r prompt=%r queued_chars=%d queued_timeline=%s queued_digest=%s persistent_chars=%d persistent_timeline=%s persistent_digest=%s",
+                text_id,
+                manager_id,
+                selection_source,
+                selected_character_id,
+                selected_prompt_id,
+                queued_chars,
+                queued_timeline,
+                queued_digest,
+                persistent_chars,
+                timeline,
+                digest,
+            )
+
         if text_inputs.get("text") != effective_text:
             text_inputs["text"] = effective_text
             changed += 1
-
-        digest = hashlib.sha256(effective_text.encode("utf-8")).hexdigest()
-        timeline = bool(_TIMELINE_HEADER.search(effective_text))
 
         for impact_id, impact_node, impact_inputs in impacts_by_source[text_id]:
             impact_changed = False
@@ -205,7 +262,7 @@ def materialize_state_manager_impact_prompts(
                     impact_changed = True
 
             _LOG.info(
-                "[State Manager] backend Impact prompt bridge text_node=%s manager=%s impact_node=%s impact_class=%s mode=%r role=%r slot=%r chars=%d timeline=%s digest=%s changed=%s",
+                "[State Manager] backend Impact prompt bridge text_node=%s manager=%s impact_node=%s impact_class=%s mode=%r role=%r slot=%r selection_source=%s character=%r prompt=%r queued_match=%s chars=%d timeline=%s digest=%s changed=%s",
                 text_id,
                 manager_id,
                 impact_id,
@@ -213,7 +270,11 @@ def materialize_state_manager_impact_prompts(
                 impact_inputs.get("mode"),
                 str(text_inputs.get("role", "positive")),
                 str(text_inputs.get("state_slot", "default")),
-                len(effective_text),
+                selection_source,
+                selected_character_id,
+                selected_prompt_id,
+                queued_matches_persistent,
+                persistent_chars,
                 timeline,
                 digest,
                 impact_changed,
