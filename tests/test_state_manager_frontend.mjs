@@ -118,7 +118,7 @@ test("managed State Manager text integration updates the authoritative selected 
 });
 
 
-test("ordinary queues materialize managed State Manager text into Impact wildcard runtime inputs", async () => {
+test("ordinary queues preserve Impact links for the backend managed-text bridge", async () => {
   const helpers = await loadStateManagerHelpers();
   const timeline = "Global.\n\n[0-7s]\nOne.\n\n[7-14s]\nTwo.";
   const state = {
@@ -227,10 +227,10 @@ test("ordinary queues materialize managed State Manager text into Impact wildcar
     };
 
     const changed = helpers.mutatePromptForStateManagers(promptPayload, 0, 1);
-    assert.ok(changed >= 3);
+    assert.equal(changed, 1);
     assert.equal(promptPayload.output["2"].inputs.text, timeline);
-    assert.equal(promptPayload.output["3"].inputs.wildcard_text, timeline);
-    assert.equal(promptPayload.output["3"].inputs.populated_text, timeline);
+    assert.deepEqual(promptPayload.output["3"].inputs.wildcard_text, ["2", 0]);
+    assert.equal(promptPayload.output["3"].inputs.populated_text, "stale populated");
     assert.equal(promptPayload.output["3"].inputs.mode, mode);
   }
 });
