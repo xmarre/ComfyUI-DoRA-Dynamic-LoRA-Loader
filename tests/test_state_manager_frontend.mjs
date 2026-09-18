@@ -27,6 +27,7 @@ function privateCharacter(id, name, promptText) {
 
 test("managed State Manager text integration updates the authoritative selected prompt", async () => {
   const helpers = await loadStateManagerHelpers();
+  assert.equal(typeof globalThis.__doraStateManagerPromptApi?.setTextBox, "function");
   const state = {
     version: 3,
     characters: [{
