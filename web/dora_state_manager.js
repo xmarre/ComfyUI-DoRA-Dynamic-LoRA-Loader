@@ -1754,6 +1754,71 @@ function installLoaderStateSyncApi() {
   };
 }
 
+async function waitForStateManagerLibraryIdle(timeoutMs = 10000) {
+  const deadline = Date.now() + Math.max(100, Number(timeoutMs) || 10000);
+  while ((stateLibraryClient.writing || stateLibraryClient.pending.length) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  if (stateLibraryClient.writing || stateLibraryClient.pending.length) {
+    throw new Error("Timed out while saving the State Manager prompt.");
+  }
+  if (stateLibraryClient.blocked) {
+    throw new Error("State Manager library writes are blocked; reload the State Manager library before applying the prompt.");
+  }
+}
+
+async function updateManagedStateTextBox(managerNode, textNode, text, { persist = true, render = true } = {}) {
+  if (!isStateManagerNode(managerNode)) {
+    throw new Error("The connected state_control source is not a State Manager node.");
+  }
+  if (!isStateTextNode(textNode)) {
+    throw new Error("The managed Sequence Prompt source is not a State Manager Text Box.");
+  }
+  if (!getControlledNodes(managerNode).includes(textNode)) {
+    throw new Error("The State Manager does not own the connected Text Box through state_control.");
+  }
+
+  const current = getRenderableState(managerNode);
+  const nextState = structuredCloneCompat(current.state);
+  const { prompt } = ensureSelection(managerNode, nextState);
+  if (!prompt || prompt.__dsm_ephemeral) {
+    throw new Error("The selected State Manager prompt is not available locally.");
+  }
+
+  const role = getStateTextRole(textNode);
+  const slot = getStateTextSlot(textNode, role, "default");
+  const value = String(text ?? "");
+  setPromptTextBox(prompt, role, slot, value, stateTextLabel(textNode, role, slot));
+
+  updateState(managerNode, nextState, current.uiState, {
+    status: "Updated managed prompt text from an external integration.",
+    persist,
+    render,
+  });
+  applyTextToNode(textNode, value, role);
+  mirrorStateTextToDownstreamWidgets(textNode, value, role);
+  markDownstreamDirty(textNode);
+
+  if (persist) await waitForStateManagerLibraryIdle();
+
+  const widgets = getWidgets(managerNode);
+  return {
+    status: "updated",
+    role,
+    slot,
+    character_id: String(widgetValue(widgets.characterWidget, "") || ""),
+    prompt_id: String(widgetValue(widgets.promptWidget, "") || ""),
+  };
+}
+
+function installStateManagerPromptIntegrationApi() {
+  globalThis.__doraStateManagerPromptApi = {
+    async setTextBox(managerNode, textNode, text) {
+      return updateManagedStateTextBox(managerNode, textNode, text, { persist: true });
+    },
+  };
+}
+
 function getWidgetMap(node) {
   const map = new Map();
   for (const widget of node?.widgets || []) {
@@ -4718,6 +4783,7 @@ function maybeInjectWidgetInput(nodeData) {
 }
 
 installLoaderStateSyncApi();
+installStateManagerPromptIntegrationApi();
 
 app.registerExtension({
   name: EXT_NAME,
