@@ -182,6 +182,32 @@ def test_backend_bridge_uses_queued_library_user(configured_nodes, bridge):
     assert payload["prompt"]["251"]["inputs"]["populated_text"] == second_text
 
 
+def test_backend_bridge_uses_request_local_selection_metadata(configured_nodes, bridge):
+    nodes = configured_nodes
+    stale = _persistent_character("stale prompt")
+    timeline_text = "[0-7s]\nExact queued managed timeline."
+    selected = _persistent_character(timeline_text)
+    nodes._get_state_manager_store().replace([stale, selected], 0)
+
+    payload = _prompt(nodes, stale)
+    payload["prompt"]["249"]["inputs"]["ui_state_json"] = json.dumps({
+        "__dsm_library_user_id": "default",
+        "__dsm_queued_runtime_character_id": selected["id"],
+        "__dsm_queued_runtime_prompt_id": selected["prompts"][0]["id"],
+    })
+
+    bridge.materialize_state_manager_impact_prompts(
+        payload,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=nodes._state_payload_text_for_box,
+    )
+
+    assert payload["prompt"]["250"]["inputs"]["text"] == timeline_text
+    assert payload["prompt"]["251"]["inputs"]["wildcard_text"] == timeline_text
+    assert payload["prompt"]["251"]["inputs"]["populated_text"] == timeline_text
+
+
 def test_backend_bridge_leaves_unrelated_impact_node_untouched(configured_nodes, bridge):
     nodes = configured_nodes
     timeline = "[0-7s]\nManaged."
