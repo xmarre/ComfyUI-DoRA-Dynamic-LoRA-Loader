@@ -467,6 +467,7 @@ class StateLibraryStore:
         slot: Any,
         text: Any,
         expected_revision: Any,
+        label: Any = "",
     ) -> Dict[str, Any]:
         """Atomically update one persistent prompt text box.
 
@@ -478,6 +479,7 @@ class StateLibraryStore:
         role = str(role or "positive").strip() or "positive"
         slot = str(slot or "default").strip() or "default"
         value = str(text or "")
+        label = str(label or "").strip()
 
         with self._lock:
             document = self._load_unlocked()
@@ -518,12 +520,14 @@ class StateLibraryStore:
                 target = {
                     "role": role,
                     "slot": slot,
-                    "label": f"{role} {slot}",
+                    "label": label or f"{role} {slot}",
                     "text": value,
                 }
                 boxes.append(target)
             else:
                 target["text"] = value
+                if label:
+                    target["label"] = label
 
             if role == "positive" and slot == "default":
                 prompt["positive"] = value
