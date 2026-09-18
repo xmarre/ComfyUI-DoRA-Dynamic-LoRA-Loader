@@ -118,9 +118,10 @@ test("managed State Manager text integration updates the authoritative selected 
 });
 
 
-test("ordinary queues preserve Impact links for the backend managed-text bridge", async () => {
+test("ordinary queues preserve Impact links and carry request-local persistent identity", async () => {
   const helpers = await loadStateManagerHelpers();
   const timeline = "Global.\n\n[0-7s]\nOne.\n\n[7-14s]\nTwo.";
+  helpers.stateLibraryClient.userId = "queue-user";
   const state = {
     version: 3,
     characters: [{
@@ -227,12 +228,20 @@ test("ordinary queues preserve Impact links for the backend managed-text bridge"
     };
 
     const changed = helpers.mutatePromptForStateManagers(promptPayload, 0, 1);
-    assert.equal(changed, 1);
+    assert.equal(changed, 2);
     assert.equal(promptPayload.output["2"].inputs.text, timeline);
     assert.deepEqual(promptPayload.output["3"].inputs.wildcard_text, ["2", 0]);
     assert.equal(promptPayload.output["3"].inputs.populated_text, "stale populated");
     assert.equal(promptPayload.output["3"].inputs.mode, mode);
+
+    const queuedUi = JSON.parse(promptPayload.output["1"].inputs.ui_state_json);
+    assert.equal(queuedUi.__dsm_library_user_id, "queue-user");
+    assert.equal(queuedUi.__dsm_queued_runtime_character_id, "character-a");
+    assert.equal(queuedUi.__dsm_queued_runtime_prompt_id, "prompt-a");
+    assert.equal(Object.prototype.hasOwnProperty.call(queuedUi, "__dsm_queued_runtime_nonce"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(JSON.parse(manager.widgets[1].value), "__dsm_library_user_id"), false);
   }
+  helpers.stateLibraryClient.userId = "default";
 });
 
 
