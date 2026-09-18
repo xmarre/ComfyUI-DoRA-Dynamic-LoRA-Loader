@@ -1754,6 +1754,93 @@ function installLoaderStateSyncApi() {
   };
 }
 
+async function waitForStateManagerLibraryIdle(timeoutMs = 10000) {
+  const deadline = Date.now() + Math.max(100, Number(timeoutMs) || 10000);
+  while ((stateLibraryClient.writing || stateLibraryClient.pending.length) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  if (stateLibraryClient.writing || stateLibraryClient.pending.length) {
+    throw new Error("Timed out while saving the State Manager prompt.");
+  }
+  if (stateLibraryClient.blocked) {
+    throw new Error("State Manager library writes are blocked; reload the State Manager library before applying the prompt.");
+  }
+}
+
+async function updateManagedStateTextBox(managerNode, textNode, text, { persist = true, render = true } = {}) {
+  if (!isStateManagerNode(managerNode)) {
+    throw new Error("The connected state_control source is not a State Manager node.");
+  }
+  if (!isStateTextNode(textNode)) {
+    throw new Error("The managed Sequence Prompt source is not a State Manager Text Box.");
+  }
+  if (!getControlledNodes(managerNode).includes(textNode)) {
+    throw new Error("The State Manager does not own the connected Text Box through state_control.");
+  }
+
+  const current = getRenderableState(managerNode);
+  const nextState = structuredCloneCompat(current.state);
+  const { prompt } = ensureSelection(managerNode, nextState);
+  if (!prompt || prompt.__dsm_ephemeral) {
+    throw new Error("The selected State Manager prompt is not available locally.");
+  }
+
+  const role = getStateTextRole(textNode);
+  const slot = getStateTextSlot(textNode, role, "default");
+  const value = String(text ?? "");
+  setPromptTextBox(prompt, role, slot, value, stateTextLabel(textNode, role, slot));
+
+  updateState(managerNode, nextState, current.uiState, {
+    status: "Updated managed prompt text from an external integration.",
+    persist,
+    render,
+  });
+  applyTextToNode(textNode, value, role);
+  mirrorStateTextToDownstreamWidgets(textNode, value, role);
+  markDownstreamDirty(textNode);
+
+  if (persist) await waitForStateManagerLibraryIdle();
+
+  const widgets = getWidgets(managerNode);
+  const characterId = String(widgetValue(widgets.characterWidget, "") || "");
+  const promptId = String(widgetValue(widgets.promptWidget, "") || "");
+  if (persist) {
+    const persistedCharacter = (stateLibraryClient.state?.characters || []).find((item) => item?.id === characterId);
+    const persistedPrompt = persistedCharacter?.prompts?.find((item) => item?.id === promptId);
+    const persistedBox = persistedPrompt
+      ? findPromptTextBox(persistedPrompt, role, slot, { allowRoleFallback: false })
+      : null;
+    if (!persistedBox || String(persistedBox.text ?? "") !== value) {
+      throw new Error(
+        `State Manager prompt write did not persist the selected ${role}/${slot} text exactly; refusing to report success.`
+      );
+    }
+  }
+
+  return {
+    status: "updated",
+    role,
+    slot,
+    character_id: characterId,
+    prompt_id: promptId,
+    persistent_verified: !!persist,
+  };
+}
+
+function installStateManagerPromptIntegrationApi() {
+  globalThis.__doraStateManagerPromptApi = {
+    contract_version: 3,
+    capabilities: Object.freeze([
+      "authoritative_persistent_text_v1",
+      "impact_wildcard_queue_bridge_v1",
+      "backend_impact_prompt_bridge_v1",
+    ]),
+    async setTextBox(managerNode, textNode, text) {
+      return updateManagedStateTextBox(managerNode, textNode, text, { persist: true });
+    },
+  };
+}
+
 function getWidgetMap(node) {
   const map = new Map();
   for (const widget of node?.widgets || []) {
@@ -4117,13 +4204,22 @@ function firstControlledStateSeed(managerNode, promptPayload) {
   return null;
 }
 
-function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, queueIndex, total) {
+function serializeQueuedUiStateIdentity(uiState, characterId, promptId) {
   return JSON.stringify({
     ...safeJsonParse(serializeWorkflowUiState(uiState), {}),
+    // The persistent library is request-user scoped. Prompt handlers do not have
+    // the original HTTP request, so carry the resolved browser/API user only in
+    // the queued payload. serializeWorkflowUiState() intentionally omits it.
     __dsm_library_user_id: stateLibraryClient.userId,
-    ...(runtimeSeed == null ? {} : { __dsm_runtime_seed: runtimeSeed }),
     __dsm_queued_runtime_character_id: String(characterId ?? ""),
     __dsm_queued_runtime_prompt_id: String(promptId ?? ""),
+  }, null, 0);
+}
+
+function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, queueIndex, total) {
+  return JSON.stringify({
+    ...safeJsonParse(serializeQueuedUiStateIdentity(uiState, characterId, promptId), {}),
+    ...(runtimeSeed == null ? {} : { __dsm_runtime_seed: runtimeSeed }),
     __dsm_queued_runtime_queue_index: Math.max(0, Number(queueIndex) || 0),
     __dsm_queued_runtime_queue_total: Math.max(1, Number(total) || 1),
     // The runtime override must differ per queued prompt even if the same prompt
@@ -4346,7 +4442,11 @@ function mutateQueuedStateTextBoxes(promptPayload, managerNode, prompt) {
     const slot = getStateTextSlot(textNode, role, `${role}_${textNode?.id ?? index + 1}`);
     const saved = findPromptTextBox(prompt, role, slot, { allowRoleFallback: false }) || findPromptTextBox(prompt, role, slot, { allowRoleFallback: true });
     if (!saved) continue;
-    changed += setQueuedWidgetInput(promptPayload, textNode, "text", String(saved.text ?? ""));
+    const value = String(saved.text ?? "");
+    // Keep the submitted STRING link intact. The backend prompt bridge resolves
+    // the authoritative persistent value and materializes downstream Impact
+    // wildcard inputs server-side, after ComfyUI has serialized the graph.
+    changed += setQueuedWidgetInput(promptPayload, textNode, "text", value);
   }
   return changed;
 }
@@ -4411,11 +4511,36 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
     if (!isStateManagerNode(node)) continue;
     const widgets = getWidgets(node);
     const { state, uiState } = getCurrentState(node);
-    if (!uiState.queue_prompt_wildcard && !uiState.queue_character_wildcard && !uiState.queue_randomize_saved_seed) continue;
     const currentCharacterId = String(widgetValue(widgets.characterWidget, "") || "");
     const currentPromptId = String(widgetValue(widgets.promptWidget, "") || "");
     const { character, prompt } = selectQueuedCharacterAndPrompt(node, state, uiState, currentCharacterId, currentPromptId, queueIndex, total);
     if (!character || !prompt) continue;
+
+    // State Manager Text Boxes are runtime-owned even in an ordinary queue with
+    // no prompt/character wildcarding. Materialize their selected saved text into
+    // the queued Text Box input while preserving downstream STRING links. The
+    // backend prompt bridge owns final Impact wildcard materialization.
+    changed += mutateQueuedStateTextBoxes(promptPayload, node, prompt);
+
+    const hasQueueOverrides = !!(
+      uiState.queue_prompt_wildcard
+      || uiState.queue_character_wildcard
+      || uiState.queue_randomize_saved_seed
+    );
+    if (!hasQueueOverrides) {
+      // Backend prompt handlers execute outside the originating HTTP request.
+      // Preserve the exact persistent-library tenant and selected preset in the
+      // request-local queue payload even for an ordinary queue.
+      changed += setQueuedInput(
+        promptPayload,
+        node,
+        UI_STATE_WIDGET,
+        serializeQueuedUiStateIdentity(uiState, character.id, prompt.id),
+        { addIfMissing: true, syncWidget: false },
+      );
+      continue;
+    }
+
     let payload = buildQueuedDoraStatePayload(character, prompt);
     let runtimeSeed = null;
     const liveStateSeed = firstControlledStateSeed(node, promptPayload);
@@ -4438,7 +4563,6 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
       total,
     );
     changed += mutateQueuedDoraLoaders(promptPayload, node, character);
-    changed += mutateQueuedStateTextBoxes(promptPayload, node, prompt);
     changed += mutateQueuedLegacyTextTargets(promptPayload, node, prompt);
     changed += mutateQueuedSettingsNodes(promptPayload, node, payload.settings);
   }
@@ -4718,6 +4842,7 @@ function maybeInjectWidgetInput(nodeData) {
 }
 
 installLoaderStateSyncApi();
+installStateManagerPromptIntegrationApi();
 
 app.registerExtension({
   name: EXT_NAME,
