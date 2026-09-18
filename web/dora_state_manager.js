@@ -1802,12 +1802,28 @@ async function updateManagedStateTextBox(managerNode, textNode, text, { persist 
   if (persist) await waitForStateManagerLibraryIdle();
 
   const widgets = getWidgets(managerNode);
+  const characterId = String(widgetValue(widgets.characterWidget, "") || "");
+  const promptId = String(widgetValue(widgets.promptWidget, "") || "");
+  if (persist) {
+    const persistedCharacter = (stateLibraryClient.state?.characters || []).find((item) => item?.id === characterId);
+    const persistedPrompt = persistedCharacter?.prompts?.find((item) => item?.id === promptId);
+    const persistedBox = persistedPrompt
+      ? findPromptTextBox(persistedPrompt, role, slot, { allowRoleFallback: false })
+      : null;
+    if (!persistedBox || String(persistedBox.text ?? "") !== value) {
+      throw new Error(
+        `State Manager prompt write did not persist the selected ${role}/${slot} text exactly; refusing to report success.`
+      );
+    }
+  }
+
   return {
     status: "updated",
     role,
     slot,
-    character_id: String(widgetValue(widgets.characterWidget, "") || ""),
-    prompt_id: String(widgetValue(widgets.promptWidget, "") || ""),
+    character_id: characterId,
+    prompt_id: promptId,
+    persistent_verified: !!persist,
   };
 }
 
@@ -4402,6 +4418,23 @@ function mutateQueuedDoraLoaders(promptPayload, managerNode, character) {
   return changed;
 }
 
+function mutateQueuedImpactWildcardTargets(promptPayload, textNode, text) {
+  const value = String(text ?? "");
+  let changed = 0;
+  for (const target of getOutputTargets(textNode, STATE_TEXT_OUTPUT_NAMES)) {
+    if (!target?.node || !isImpactWildcardNode(target.node)) continue;
+
+    // ImpactWildcardProcessor/Encode execute from populated_text. In populate mode,
+    // Impact Pack's server-side queue hook processes wildcard_text before execution.
+    // A connected STRING is serialized as a link, so make the State Manager's
+    // authoritative concrete text explicit in the queued processor inputs. The
+    // editor graph remains connected; this mutation is queue-local.
+    changed += setQueuedInput(promptPayload, target.node, "wildcard_text", value, { addIfMissing: true, syncWidget: false });
+    changed += setQueuedInput(promptPayload, target.node, "populated_text", value, { addIfMissing: true, syncWidget: false });
+  }
+  return changed;
+}
+
 function mutateQueuedStateTextBoxes(promptPayload, managerNode, prompt) {
   const controlled = getControlledNodes(managerNode).filter((node) => node && node !== managerNode);
   const textNodes = controlled.filter(isStateTextNode);
@@ -4411,7 +4444,9 @@ function mutateQueuedStateTextBoxes(promptPayload, managerNode, prompt) {
     const slot = getStateTextSlot(textNode, role, `${role}_${textNode?.id ?? index + 1}`);
     const saved = findPromptTextBox(prompt, role, slot, { allowRoleFallback: false }) || findPromptTextBox(prompt, role, slot, { allowRoleFallback: true });
     if (!saved) continue;
-    changed += setQueuedWidgetInput(promptPayload, textNode, "text", String(saved.text ?? ""));
+    const value = String(saved.text ?? "");
+    changed += setQueuedWidgetInput(promptPayload, textNode, "text", value);
+    changed += mutateQueuedImpactWildcardTargets(promptPayload, textNode, value);
   }
   return changed;
 }
@@ -4476,11 +4511,24 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
     if (!isStateManagerNode(node)) continue;
     const widgets = getWidgets(node);
     const { state, uiState } = getCurrentState(node);
-    if (!uiState.queue_prompt_wildcard && !uiState.queue_character_wildcard && !uiState.queue_randomize_saved_seed) continue;
     const currentCharacterId = String(widgetValue(widgets.characterWidget, "") || "");
     const currentPromptId = String(widgetValue(widgets.promptWidget, "") || "");
     const { character, prompt } = selectQueuedCharacterAndPrompt(node, state, uiState, currentCharacterId, currentPromptId, queueIndex, total);
     if (!character || !prompt) continue;
+
+    // State Manager Text Boxes are runtime-owned even in an ordinary queue with
+    // no prompt/character wildcarding. Always materialize their selected saved
+    // text into the queued API payload, including queue-local Impact wildcard
+    // mirrors, before considering the optional queue-variation features below.
+    changed += mutateQueuedStateTextBoxes(promptPayload, node, prompt);
+
+    const hasQueueOverrides = !!(
+      uiState.queue_prompt_wildcard
+      || uiState.queue_character_wildcard
+      || uiState.queue_randomize_saved_seed
+    );
+    if (!hasQueueOverrides) continue;
+
     let payload = buildQueuedDoraStatePayload(character, prompt);
     let runtimeSeed = null;
     const liveStateSeed = firstControlledStateSeed(node, promptPayload);
@@ -4503,7 +4551,6 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
       total,
     );
     changed += mutateQueuedDoraLoaders(promptPayload, node, character);
-    changed += mutateQueuedStateTextBoxes(promptPayload, node, prompt);
     changed += mutateQueuedLegacyTextTargets(promptPayload, node, prompt);
     changed += mutateQueuedSettingsNodes(promptPayload, node, payload.settings);
   }
