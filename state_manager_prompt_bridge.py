@@ -40,6 +40,65 @@ def _link_source(value: Any) -> Optional[str]:
     return str(source)
 
 
+def _workflow(json_data: Any) -> Dict[str, Any]:
+    if not isinstance(json_data, dict):
+        return {}
+    extra = json_data.get("extra_data")
+    if not isinstance(extra, dict):
+        return {}
+    pnginfo = extra.get("extra_pnginfo")
+    if not isinstance(pnginfo, dict):
+        return {}
+    workflow = pnginfo.get("workflow")
+    return workflow if isinstance(workflow, dict) else {}
+
+
+def _workflow_input_source(json_data: Any, node_id: Any, input_name: str) -> Optional[str]:
+    workflow = _workflow(json_data)
+    nodes = workflow.get("nodes")
+    links = workflow.get("links")
+    if not isinstance(nodes, list) or not isinstance(links, list):
+        return None
+
+    workflow_node = next(
+        (
+            item
+            for item in nodes
+            if isinstance(item, dict) and str(item.get("id")) == str(node_id)
+        ),
+        None,
+    )
+    if not isinstance(workflow_node, dict):
+        return None
+
+    inputs = workflow_node.get("inputs")
+    if not isinstance(inputs, list):
+        return None
+    input_entry = next(
+        (
+            item
+            for item in inputs
+            if isinstance(item, dict) and str(item.get("name", "")) == str(input_name)
+        ),
+        None,
+    )
+    if not isinstance(input_entry, dict):
+        return None
+
+    link_id = input_entry.get("link")
+    if link_id is None:
+        return None
+    for row in links:
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
+            continue
+        if str(row[0]) != str(link_id):
+            continue
+        if str(row[3]) != str(node_id):
+            continue
+        return str(row[1])
+    return None
+
+
 def materialize_state_manager_impact_prompts(
     json_data: Any,
     *,
@@ -70,6 +129,12 @@ def materialize_state_manager_impact_prompts(
         if impact_inputs is None:
             continue
         source_id = _link_source(impact_inputs.get("wildcard_text"))
+        if source_id is None:
+            # Older frontend queue bridges may already have materialized the
+            # STRING input and therefore erased the API-prompt link. Recover the
+            # original source from the immutable workflow metadata so the backend
+            # remains authoritative across mixed frontend/backend revisions.
+            source_id = _workflow_input_source(json_data, impact_id, "wildcard_text")
         if source_id is None:
             continue
         impacts_by_source.setdefault(source_id, []).append((str(impact_id), impact_node, impact_inputs))
