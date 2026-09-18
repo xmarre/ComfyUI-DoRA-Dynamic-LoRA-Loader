@@ -1,6 +1,8 @@
 import asyncio
+import hashlib
 import json
 import logging
+import re
 from typing import Any, Callable, Dict
 
 from .state_manager_store import (
@@ -14,6 +16,7 @@ from .state_manager_store import (
 
 LOGGER = logging.getLogger(__name__)
 _ROUTES_REGISTERED = False
+_TIMELINE_HEADER = re.compile(r"(?m)^\s*\[[0-9]+(?:\.[0-9]+)?-[0-9]+(?:\.[0-9]+)?s\]\s*$")
 
 
 def configure_store(
@@ -55,6 +58,7 @@ def register_routes(
         return
     _ROUTES_REGISTERED = True
     routes = prompt_server.instance.routes
+    LOGGER.info("[State Manager] managed prompt API registered contract=v4 capability=backend_persistent_text_write_v1 revision=backend-write-v1")
 
     def store_for_request(request):
         user_manager = getattr(prompt_server.instance, "user_manager", None)
@@ -106,6 +110,65 @@ def register_routes(
             )
             return web.json_response(with_user_id(snapshot, user_id))
         except Exception as exc:
+            return error_response(exc)
+
+    @routes.put("/dora_dynamic_lora/state-library/characters/{character_id}/prompts/{prompt_id}/text-box")
+    async def state_manager_update_prompt_text_box(request):
+        try:
+            store, user_id = store_for_request(request)
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise InvalidStateLibrary("The State Manager managed-text request is malformed.")
+
+            character_id = request.match_info["character_id"]
+            prompt_id = request.match_info["prompt_id"]
+            role = str(payload.get("role", "positive") or "positive")
+            slot = str(payload.get("slot", "default") or "default")
+            text = str(payload.get("text", "") or "")
+            label = str(payload.get("label", "") or "")
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            LOGGER.info(
+                "[State Manager] managed prompt write request revision=backend-write-v1 character=%r prompt=%r role=%r slot=%r expected_revision=%r chars=%d timeline=%s digest=%s",
+                character_id,
+                prompt_id,
+                role,
+                slot,
+                payload.get("expected_revision"),
+                len(text),
+                bool(_TIMELINE_HEADER.search(text)),
+                digest,
+            )
+            snapshot = await asyncio.to_thread(
+                store.update_prompt_text_box,
+                character_id,
+                prompt_id,
+                role,
+                slot,
+                text,
+                payload.get("expected_revision"),
+                label,
+            )
+
+            LOGGER.info(
+                "[State Manager] managed prompt write revision=backend-write-v1 character=%r prompt=%r role=%r slot=%r chars=%d timeline=%s digest=%s library_revision=%d",
+                character_id,
+                prompt_id,
+                role,
+                slot,
+                len(text),
+                bool(_TIMELINE_HEADER.search(text)),
+                digest,
+                int(snapshot.get("revision", -1)),
+            )
+            return web.json_response(with_user_id(snapshot, user_id))
+        except Exception as exc:
+            LOGGER.warning(
+                "[State Manager] managed prompt write rejected revision=backend-write-v1 character=%r prompt=%r error=%s: %s",
+                locals().get("character_id", ""),
+                locals().get("prompt_id", ""),
+                type(exc).__name__,
+                exc,
+            )
             return error_response(exc)
 
     @routes.post("/dora_dynamic_lora/state-library/migrate")

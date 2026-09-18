@@ -459,6 +459,91 @@ class StateLibraryStore:
             self._write_unlocked(document)
             return {"snapshot": self._public(document), "character_ids": imported_ids}
 
+    def update_prompt_text_box(
+        self,
+        character_id: Any,
+        prompt_id: Any,
+        role: Any,
+        slot: Any,
+        text: Any,
+        expected_revision: Any,
+        label: Any = "",
+    ) -> Dict[str, Any]:
+        """Atomically update one persistent prompt text box.
+
+        This is the backend-authoritative write path used by external integrations.
+        It intentionally avoids replacing the whole library from browser state.
+        """
+        character_id = str(character_id or "").strip()
+        prompt_id = str(prompt_id or "").strip()
+        role = str(role or "positive").strip() or "positive"
+        slot = str(slot or "default").strip() or "default"
+        value = str(text or "")
+        label = str(label or "").strip()
+
+        with self._lock:
+            document = self._load_unlocked()
+            self._require_recovery_acknowledgement()
+            try:
+                expected = int(expected_revision)
+            except (TypeError, ValueError) as exc:
+                raise InvalidStateLibrary("An expected library revision is required.") from exc
+            if expected != document["revision"]:
+                raise StateLibraryRevisionConflict(self._public(document))
+
+            character = next((entry for entry in document["characters"] if entry["id"] == character_id), None)
+            if character is None:
+                raise StatePresetNotFound(
+                    "Selected character preset is not available locally. Select or create a character."
+                )
+            prompt = next((entry for entry in character.get("prompts", []) if entry["id"] == prompt_id), None)
+            if prompt is None:
+                raise StatePresetNotFound(
+                    "Selected prompt preset is not available locally for this character. Select or create a prompt."
+                )
+
+            boxes = prompt.get("text_boxes")
+            if not isinstance(boxes, list):
+                boxes = []
+                prompt["text_boxes"] = boxes
+
+            target = next(
+                (
+                    box for box in boxes
+                    if isinstance(box, dict)
+                    and str(box.get("role", "") or "").strip() == role
+                    and str(box.get("slot", "default") or "default").strip() == slot
+                ),
+                None,
+            )
+            if target is None:
+                target = {
+                    "role": role,
+                    "slot": slot,
+                    "label": label or f"{role} {slot}",
+                    "text": value,
+                }
+                boxes.append(target)
+            else:
+                target["text"] = value
+                if label:
+                    target["label"] = label
+
+            if role == "positive" and slot == "default":
+                prompt["positive"] = value
+            elif role == "negative" and slot == "default":
+                prompt["negative"] = value
+
+            # Re-run the normal schema normalizer so mirrors, IDs and validation
+            # stay identical to every other persistent-library write path.
+            document["characters"] = self._normalize_characters(
+                document["characters"],
+                require_uuids=True,
+            )
+            document["revision"] += 1
+            self._write_unlocked(document)
+            return self._public(document)
+
     def export_character(self, character_id: Any) -> Dict[str, Any]:
         character_id = str(character_id or "").strip()
         with self._lock:
