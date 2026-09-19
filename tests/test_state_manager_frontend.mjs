@@ -230,7 +230,7 @@ test("selection mirror is updated with the selected persistent preset", async ()
 });
 
 
-test("State Manager DOM mutations force a post-click workflow snapshot", async () => {
+test("State Manager DOM mutations capture only workflow-relevant post-click state", async () => {
   const helpers = await loadStateManagerHelpers();
   const character = privateCharacter("character-a", "Character A", "saved");
   const promptId = character.prompts[0].id;
@@ -296,6 +296,23 @@ test("State Manager DOM mutations force a post-click workflow snapshot", async (
       prompt_id: promptId,
     },
   });
+
+  // Persistent library edits are backend-authoritative and are not serialized
+  // into the workflow. They must not force a whole-graph snapshot on each DOM
+  // input event (for example while typing in a prompt textarea).
+  character.name = "Character A renamed";
+  helpers.updateState(
+    node,
+    { version: 3, characters: [character] },
+    {},
+    {
+      characterId: character.id,
+      promptId,
+      persist: false,
+      render: false,
+    },
+  );
+  assert.equal(snapshots.length, 2);
 });
 
 
