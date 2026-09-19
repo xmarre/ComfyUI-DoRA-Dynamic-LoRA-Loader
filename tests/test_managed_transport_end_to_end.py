@@ -114,10 +114,17 @@ def _load_real_impact(source_root: Path):
             "impact": impact,
             "logging": __import__("logging"),
             "PromptServer": prompt_server,
+            "core": types.SimpleNamespace(),
+            "onprompt_for_remote": lambda _data: None,
+            "onprompt_for_switch": lambda _data: None,
+            "onprompt_for_pickers": lambda _data: None,
+            "gc_preview_bridge_cache": lambda _data: None,
+            "workflow_imagereceiver_update": lambda _data: None,
+            "regional_sampler_seed_update": lambda _data: None,
         }
         _compile_reviewed_defs(
             source_root / "modules" / "impact" / "impact_server.py",
-            {"find_input_value", "onprompt_populate_wildcards"},
+            {"find_input_value", "onprompt_populate_wildcards", "onprompt"},
             server_ns,
         )
         processor_ns = {"impact": impact}
@@ -128,7 +135,7 @@ def _load_real_impact(source_root: Path):
         )
         return (
             wildcards,
-            server_ns["onprompt_populate_wildcards"],
+            server_ns["onprompt"],
             processor_ns["ImpactWildcardProcessor"],
             prompt_server.instance,
         )
@@ -396,6 +403,79 @@ def test_direct_state_manager_real_impact_to_continuum_sequence_contract(reviewe
     assert "TWO_GREEN_SPHERE_SENTINEL" in clip.prompt
     assert "ONE_RED_CUBE_SENTINEL" not in clip.prompt
     assert "THREE_BLUE_PYRAMID_SENTINEL" not in clip.prompt
+
+
+def test_real_impact_wrapper_has_identical_output_for_both_extension_import_orders(reviewed_stack):
+    nodes, bridge, prompts, impact_handler, processor_cls, _feedback, *_continuum = reviewed_stack
+    raw = (
+        "__managed/shared__\n\n"
+        "[0-5s]\n__managed/one__\n\n"
+        "[5-10s]\n__managed/two__"
+    )
+    character = _character(raw)
+    descriptor = {
+        "schema_version": 1,
+        "format": "timeline",
+        "routing": "logical_chunks",
+        "geometry": {"chunks": 2, "chunk_seconds": "5"},
+    }
+    persisted = _install_document(nodes, character, raw, descriptor)
+
+    class Server:
+        def __init__(self, initial_handlers=()):
+            self.on_prompt_handlers = list(initial_handlers)
+
+        def add_on_prompt_handler(self, handler):
+            self.on_prompt_handlers.append(handler)
+
+    outputs = []
+    for impact_first in (True, False):
+        server = Server([impact_handler] if impact_first else [])
+
+        class PromptServer:
+            instance = server
+
+        bridge.register_prompt_bridge(
+            PromptServer,
+            resolve_payload=nodes._resolve_dora_state_payload,
+            resolve_snapshot=nodes._resolve_dora_state_payload_snapshot,
+            library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+            text_for_box=nodes._state_payload_text_for_box,
+        )
+        if not impact_first:
+            server.add_on_prompt_handler(impact_handler)
+
+        assert server.on_prompt_handlers[0] is not impact_handler
+        assert server.on_prompt_handlers[1] is impact_handler
+
+        payload = _queue(nodes, character, mode="populate")
+        payload["prompt"]["260"]["inputs"]["sequence_prompt"] = ["251", 0]
+        data = payload
+        for handler in server.on_prompt_handlers:
+            data = handler(data)
+
+        impact_inputs = data["prompt"]["251"]["inputs"]
+        assert impact_inputs["mode"] == "reproduce"
+        expanded = processor_cls().doit(**impact_inputs)[0]
+        sidecar = json.loads(data["prompt"]["260"]["inputs"]["managed_prompt_source_json"])
+        assert sidecar["library_revision"] == persisted["library_revision"]
+        plan = prompts.build_sampler_prompt_plan(
+            prompt_mode="Auto",
+            prompt_script="legacy",
+            sequence_prompt=expanded,
+            prompt_plan=None,
+            chunks=2,
+            chunk_seconds=5.0,
+            managed_prompt_source_json=json.dumps(sidecar),
+        )
+        assert plan["managed_prompt_transport"]["status"] == "verified_sequence"
+        outputs.append((expanded, plan["prompts"]))
+
+    assert outputs[0] == outputs[1]
+    assert outputs[0][1] == [
+        "SHARED_ENV_SENTINEL\n\nONE_RED_CUBE_SENTINEL",
+        "SHARED_ENV_SENTINEL\n\nTWO_GREEN_SPHERE_SENTINEL",
+    ]
 
 
 def test_real_impact_header_injection_cannot_become_verified_schedule(reviewed_stack):
