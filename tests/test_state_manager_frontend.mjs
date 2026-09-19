@@ -25,14 +25,14 @@ function privateCharacter(id, name, promptText) {
 }
 
 
-test("startup selection reads serialized workflow ids instead of constructor defaults", async () => {
+test("startup selection follows the values ComfyUI restored before onConfigure", async () => {
   const helpers = await loadStateManagerHelpers();
   const node = {
     widgets: [
       { name: "state_json", value: helpers.serializeBinding() },
       { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
-      { name: "selected_character_id", value: "default_character" },
-      { name: "selected_prompt_id", value: "default_prompt" },
+      { name: "selected_character_id", value: "character-a" },
+      { name: "selected_prompt_id", value: "prompt-a" },
     ],
     properties: {
       dora_state_manager_selection_v1: {
@@ -55,6 +55,70 @@ test("startup selection reads serialized workflow ids instead of constructor def
   assert.deepEqual(
     helpers.selectionIdentityForLibraryLoad(node, serialized),
     { characterId: "character-a", promptId: "prompt-a" },
+  );
+});
+
+
+test("startup selection does not let a stale named shadow override ComfyUI's restored positional widgets", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const node = {
+    widgets: [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: "character-a" },
+      { name: "selected_prompt_id", value: "prompt-a" },
+    ],
+    properties: {},
+  };
+  const serialized = {
+    widgets_values: [
+      helpers.serializeBinding(),
+      helpers.serializeWorkflowUiState({}),
+      "character-a",
+      "prompt-a",
+    ],
+    widgets_values_named: {
+      selected_character_id: "default_character",
+      selected_prompt_id: "default_prompt",
+    },
+    properties: {},
+  };
+
+  assert.deepEqual(
+    helpers.selectionIdentityForLibraryLoad(node, serialized),
+    { characterId: "character-a", promptId: "prompt-a" },
+  );
+});
+
+
+test("startup selection follows named restoration when ComfyUI already applied it", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const node = {
+    widgets: [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: "character-named" },
+      { name: "selected_prompt_id", value: "prompt-named" },
+    ],
+    properties: {},
+  };
+  const serialized = {
+    widgets_values: [
+      helpers.serializeBinding(),
+      helpers.serializeWorkflowUiState({}),
+      "character-positional",
+      "prompt-positional",
+    ],
+    widgets_values_named: {
+      selected_character_id: "character-named",
+      selected_prompt_id: "prompt-named",
+    },
+    properties: {},
+  };
+
+  assert.deepEqual(
+    helpers.selectionIdentityForLibraryLoad(node, serialized),
+    { characterId: "character-named", promptId: "prompt-named" },
   );
 });
 
@@ -207,6 +271,10 @@ test("distribution-safe startup restores only this browser's local selection", a
     );
 
     storage.clear();
+    // A different browser/machine first restores the distribution-safe workflow
+    // placeholders into the live widgets before onConfigure runs.
+    node.widgets[2].value = "default_character";
+    node.widgets[3].value = "default_prompt";
     assert.deepEqual(
       helpers.selectionIdentityForLibraryLoad(node, serialized),
       { characterId: "default_character", promptId: "default_prompt" },
