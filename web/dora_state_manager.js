@@ -1706,34 +1706,42 @@ function writeSelectionMirror(node, characterId, promptId) {
 }
 
 function configuredSelectionIdentity(node, serializedNode = null) {
+  if (!serializedNode) return null;
+
   const widgets = getWidgets(node);
-  const named = serializedNode?.widgets_values_named;
-  if (named && typeof named === "object") {
-    const hasCharacter = Object.prototype.hasOwnProperty.call(named, SELECTED_CHARACTER_WIDGET);
-    const hasPrompt = Object.prototype.hasOwnProperty.call(named, SELECTED_PROMPT_WIDGET);
-    if (hasCharacter || hasPrompt) {
-      return normalizeSelectionIdentity(
-        hasCharacter ? named[SELECTED_CHARACTER_WIDGET] : widgetValue(widgets.characterWidget, ""),
-        hasPrompt ? named[SELECTED_PROMPT_WIDGET] : widgetValue(widgets.promptWidget, ""),
-      );
-    }
-  }
+  const named = serializedNode.widgets_values_named;
+  const namedHasSelection = Boolean(
+    named
+    && typeof named === "object"
+    && (
+      Object.prototype.hasOwnProperty.call(named, SELECTED_CHARACTER_WIDGET)
+      || Object.prototype.hasOwnProperty.call(named, SELECTED_PROMPT_WIDGET)
+    )
+  );
 
-  const values = serializedNode?.widgets_values;
-  if (Array.isArray(values)) {
-    const characterIndex = (node?.widgets || []).indexOf(widgets.characterWidget);
-    const promptIndex = (node?.widgets || []).indexOf(widgets.promptWidget);
-    const hasCharacter = characterIndex >= 0 && characterIndex < values.length;
-    const hasPrompt = promptIndex >= 0 && promptIndex < values.length;
-    if (hasCharacter || hasPrompt) {
-      return normalizeSelectionIdentity(
-        hasCharacter ? values[characterIndex] : widgetValue(widgets.characterWidget, ""),
-        hasPrompt ? values[promptIndex] : widgetValue(widgets.promptWidget, ""),
-      );
-    }
-  }
+  const values = serializedNode.widgets_values;
+  const characterIndex = (node?.widgets || []).indexOf(widgets.characterWidget);
+  const promptIndex = (node?.widgets || []).indexOf(widgets.promptWidget);
+  const positionalHasSelection = Boolean(
+    Array.isArray(values)
+    && (
+      (characterIndex >= 0 && characterIndex < values.length)
+      || (promptIndex >= 0 && promptIndex < values.length)
+    )
+  );
 
-  return null;
+  if (!namedHasSelection && !positionalHasSelection) return null;
+
+  // LGraphNode.configure() restores widget values before invoking onConfigure().
+  // The live widgets therefore already embody the frontend's actual restoration
+  // policy: positional values by default, or named values when that experimental
+  // setting is enabled. Do not independently prefer widgets_values_named here;
+  // the two serialized shadows can legitimately disagree, and doing so would
+  // override the value ComfyUI itself just restored.
+  return normalizeSelectionIdentity(
+    widgetValue(widgets.characterWidget, ""),
+    widgetValue(widgets.promptWidget, ""),
+  );
 }
 
 function selectionResolutionForLibraryLoad(node, serializedNode = null) {
