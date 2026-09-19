@@ -2001,7 +2001,13 @@ async function updateManagedStateTextBox(managerNode, textNode, text, { persist 
 async function updateManagedPromptDocument(
   managerNode,
   textNode,
-  { text, prompt_document },
+  {
+    text,
+    prompt_document,
+    role: requestedRole = null,
+    slot: requestedSlot = null,
+    label: requestedLabel = "",
+  },
   { render = true } = {},
 ) {
   if (!isStateManagerNode(managerNode)) {
@@ -2018,8 +2024,12 @@ async function updateManagedPromptDocument(
 
   const document = normalizePromptDocument(prompt_document, { preserveFuture: false });
   if (!document) throw new Error("prompt_document is required.");
-  const role = textNode ? getStateTextRole(textNode) : null;
-  const slot = textNode ? getStateTextSlot(textNode, role, "default") : null;
+  const role = textNode
+    ? getStateTextRole(textNode)
+    : normalizeTextRole(requestedRole, "generic");
+  const slot = textNode
+    ? getStateTextSlot(textNode, role, "default")
+    : normalizeTextSlot(requestedSlot, "default");
   const value = String(text ?? "");
 
   await waitForStateManagerLibraryIdle();
@@ -2030,7 +2040,7 @@ async function updateManagedPromptDocument(
     throw new Error("The selected State Manager prompt is not available locally.");
   }
 
-  const resolvedRole = role || "positive";
+  const resolvedRole = role || "generic";
   const resolvedSlot = slot || "default";
   const selectedBox = findPromptTextBox(
     prompt,
@@ -2038,7 +2048,11 @@ async function updateManagedPromptDocument(
     resolvedSlot,
     { allowRoleFallback: false },
   );
-  const label = selectedBox?.label || stateTextLabel(textNode, resolvedRole, resolvedSlot);
+  const label = String(
+    requestedLabel
+    || selectedBox?.label
+    || (textNode ? stateTextLabel(textNode, resolvedRole, resolvedSlot) : `${resolvedRole} ${resolvedSlot}`)
+  );
   const widgets = getWidgets(managerNode);
   const characterId = String(widgetValue(widgets.characterWidget, "") || "");
   const promptId = String(widgetValue(widgets.promptWidget, "") || "");
