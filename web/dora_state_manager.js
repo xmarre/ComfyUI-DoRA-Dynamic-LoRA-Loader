@@ -1884,6 +1884,37 @@ function ensureSelection(node, state) {
   return { character, prompt };
 }
 
+function stateManagerWorkflowPersistenceSignature(node) {
+  const widgets = getWidgets(node);
+  const distributionSafe = distributionSafeSelectionEnabled(node);
+  const selection = normalizeSelectionIdentity(
+    widgetValue(widgets.characterWidget, ""),
+    widgetValue(widgets.promptWidget, ""),
+  );
+  const properties = node?.properties || {};
+  const mirror = distributionSafe ? null : readSelectionMirror(node);
+  return canonicalJson({
+    ui_state_json: serializeWorkflowUiState(
+      widgetValue(widgets.uiStateWidget, serializeWorkflowUiState(defaultUiState())),
+    ),
+    selected_character_id: distributionSafe
+      ? "default_character"
+      : (selection.characterId || "default_character"),
+    selected_prompt_id: distributionSafe
+      ? "default_prompt"
+      : (selection.promptId || "default_prompt"),
+    selection_mirror: mirror
+      ? {
+          character_id: mirror.characterId || "default_character",
+          prompt_id: mirror.promptId || "default_prompt",
+        }
+      : null,
+    local_selection_binding: distributionSafe
+      ? String(properties[LOCAL_SELECTION_BINDING_PROPERTY] || "")
+      : "",
+  });
+}
+
 function captureStateManagerWorkflowState() {
   const canvas = app?.canvas;
   if (
@@ -1894,11 +1925,9 @@ function captureStateManagerWorkflowState() {
   }
 
   // State Manager controls are DOM widgets. ComfyUI's global mouseup capture
-  // runs before a DOM click handler, so the workflow snapshot can be taken
-  // before updateState() changes the hidden selection widgets/properties.
-  // Emit an explicit completed change transaction after the mutation so the
-  // active workflow ChangeTracker snapshots the authoritative State Manager
-  // selection and workflow persistence receives graphChanged.
+  // runs before a DOM click handler, so a workflow-relevant mutation can land
+  // after the frontend's normal snapshot. Emit a completed change transaction
+  // only when State Manager's serialized workflow contract actually changed.
   canvas.emitBeforeChange();
   canvas.emitAfterChange();
   return true;
@@ -1936,6 +1965,7 @@ function markDownstreamDirty(node) {
 
 function updateState(node, state, uiState, opts = {}) {
   const widgets = getWidgets(node);
+  const workflowPersistenceBefore = stateManagerWorkflowPersistenceSignature(node);
   const currentCharacterId = opts.characterId ?? String(widgetValue(widgets.characterWidget, "") || "");
   const currentPromptId = opts.promptId ?? String(widgetValue(widgets.promptWidget, "") || "");
   const materialized = materializeEditedDefault(state, currentCharacterId, currentPromptId);
@@ -1975,7 +2005,11 @@ function updateState(node, state, uiState, opts = {}) {
     syncCharacterLoaderStacksToConnectedNodes(node, character, opts.syncLoaderSlot);
   }
   if (opts.persist !== false) scheduleLibraryPersist(node, normalizedState);
-  if (opts.dirty !== false) markNodeDirty(node, { captureWorkflow: true });
+  const workflowPersistenceChanged = workflowPersistenceBefore
+    !== stateManagerWorkflowPersistenceSignature(node);
+  if (opts.dirty !== false) {
+    markNodeDirty(node, { captureWorkflow: workflowPersistenceChanged });
+  }
   if (opts.render !== false) scheduleRender(node);
 }
 
