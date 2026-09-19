@@ -252,6 +252,29 @@ def test_request_local_queue_snapshot_prevents_mid_execution_library_mixing(conf
     assert marker["queue_snapshot"] is True
 
 
+def test_v1_import_cannot_smuggle_prompt_document_without_v2_capability(dora_modules):
+    import dora_loader_testpkg.state_manager_api as api
+
+    class Store:
+        def merge_library(self, _characters):
+            raise AssertionError("must not mutate before descriptor-version validation")
+
+        def import_character(self, _character):
+            raise AssertionError("must not mutate before descriptor-version validation")
+
+    character = persistent_character()
+    character["prompts"][0]["text_boxes"][0]["prompt_document"] = {
+        "schema_version": 1,
+        "format": "fixed",
+    }
+    with pytest.raises(Exception, match="version 2.*prompt_document_v1"):
+        api._import_payload(Store(), {
+            "version": 1,
+            "kind": "dora_state_manager_library_export",
+            "characters": [character],
+        })
+
+
 def test_v2_import_requires_prompt_document_capability_before_mutation(dora_modules):
     import dora_loader_testpkg.state_manager_api as api
 
