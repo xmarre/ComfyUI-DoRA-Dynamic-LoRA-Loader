@@ -115,6 +115,53 @@ test("nondefault mirror repairs serialized defaults left by the startup race", a
   );
 });
 
+test("distribution-safe startup migrates the PR82 workflow mirror before local binding exists", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const previousStorage = globalThis.localStorage;
+  const storage = new Map();
+  globalThis.localStorage = {
+    getItem(key) { return storage.has(key) ? storage.get(key) : null; },
+    setItem(key, value) { storage.set(key, String(value)); },
+    removeItem(key) { storage.delete(key); },
+  };
+  const node = {
+    id: 42,
+    widgets: [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: "default_character" },
+      { name: "selected_prompt_id", value: "default_prompt" },
+    ],
+    properties: {
+      dora_state_manager_distribution_safe_serialization: true,
+      dora_state_manager_selection_v1: {
+        version: 1,
+        character_id: "character-a",
+        prompt_id: "prompt-a",
+      },
+    },
+  };
+  const serialized = {
+    id: 42,
+    widgets_values_named: {
+      selected_character_id: "default_character",
+      selected_prompt_id: "default_prompt",
+    },
+    properties: structuredClone(node.properties),
+  };
+
+  try {
+    assert.deepEqual(
+      helpers.selectionIdentityForLibraryLoad(node, serialized),
+      { characterId: "character-a", promptId: "prompt-a" },
+    );
+  } finally {
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+  }
+});
+
+
 test("distribution-safe startup restores only this browser's local selection", async () => {
   const helpers = await loadStateManagerHelpers();
   const previousStorage = globalThis.localStorage;
