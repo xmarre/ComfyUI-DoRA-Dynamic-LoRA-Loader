@@ -655,8 +655,8 @@ def materialize_state_manager_impact_prompts(
             text_id,
             impact_id,
             int(snapshot["library_revision"]),
-            document.get("format") if isinstance(document, dict) else None,
-            document.get("routing") if isinstance(document, dict) else None,
+            _receipt_document_field(document, "format"),
+            _receipt_document_field(document, "routing"),
             hashlib.sha256(info["text"].encode("utf-8")).hexdigest(),
         )
 
