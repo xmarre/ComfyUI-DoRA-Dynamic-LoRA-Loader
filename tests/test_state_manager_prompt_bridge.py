@@ -435,6 +435,12 @@ def _add_descriptor(nodes, character, text, descriptor):
     return result
 
 
+def test_legacy_interval_token_diagnostic_counts_inline_and_standalone_markers(bridge):
+    text = "Shared [0-7s] ONE\n[7-14s]\nTWO"
+    assert bridge._legacy_interval_token_count(text) == 2
+    assert bridge._legacy_interval_token_count("ordinary fixed prompt") == 0
+
+
 def test_provider_support_rejects_noncanonical_or_coerced_prompt_documents(
     bridge, monkeypatch
 ):
