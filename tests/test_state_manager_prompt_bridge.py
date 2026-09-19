@@ -551,6 +551,113 @@ def test_queue_snapshot_and_direct_continuum_sidecar_share_one_revision(
     assert sidecar["queue_contract"] == "ordered-impact-v1"
 
 
+def test_two_managers_and_fanout_keep_managed_sidecars_bound_to_their_owners(
+    configured_nodes, bridge, monkeypatch
+):
+    nodes = configured_nodes
+    _install_fake_continuum_provider(monkeypatch)
+    text_a = "[0-5s]\nALPHA"
+    text_b = "[0-5s]\nBRAVO"
+    character_a = _persistent_character(text_a)
+    character_b = _persistent_character(text_b)
+    store = nodes._get_state_manager_store()
+    snapshot = store.replace([character_a, character_b], 0)
+    descriptor = {
+        "schema_version": 1,
+        "format": "timeline",
+        "routing": "logical_chunks",
+        "geometry": {"chunks": 1, "chunk_seconds": "5"},
+    }
+    first = store.update_prompt_document(
+        character_a["id"],
+        character_a["prompts"][0]["id"],
+        "positive",
+        "default",
+        text_a,
+        descriptor,
+        snapshot["revision"],
+        "Positive",
+    )
+    store.update_prompt_document(
+        character_b["id"],
+        character_b["prompts"][0]["id"],
+        "positive",
+        "default",
+        text_b,
+        descriptor,
+        first["library_revision"],
+        "Positive",
+    )
+
+    payload = _prompt(nodes, character_a)
+    payload["prompt"]["260"] = {
+        "class_type": "H3 Continuum Production",
+        "inputs": {"sequence_prompt": ["251", 0], "managed_prompt_source_json": ""},
+    }
+    payload["prompt"]["261"] = {
+        "class_type": "H3 Continuum Production",
+        "inputs": {"sequence_prompt": ["251", 0], "managed_prompt_source_json": ""},
+    }
+    payload["prompt"].update({
+        "349": {
+            "class_type": "State Manager",
+            "inputs": {
+                "state_json": json.dumps(nodes._state_manager_default_binding()),
+                "ui_state_json": "",
+                "selected_character_id": character_b["id"],
+                "selected_prompt_id": character_b["prompts"][0]["id"],
+            },
+        },
+        "350": {
+            "class_type": "State Manager Text Box",
+            "inputs": {
+                "role": "positive",
+                "text": "stale-b",
+                "state_slot": "default",
+                "state_control": ["349", 7],
+            },
+        },
+        "351": {
+            "class_type": "ImpactWildcardProcessor",
+            "inputs": {
+                "wildcard_text": ["350", 0],
+                "populated_text": "stale-b-populated",
+                "mode": "populate",
+                "seed": 456,
+            },
+        },
+        "360": {
+            "class_type": "H3 Continuum Production",
+            "inputs": {"sequence_prompt": ["351", 0], "managed_prompt_source_json": ""},
+        },
+    })
+
+    bridge.materialize_state_manager_impact_prompts(
+        payload,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        resolve_snapshot=nodes._resolve_dora_state_payload_snapshot,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=nodes._state_payload_text_for_box,
+        ordering_verified=True,
+    )
+
+    sidecar_a = json.loads(payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"])
+    sidecar_a_fanout = json.loads(payload["prompt"]["261"]["inputs"]["managed_prompt_source_json"])
+    sidecar_b = json.loads(payload["prompt"]["360"]["inputs"]["managed_prompt_source_json"])
+    assert sidecar_a == sidecar_a_fanout
+    assert sidecar_a["text"] == text_a
+    assert sidecar_a["binding"]["manager_node"] == "249"
+    assert sidecar_a["binding"]["text_node"] == "250"
+    assert sidecar_a["binding"]["impact_node"] == "251"
+    assert sidecar_b["text"] == text_b
+    assert sidecar_b["binding"]["manager_node"] == "349"
+    assert sidecar_b["binding"]["text_node"] == "350"
+    assert sidecar_b["binding"]["impact_node"] == "351"
+    assert sidecar_a["raw_text_sha256"] != sidecar_b["raw_text_sha256"]
+    assert payload["prompt"]["251"]["inputs"]["wildcard_text"] == text_a
+    assert payload["prompt"]["351"]["inputs"]["wildcard_text"] == text_b
+
+
 def test_impact_to_continuum_sidecar_proves_exact_output_zero_path(
     configured_nodes, bridge, monkeypatch
 ):
