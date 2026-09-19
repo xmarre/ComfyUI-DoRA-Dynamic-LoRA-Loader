@@ -1677,6 +1677,37 @@ test("ordinary bulk library writes advertise the v5 prompt-document capability",
 });
 
 
+test("frontend prompt-document normalization rejects backend-invalid scalar coercions", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const valid = {
+    schema_version: 1,
+    format: "timeline",
+    routing: "logical_chunks",
+    geometry: { chunks: 2, chunk_seconds: "5.000" },
+  };
+  assert.deepEqual(helpers.normalizePromptDocument(valid, { preserveFuture: false }), {
+    schema_version: 1,
+    format: "timeline",
+    routing: "logical_chunks",
+    geometry: { chunks: 2, chunk_seconds: "5" },
+  });
+
+  for (const malformed of [
+    { ...valid, schema_version: "1" },
+    { ...valid, geometry: { chunks: "2", chunk_seconds: "5" } },
+    { ...valid, geometry: { chunks: 2, chunk_seconds: 5 } },
+    { ...valid, geometry: { chunks: 2, chunk_seconds: ".5" } },
+    { ...valid, geometry: { chunks: 2, chunk_seconds: "05" } },
+    { ...valid, geometry: { chunks: 2, chunk_seconds: "5e0" } },
+  ]) {
+    assert.throws(
+      () => helpers.normalizePromptDocument(malformed, { preserveFuture: false }),
+      /prompt_document|chunks|chunk_seconds/i,
+    );
+  }
+});
+
+
 test("frontend text normalization preserves unknown future prompt-document schemas losslessly", async () => {
   const helpers = await loadStateManagerHelpers();
   const future = {
