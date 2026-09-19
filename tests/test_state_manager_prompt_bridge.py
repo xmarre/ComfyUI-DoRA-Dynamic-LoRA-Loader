@@ -449,6 +449,104 @@ def test_impact_to_continuum_sidecar_proves_exact_output_zero_path(
     assert sidecar["library_revision"] == persisted["library_revision"]
 
 
+def test_nonzero_impact_output_never_receives_managed_provenance(
+    configured_nodes, bridge, monkeypatch
+):
+    nodes = configured_nodes
+    _install_fake_continuum_provider(monkeypatch)
+    text = "[0-5s]\nONE"
+    character = _persistent_character(text)
+    _add_descriptor(
+        nodes,
+        character,
+        text,
+        {
+            "schema_version": 1,
+            "format": "timeline",
+            "routing": "logical_chunks",
+            "geometry": {"chunks": 1, "chunk_seconds": "5"},
+        },
+    )
+    payload = _prompt(nodes, character)
+    payload["prompt"]["260"] = {
+        "class_type": "H3 Continuum Production",
+        "inputs": {
+            "sequence_prompt": ["251", 1],
+            "managed_prompt_source_json": "",
+        },
+    }
+
+    bridge.materialize_state_manager_impact_prompts(
+        payload,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        resolve_snapshot=nodes._resolve_dora_state_payload_snapshot,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=nodes._state_payload_text_for_box,
+        ordering_verified=True,
+    )
+
+    assert payload["prompt"]["251"]["inputs"]["wildcard_text"] == text
+    assert payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"] == ""
+
+
+def test_transport_receipts_are_bounded_and_do_not_log_prompt_text(
+    configured_nodes, bridge, monkeypatch, caplog
+):
+    nodes = configured_nodes
+    _install_fake_continuum_provider(monkeypatch)
+    text = (
+        "PRIVATE_SHARED_SENTINEL\n\n"
+        "[0-5s]\nPRIVATE_ONE_SENTINEL"
+    )
+    character = _persistent_character(text)
+    descriptor = {
+        "schema_version": 1,
+        "format": "timeline",
+        "routing": "logical_chunks",
+        "geometry": {"chunks": 1, "chunk_seconds": "5"},
+    }
+    persisted = _add_descriptor(nodes, character, text, descriptor)
+    payload = _prompt(nodes, character, mode="populate")
+    submitted_populated = "PRIVATE_STALE_POPULATED_SENTINEL"
+    payload["prompt"]["251"]["inputs"]["populated_text"] = submitted_populated
+    payload["prompt"]["260"] = {
+        "class_type": "H3 Continuum Production",
+        "inputs": {
+            "sequence_prompt": ["251", 0],
+            "managed_prompt_source_json": "",
+        },
+    }
+
+    with caplog.at_level("INFO", logger=bridge.__name__):
+        bridge.materialize_state_manager_impact_prompts(
+            payload,
+            resolve_payload=nodes._resolve_dora_state_payload,
+            resolve_snapshot=nodes._resolve_dora_state_payload_snapshot,
+            library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+            text_for_box=nodes._state_payload_text_for_box,
+            ordering_verified=True,
+        )
+
+    messages = "\n".join(record.getMessage() for record in caplog.records if record.name == bridge.__name__)
+    assert "managed prompt queue receipt transport=v1" in messages
+    assert f"snapshot_revision={persisted['library_revision']}" in messages
+    assert "format='timeline'" in messages
+    assert "routing='logical_chunks'" in messages
+    assert "ordering_verified=True" in messages
+    assert "managed Impact edge receipt transport=v1" in messages
+    assert "seed_provenance=literal" in messages
+    assert "expansion_state=pending_native_populate" in messages
+    assert (
+        "submitted_populated_sha256="
+        + __import__("hashlib").sha256(submitted_populated.encode("utf-8")).hexdigest()
+    ) in messages
+    assert "managed consumer sidecar receipt transport=v1" in messages
+    assert "queue_contract=ordered-impact-v1" in messages
+    assert "PRIVATE_SHARED_SENTINEL" not in messages
+    assert "PRIVATE_ONE_SENTINEL" not in messages
+    assert "PRIVATE_STALE_POPULATED_SENTINEL" not in messages
+
+
 def test_unknown_transform_never_receives_or_forwards_managed_provenance(
     configured_nodes, bridge, monkeypatch
 ):
@@ -581,6 +679,39 @@ def test_handler_order_receipt_is_bounded_and_names_handlers(bridge):
     assert len(receipt["shown"]) == 32
     assert receipt["truncated"] is True
     assert receipt["shown"][0]["name"].endswith("handler")
+
+
+def test_handler_registration_remains_first_when_impact_registers_later(bridge):
+    def impact_handler(value):
+        return value
+
+    class Server:
+        def __init__(self):
+            self.on_prompt_handlers = []
+
+        def add_on_prompt_handler(self, handler):
+            self.on_prompt_handlers.append(handler)
+
+    class PromptServer:
+        instance = Server()
+
+    bridge.register_prompt_bridge(
+        PromptServer,
+        resolve_payload=lambda *_args: {},
+        resolve_snapshot=lambda *_args: {
+            "version": 1,
+            "library_revision": 0,
+            "character_id": "",
+            "prompt_id": "",
+            "payload": {},
+        },
+        library_user_from_ui_state=lambda _value: "default",
+        text_for_box=lambda *_args: None,
+    )
+    owned = PromptServer.instance.on_prompt_handlers[0]
+    PromptServer.instance.add_on_prompt_handler(impact_handler)
+
+    assert PromptServer.instance.on_prompt_handlers == [owned, impact_handler]
 
 
 def test_handler_registration_prepends_without_reordering_other_handlers(bridge):
