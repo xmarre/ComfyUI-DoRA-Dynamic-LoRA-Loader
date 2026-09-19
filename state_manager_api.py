@@ -257,9 +257,7 @@ def register_routes(
             }
             LOGGER.info(
                 "[State Manager] prompt-document write revision=backend-document-write-v1 "
-                "character=%r prompt=%r role=%r slot=%r digest=%s library_revision=%d format=%s routing=%s",
-                character_id,
-                prompt_id,
+                "role=%r slot=%r digest=%s library_revision=%d format=%s routing=%s",
                 role,
                 slot,
                 result["text_sha256"],
@@ -271,9 +269,7 @@ def register_routes(
         except Exception as exc:
             LOGGER.warning(
                 "[State Manager] prompt-document write rejected revision=backend-document-write-v1 "
-                "character=%r prompt=%r error=%s: %s",
-                locals().get("character_id", ""),
-                locals().get("prompt_id", ""),
+                "error=%s: %s",
                 type(exc).__name__,
                 exc,
             )
