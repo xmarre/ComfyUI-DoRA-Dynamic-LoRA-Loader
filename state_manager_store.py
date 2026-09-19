@@ -10,6 +10,11 @@ from copy import deepcopy
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+try:
+    from .state_manager_prompt_document import normalize_prompt_document
+except ImportError:  # pragma: no cover
+    from state_manager_prompt_document import normalize_prompt_document
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -107,7 +112,8 @@ def _validate_image_reference(value: Any) -> None:
 
 
 class StateLibraryStore:
-    VERSION = 1
+    VERSION = 2
+    LEGACY_VERSION = 1
     MAX_MIGRATIONS = 2048
 
     def __init__(
@@ -125,7 +131,7 @@ class StateLibraryStore:
     @staticmethod
     def _empty_document() -> Dict[str, Any]:
         return {
-            "version": StateLibraryStore.VERSION,
+            "version": StateLibraryStore.LEGACY_VERSION,
             "revision": 0,
             "characters": [],
             "migrations": [],
@@ -170,9 +176,10 @@ class StateLibraryStore:
     def _normalize_document(self, raw: Any) -> Dict[str, Any]:
         if not isinstance(raw, dict):
             raise InvalidStateLibrary("The State Manager library document is malformed.")
-        if raw.get("version") != self.VERSION:
+        version = raw.get("version")
+        if version not in {self.LEGACY_VERSION, self.VERSION}:
             raise UnsupportedStateLibraryVersion(
-                f"Unsupported State Manager library version {raw.get('version')!r}; expected {self.VERSION}."
+                f"Unsupported State Manager library version {version!r}; expected {self.LEGACY_VERSION} or {self.VERSION}."
             )
         try:
             revision = max(0, int(raw.get("revision", 0)))
@@ -207,7 +214,7 @@ class StateLibraryStore:
                 "imported_at": max(0, int(entry.get("imported_at", 0) or 0)),
             })
         return {
-            "version": self.VERSION,
+            "version": int(version),
             "revision": revision,
             "characters": self._normalize_characters(raw.get("characters"), require_uuids=True),
             "migrations": normalized_migrations,
@@ -295,6 +302,41 @@ class StateLibraryStore:
                 "The malformed library was quarantined. Reload the empty recovered library before saving."
             )
 
+    @staticmethod
+    def _prompt_documents_by_identity(characters: Any) -> Dict[Tuple[str, str, str, str], Any]:
+        out: Dict[Tuple[str, str, str, str], Any] = {}
+        for character in characters if isinstance(characters, list) else []:
+            if not isinstance(character, dict):
+                continue
+            cid = str(character.get("id", ""))
+            for prompt in character.get("prompts", []) if isinstance(character.get("prompts"), list) else []:
+                if not isinstance(prompt, dict):
+                    continue
+                pid = str(prompt.get("id", ""))
+                for box in prompt.get("text_boxes", []) if isinstance(prompt.get("text_boxes"), list) else []:
+                    if not isinstance(box, dict) or "prompt_document" not in box:
+                        continue
+                    key = (
+                        cid,
+                        pid,
+                        str(box.get("role", "") or ""),
+                        str(box.get("slot", "default") or "default"),
+                    )
+                    out[key] = normalize_prompt_document(box.get("prompt_document"), preserve_future=True)
+        return out
+
+    def _backup_v1_unlocked(self, document: Dict[str, Any]) -> Optional[str]:
+        if int(document.get("version", self.LEGACY_VERSION)) != self.LEGACY_VERSION:
+            return None
+        parent = os.path.dirname(self.path)
+        os.makedirs(parent, exist_ok=True)
+        backup = f"{self.path}.v1-backup-{int(time.time() * 1000)}"
+        with open(backup, "x", encoding="utf-8") as handle:
+            json.dump(document, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        return backup
+
     def replace(self, characters: Any, expected_revision: Any) -> Dict[str, Any]:
         with self._lock:
             document = self._load_unlocked()
@@ -305,7 +347,15 @@ class StateLibraryStore:
                 raise InvalidStateLibrary("An expected library revision is required.") from exc
             if expected != document["revision"]:
                 raise StateLibraryRevisionConflict(self._public(document))
-            document["characters"] = self._normalize_characters(characters, require_uuids=True)
+            existing_documents = self._prompt_documents_by_identity(document["characters"])
+            normalized_characters = self._normalize_characters(characters, require_uuids=True)
+            replacement_documents = self._prompt_documents_by_identity(normalized_characters)
+            missing = [key for key, value in existing_documents.items() if replacement_documents.get(key) != value]
+            if missing:
+                raise InvalidStateLibrary(
+                    "The submitted library snapshot would strip or rewrite persistent prompt_document metadata; reload before saving."
+                )
+            document["characters"] = normalized_characters
             document["revision"] += 1
             self._write_unlocked(document)
             return self._public(document)
@@ -544,6 +594,104 @@ class StateLibraryStore:
             self._write_unlocked(document)
             return self._public(document)
 
+    def update_prompt_document(
+        self,
+        character_id: Any,
+        prompt_id: Any,
+        role: Any,
+        slot: Any,
+        text: Any,
+        prompt_document: Any,
+        expected_revision: Any,
+        label: Any = "",
+    ) -> Dict[str, Any]:
+        """Atomically persist text and interpretation, migrating v1 storage once."""
+        character_id = str(character_id or "").strip()
+        prompt_id = str(prompt_id or "").strip()
+        role = str(role or "positive").strip() or "positive"
+        slot = str(slot or "default").strip() or "default"
+        value = str(text or "")
+        label = str(label or "").strip()
+        descriptor = normalize_prompt_document(prompt_document, preserve_future=False)
+
+        with self._lock:
+            document = self._load_unlocked()
+            self._require_recovery_acknowledgement()
+            try:
+                expected = int(expected_revision)
+            except (TypeError, ValueError) as exc:
+                raise InvalidStateLibrary("An expected library revision is required.") from exc
+            if expected != document["revision"]:
+                raise StateLibraryRevisionConflict(self._public(document))
+
+            character = next((entry for entry in document["characters"] if entry["id"] == character_id), None)
+            if character is None:
+                raise StatePresetNotFound("Selected character preset is not available locally. Select or create a character.")
+            prompt = next((entry for entry in character.get("prompts", []) if entry["id"] == prompt_id), None)
+            if prompt is None:
+                raise StatePresetNotFound("Selected prompt preset is not available locally for this character. Select or create a prompt.")
+
+            boxes = prompt.get("text_boxes")
+            if not isinstance(boxes, list):
+                boxes = []
+                prompt["text_boxes"] = boxes
+            target = next(
+                (
+                    box for box in boxes
+                    if isinstance(box, dict)
+                    and str(box.get("role", "") or "").strip() == role
+                    and str(box.get("slot", "default") or "default").strip() == slot
+                ),
+                None,
+            )
+            if target is None:
+                target = {"role": role, "slot": slot, "label": label or f"{role} {slot}", "text": value}
+                boxes.append(target)
+            else:
+                target["text"] = value
+                if label:
+                    target["label"] = label
+            target["prompt_document"] = descriptor
+
+            if role == "positive" and slot == "default":
+                prompt["positive"] = value
+            elif role == "negative" and slot == "default":
+                prompt["negative"] = value
+
+            migrating = int(document.get("version", self.LEGACY_VERSION)) == self.LEGACY_VERSION
+            backup = self._backup_v1_unlocked(document) if migrating else None
+            document["version"] = self.VERSION
+            document["characters"] = self._normalize_characters(document["characters"], require_uuids=True)
+            document["revision"] += 1
+            self._write_unlocked(document)
+            persisted = self._prompt_documents_by_identity(document["characters"]).get((character_id, prompt_id, role, slot))
+            return {
+                "snapshot": self._public(document),
+                "prompt_document": _json_copy(persisted),
+                "text_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                "library_revision": int(document["revision"]),
+                "migrated_container_v2": bool(migrating),
+                "backup_path": backup,
+            }
+
+    def resolve_with_revision(
+        self, character_id: Any, prompt_id: Any
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
+        character_id = str(character_id or "").strip()
+        prompt_id = str(prompt_id or "").strip()
+        if character_id in {"", "default_character"} and prompt_id in {"", "default_prompt"}:
+            character = self._default_state()["characters"][0]
+            return _json_copy(character), _json_copy(character["prompts"][0]), 0
+        with self._lock:
+            document = self._load_unlocked()
+            character = next((entry for entry in document["characters"] if entry["id"] == character_id), None)
+            if character is None:
+                raise StatePresetNotFound("Selected character preset is not available locally. Select or create a character.")
+            prompt = next((entry for entry in character.get("prompts", []) if entry["id"] == prompt_id), None)
+            if prompt is None:
+                raise StatePresetNotFound("Selected prompt preset is not available locally for this character. Select or create a prompt.")
+            return _json_copy(character), _json_copy(prompt), int(document["revision"])
+
     def export_character(self, character_id: Any) -> Dict[str, Any]:
         character_id = str(character_id or "").strip()
         with self._lock:
@@ -568,24 +716,8 @@ class StateLibraryStore:
         }
 
     def resolve(self, character_id: Any, prompt_id: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        character_id = str(character_id or "").strip()
-        prompt_id = str(prompt_id or "").strip()
-        if character_id in {"", "default_character"} and prompt_id in {"", "default_prompt"}:
-            character = self._default_state()["characters"][0]
-            return _json_copy(character), _json_copy(character["prompts"][0])
-        with self._lock:
-            document = self._load_unlocked()
-            character = next((entry for entry in document["characters"] if entry["id"] == character_id), None)
-            if character is None:
-                raise StatePresetNotFound(
-                    "Selected character preset is not available locally. Select or create a character."
-                )
-            prompt = next((entry for entry in character.get("prompts", []) if entry["id"] == prompt_id), None)
-            if prompt is None:
-                raise StatePresetNotFound(
-                    "Selected prompt preset is not available locally for this character. Select or create a prompt."
-                )
-            return _json_copy(character), _json_copy(prompt)
+        character, prompt, _revision = self.resolve_with_revision(character_id, prompt_id)
+        return character, prompt
 
 
 _STORES: Dict[str, StateLibraryStore] = {}
