@@ -77,6 +77,17 @@ const BINDING_KIND = "dora_state_manager_binding";
 const BINDING_VERSION = 1;
 const QUEUE_SESSION_MAX_AGE_MS = 30000;
 
+const PROMPT_DOCUMENT_SCHEMA_VERSION = 1;
+const PROMPT_DOCUMENT_FORMATS = ["inherit", "fixed", "list", "timeline"];
+const PROMPT_DOCUMENT_ROUTINGS = ["logical_chunks", "physical_timeline"];
+
+const promptTransportProviderClient = {
+  loaded: false,
+  loading: null,
+  provider: null,
+  orderingContract: "",
+};
+
 const dsmQueueSession = {
   active: false,
   total: 1,
@@ -166,6 +177,107 @@ function normalizeTextSlot(value, fallback = "default") {
   return cleanId(value, fallback);
 }
 
+function normalizePromptDocument(raw, { preserveFuture = true } = {}) {
+  if (raw == null) return null;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("prompt_document must be an object");
+  }
+  const schemaVersion = Number(raw.schema_version);
+  if (!Number.isInteger(schemaVersion) || schemaVersion < 1) {
+    throw new Error("prompt_document schema_version is invalid");
+  }
+  if (schemaVersion !== PROMPT_DOCUMENT_SCHEMA_VERSION) {
+    if (preserveFuture) return structuredCloneCompat(raw);
+    throw new Error(`Unsupported prompt_document schema ${schemaVersion}.`);
+  }
+
+  const format = String(raw.format ?? "").trim().toLowerCase();
+  if (!PROMPT_DOCUMENT_FORMATS.includes(format)) {
+    throw new Error("prompt_document format is invalid");
+  }
+  const out = { schema_version: PROMPT_DOCUMENT_SCHEMA_VERSION, format };
+  if (format !== "timeline") {
+    if (raw.routing != null || raw.geometry != null) {
+      throw new Error("Non-Timeline prompt documents cannot carry routing or geometry.");
+    }
+    return out;
+  }
+
+  const routing = String(raw.routing ?? "").trim();
+  if (!PROMPT_DOCUMENT_ROUTINGS.includes(routing)) {
+    throw new Error("Timeline prompt_document routing is invalid.");
+  }
+  out.routing = routing;
+  if (routing === "physical_timeline") {
+    if (raw.geometry != null) {
+      throw new Error("Physical Timeline prompt documents cannot carry logical geometry.");
+    }
+    return out;
+  }
+
+  const geometry = raw.geometry;
+  if (!geometry || typeof geometry !== "object" || Array.isArray(geometry)) {
+    throw new Error("Logical Timeline prompt documents require geometry.");
+  }
+  const chunks = Number(geometry.chunks);
+  if (!Number.isInteger(chunks) || chunks < 1 || chunks > 16) {
+    throw new Error("Logical Timeline chunks must be in 1..16.");
+  }
+  const secondsText = String(geometry.chunk_seconds ?? "").trim();
+  if (!/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(secondsText)) {
+    throw new Error("chunk_seconds must be an unsigned decimal string.");
+  }
+  const seconds = Number(secondsText);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    throw new Error("chunk_seconds must be positive.");
+  }
+  const normalizedSeconds = secondsText.includes(".")
+    ? secondsText.replace(/0+$/, "").replace(/\.$/, "")
+    : secondsText;
+  out.geometry = { chunks, chunk_seconds: normalizedSeconds };
+  return out;
+}
+
+function inheritedPromptDocument() {
+  return { schema_version: PROMPT_DOCUMENT_SCHEMA_VERSION, format: "inherit" };
+}
+
+async function loadPromptTransportProvider() {
+  if (promptTransportProviderClient.loaded) return promptTransportProviderClient.provider;
+  if (promptTransportProviderClient.loading) return promptTransportProviderClient.loading;
+  promptTransportProviderClient.loading = (async () => {
+    try {
+      const payload = await stateLibraryRequest("/prompt-document-provider");
+      promptTransportProviderClient.provider =
+        payload?.provider && typeof payload.provider === "object"
+          ? structuredCloneCompat(payload.provider)
+          : null;
+      promptTransportProviderClient.orderingContract = String(payload?.ordering_contract || "");
+    } catch {
+      promptTransportProviderClient.provider = null;
+      promptTransportProviderClient.orderingContract = "";
+    } finally {
+      promptTransportProviderClient.loaded = true;
+      promptTransportProviderClient.loading = null;
+    }
+    return promptTransportProviderClient.provider;
+  })();
+  return promptTransportProviderClient.loading;
+}
+
+function promptDocumentProviderLimits() {
+  const provider = promptTransportProviderClient.provider;
+  const chunks = provider?.chunks;
+  const seconds = provider?.chunk_seconds;
+  return {
+    chunkMin: Number.isFinite(Number(chunks?.min)) ? Number(chunks.min) : null,
+    chunkMax: Number.isFinite(Number(chunks?.max)) ? Number(chunks.max) : null,
+    secondsMin: Number.isFinite(Number(seconds?.min)) ? Number(seconds.min) : null,
+    secondsMax: Number.isFinite(Number(seconds?.max)) ? Number(seconds.max) : null,
+  };
+}
+
+
 function defaultTextBox(role = "positive", slot = "default", text = "") {
   const normalizedRole = normalizeTextRole(role, "generic");
   const normalizedSlot = normalizeTextSlot(slot, "default");
@@ -187,12 +299,21 @@ function normalizeTextBox(raw, index = 0) {
   const src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : { text: raw };
   const role = normalizeTextRole(src.role ?? src.kind ?? src.type, "generic");
   const slot = normalizeTextSlot(src.slot ?? src.id ?? src.name, role === "generic" ? `text_${index + 1}` : "default");
-  return {
+  const result = {
     role,
     slot,
     label: String(src.label ?? src.name ?? `${role} ${slot}`).trim() || `${role} ${slot}`,
     text: String(src.text ?? src.value ?? src.prompt ?? ""),
   };
+  if (Object.prototype.hasOwnProperty.call(src, "prompt_document")) {
+    try {
+      result.prompt_document = normalizePromptDocument(src.prompt_document, { preserveFuture: true });
+    } catch {
+      // Never silently erase metadata from a future/stale client snapshot.
+      result.prompt_document = structuredCloneCompat(src.prompt_document);
+    }
+  }
+  return result;
 }
 
 function rawTextBoxesFromPrompt(prompt) {
