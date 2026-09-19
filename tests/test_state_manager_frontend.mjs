@@ -493,6 +493,12 @@ test("late workflow configure cannot be poisoned by an already-completed default
       },
       properties: {},
     };
+
+    // Real LGraphNode.configure() restores widgets before it invokes
+    // onConfigure(). Reproduce that ordering instead of leaving constructor
+    // defaults live while passing a contradictory serialized payload.
+    widgets[2].value = "character-a";
+    widgets[3].value = "prompt-a";
     node.onConfigure(serialized);
 
     // Selection restoration is synchronous at configure time. No API response
