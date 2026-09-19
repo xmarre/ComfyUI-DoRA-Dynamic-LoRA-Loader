@@ -10,7 +10,7 @@ async function loadStateManagerHelpers() {
     .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
     .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi(...args) { if (typeof globalThis.__dsmTestFetchApi === 'function') return globalThis.__dsmTestFetchApi(...args); throw new Error('not used'); }, apiURL(value) { return value; } };")
     .replace('import "../../scripts/domWidget.js";', "");
-  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, normalizeSelectionIdentity, readSelectionMirror, readLocalSelection, writeLocalSelection, writeSelectionMirror, configuredSelectionIdentity, selectionIdentityForLibraryLoad, initializeNode, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary, flushPendingLibraryWrites, validateManagedQueueTextState, prepareStateManagerQueuePayload };\n`;
+  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, normalizeSelectionIdentity, readSelectionMirror, readLocalSelection, writeLocalSelection, writeSelectionMirror, configuredSelectionIdentity, selectionResolutionForLibraryLoad, selectionIdentityForLibraryLoad, authoritativeSelectionIdentity, rememberAuthoritativeSelection, initializeNode, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary, flushPendingLibraryWrites, validateManagedQueueTextState, prepareStateManagerQueuePayload };\n`;
   const encoded = Buffer.from(source, "utf8").toString("base64");
   return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
 }
@@ -230,18 +230,21 @@ test("selection mirror is updated with the selected persistent preset", async ()
 });
 
 
-test("State Manager startup load is deferred until workflow configuration can restore selection", async () => {
+test("State Manager workflow hydration uses the loadedGraphNode lifecycle barrier", async () => {
   const source = await readFile(new URL("../web/dora_state_manager.js", import.meta.url), "utf8");
   const initializeIndex = source.indexOf("function initializeNode");
   const queueIndex = source.indexOf("function queueSessionTotalFromArguments");
   const block = source.slice(initializeIndex, queueIndex);
-  assert.equal(block.includes("\n  void load();\n"), false);
-  assert.match(block, /initialLoadFrame\s*=\s*requestAnimationFrame/);
-  assert.match(block, /onConfigure"[\s\S]*load\(serializedNode\)/);
+  assert.match(block, /__dsmScheduleNewNodeLibraryLoad/);
+  assert.match(block, /onConfigure"[\s\S]*selectionResolutionForLibraryLoad/);
+  assert.equal(block.includes("Promise.resolve().then(() => load(serializedNode))"), false);
+  assert.match(
+    source,
+    /loadedGraphNode\(node\)[\s\S]*__dsmLoadedGraphSeen\s*=\s*true[\s\S]*__dsmLoadConfiguredLibrary/,
+  );
 });
 
-
-test("workflow configure restores the saved preset even after a default startup load", async () => {
+test("late workflow configure cannot be poisoned by an already-completed default startup fetch", async () => {
   const helpers = await loadStateManagerHelpers();
   const previousRaf = globalThis.requestAnimationFrame;
   const previousCancel = globalThis.cancelAnimationFrame;
@@ -291,6 +294,8 @@ test("workflow configure restores the saved preset even after a default startup 
   ];
   const node = {
     id: 42,
+    type: "State Manager",
+    comfyClass: "State Manager",
     widgets,
     properties: {},
     size: [820, 720],
@@ -307,33 +312,53 @@ test("workflow configure restores the saved preset even after a default startup 
 
   try {
     helpers.initializeNode(node, {});
-    const initialFrameId = Math.min(...frames.keys());
-    const initialFrame = frames.get(initialFrameId);
-    frames.delete(initialFrameId);
-    initialFrame();
+
+    // Force the old failing ordering: allow an unconfigured default fetch to
+    // finish before ComfyUI supplies the workflow payload. It may render the
+    // built-in default, but it must not make that placeholder authoritative.
+    node.__dsmLoadConfiguredLibrary();
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     assert.equal(widgets[2].value, "default_character");
     assert.equal(widgets[3].value, "default_prompt");
+    assert.equal(helpers.authoritativeSelectionIdentity(node), null);
+    assert.equal(node.properties.dora_state_manager_selection_v1, undefined);
 
-    node.onConfigure({
+    const serialized = {
       widgets_values: [
         helpers.serializeBinding(),
         helpers.serializeWorkflowUiState({}),
         "character-a",
         "prompt-a",
       ],
+      widgets_values_named: {
+        state_json: helpers.serializeBinding(),
+        ui_state_json: helpers.serializeWorkflowUiState({}),
+        selected_character_id: "character-a",
+        selected_prompt_id: "prompt-a",
+      },
       properties: {},
-    });
+    };
+    node.onConfigure(serialized);
+
+    // Selection restoration is synchronous at configure time. No API response
+    // or animation frame may be required to stop post-load serialization from
+    // seeing constructor defaults.
+    assert.equal(widgets[2].value, "character-a");
+    assert.equal(widgets[3].value, "prompt-a");
+    assert.deepEqual(
+      helpers.authoritativeSelectionIdentity(node),
+      { characterId: "character-a", promptId: "prompt-a" },
+    );
+
+    helpers.capturedExtension.loadedGraphNode(node);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     assert.equal(widgets[2].value, "character-a");
     assert.equal(widgets[3].value, "prompt-a");
-    assert.deepEqual(node.properties.dora_state_manager_selection_v1, {
-      version: 1,
-      character_id: "character-a",
-      prompt_id: "prompt-a",
-    });
+    assert.equal(node.__dsmLibraryHydrated, true);
+    assert.equal(node.__dsm.state.characters[0].id, "character-a");
+    assert.equal(node.__dsm.state.characters[0].prompts[0].id, "prompt-a");
   } finally {
     helpers.stateLibraryClient.nodes.delete(node);
     delete globalThis.__dsmTestFetchApi;
@@ -343,7 +368,6 @@ test("workflow configure restores the saved preset even after a default startup 
     else globalThis.cancelAnimationFrame = previousCancel;
   }
 });
-
 
 test("managed State Manager text integration updates the authoritative selected prompt", async () => {
   const helpers = await loadStateManagerHelpers();
