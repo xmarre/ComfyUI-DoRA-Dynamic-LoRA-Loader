@@ -1229,6 +1229,8 @@ async function writePendingLibrary() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             expected_revision: stateLibraryClient.revision,
+            contract_version: 5,
+            capabilities: ["prompt_document_v1"],
             characters: merged.characters,
           }),
         });
