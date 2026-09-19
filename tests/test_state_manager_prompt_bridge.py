@@ -492,6 +492,50 @@ def test_impact_wildcard_encode_string_output_is_not_claimed_as_processor_transp
     assert payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"] == ""
 
 
+def test_impact_wildcard_encode_output_zero_is_not_claimed_as_processor_transport(
+    configured_nodes, bridge, monkeypatch
+):
+    nodes = configured_nodes
+    _install_fake_continuum_provider(monkeypatch)
+    text = "[0-5s]\nONE"
+    character = _persistent_character(text)
+    _add_descriptor(
+        nodes,
+        character,
+        text,
+        {
+            "schema_version": 1,
+            "format": "timeline",
+            "routing": "logical_chunks",
+            "geometry": {"chunks": 1, "chunk_seconds": "5"},
+        },
+    )
+    payload = _prompt(nodes, character, impact_class="ImpactWildcardEncode")
+    payload["prompt"]["260"] = {
+        "class_type": "H3 Continuum Production",
+        "inputs": {
+            # Output 0 on ImpactWildcardEncode is MODEL, not the Processor STRING.
+            # A malformed graph must not acquire managed STRING provenance merely
+            # because its source node is Impact-owned.
+            "sequence_prompt": ["251", 0],
+            "managed_prompt_source_json": "",
+        },
+    }
+
+    bridge.materialize_state_manager_impact_prompts(
+        payload,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        resolve_snapshot=nodes._resolve_dora_state_payload_snapshot,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=nodes._state_payload_text_for_box,
+        ordering_verified=True,
+    )
+
+    assert payload["prompt"]["251"]["inputs"]["wildcard_text"] == text
+    assert payload["prompt"]["251"]["inputs"]["populated_text"] == text
+    assert payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"] == ""
+
+
 def test_transport_receipts_are_bounded_and_do_not_log_prompt_text(
     configured_nodes, bridge, monkeypatch, caplog
 ):
