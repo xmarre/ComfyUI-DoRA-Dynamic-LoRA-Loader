@@ -8,6 +8,7 @@ const SELECTED_CHARACTER_WIDGET = "selected_character_id";
 const SELECTED_PROMPT_WIDGET = "selected_prompt_id";
 const DEFAULT_CHARACTER_ID = "default_character";
 const DEFAULT_PROMPT_ID = "default_prompt";
+const SELECTION_MIRROR_PROPERTY = "dora_state_manager_selection_v1";
 const CONTROL_ATTR = "data-dsm-distribution-safe-control";
 
 function isStateManagerDef(nodeData, nodeType) {
@@ -90,6 +91,12 @@ function applyDistributionSafeSerialization(output, node) {
     SELECTED_PROMPT_WIDGET,
     DEFAULT_PROMPT_ID,
   );
+  // The workflow-local mirror used by normal startup recovery contains the same
+  // private UUIDs that distribution-safe mode is intended to scrub. The core
+  // State Manager keeps a browser-local binding for restart persistence instead.
+  if (output.properties && typeof output.properties === "object") {
+    delete output.properties[SELECTION_MIRROR_PROPERTY];
+  }
   return uiStateChanged || characterChanged || promptChanged;
 }
 
@@ -142,7 +149,7 @@ function renderDistributionSafeControl(node) {
 
   const detail = document.createElement("small");
   detail.textContent =
-    "When enabled, workflow saves/exports serialize default_character/default_prompt instead of your currently selected local UUIDs. The live selection, local library, and runtime queue/generation state are not changed.";
+    "When enabled, workflow saves/exports omit your selected local UUIDs and serialize default_character/default_prompt instead. This browser keeps the live selection in local storage for restart recovery; another machine receives the safe defaults.";
 
   text.append(title, detail);
   label.append(checkbox, text);
