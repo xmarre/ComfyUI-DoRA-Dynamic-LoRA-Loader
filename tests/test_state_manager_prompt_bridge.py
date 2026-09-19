@@ -492,6 +492,43 @@ def test_unknown_transform_never_receives_or_forwards_managed_provenance(
     assert payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"] == ""
 
 
+def test_registered_handler_rolls_back_all_staged_mutations_on_late_failure(
+    configured_nodes, bridge
+):
+    import copy
+
+    nodes = configured_nodes
+    character = _persistent_character("[0-5s]\nONE")
+    payload = _prompt(nodes, character)
+    before = copy.deepcopy(payload)
+
+    class Server:
+        def __init__(self):
+            self.on_prompt_handlers = []
+
+        def add_on_prompt_handler(self, handler):
+            self.on_prompt_handlers.append(handler)
+
+    class PromptServer:
+        instance = Server()
+
+    def explode_after_snapshot(*_args):
+        raise RuntimeError("late text resolution failure")
+
+    bridge.register_prompt_bridge(
+        PromptServer,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        resolve_snapshot=nodes._resolve_dora_state_payload_snapshot,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=explode_after_snapshot,
+    )
+    result = PromptServer.instance.on_prompt_handlers[0](payload)
+
+    assert result is payload
+    assert payload == before
+    assert "__dsm_queue_snapshot_v1" not in payload["prompt"]["249"]["inputs"]["ui_state_json"]
+
+
 def test_handler_order_receipt_is_bounded_and_names_handlers(bridge):
     handlers = []
     for index in range(40):
