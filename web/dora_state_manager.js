@@ -358,8 +358,13 @@ function promptDocumentEditor(node, box) {
   const limits = promptDocumentProviderLimits();
   const providerNote = document.createElement("div");
   providerNote.className = "dsm-muted";
+  const orderingVerified = promptTransportProviderClient.orderingContract === "ordered-impact-v1";
   providerNote.textContent = provider
-    ? `Detected Continuum provider v${provider.provider_version}; logical chunks ${limits.chunkMin ?? "?"}–${limits.chunkMax ?? "?"}, chunk duration ${limits.secondsMin ?? "?"}–${limits.secondsMax ?? "?"}s.`
+    ? (
+        orderingVerified
+          ? `Detected Continuum provider v${provider.provider_version}; logical chunks ${limits.chunkMin ?? "?"}–${limits.chunkMax ?? "?"}, chunk duration ${limits.secondsMin ?? "?"}–${limits.secondsMax ?? "?"}s. Ordered Impact transport is verified.`
+          : `Detected Continuum provider v${provider.provider_version}, but ordered Impact transport is not verified in this runtime. Interpretation metadata can be saved; managed sequence verification will remain disabled.`
+      )
     : "No compatible Continuum prompt-transport provider is currently advertised; metadata can be saved, but managed sequence verification remains unavailable until a compatible consumer is installed.";
 
   const save = makeButton("Save interpretation", async () => {
