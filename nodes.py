@@ -4825,18 +4825,28 @@ class StateManager:
             "selected_prompt_id": selected_prompt_id,
         }
         library_user_id = _queued_library_user_from_ui_state(ui_state_json)
+        queued_snapshot = _queued_state_manager_snapshot(ui_state_json)
         try:
-            resolved = _resolve_dora_state_payload(
-                state_json,
-                selected_character_id,
-                selected_prompt_id,
-                library_user_id,
-            )
+            if (
+                queued_snapshot is not None
+                and queued_snapshot["character_id"] == str(selected_character_id or "")
+                and queued_snapshot["prompt_id"] == str(selected_prompt_id or "")
+            ):
+                resolved = dict(queued_snapshot["payload"])
+                payload["library_revision"] = queued_snapshot["library_revision"]
+                payload["queue_snapshot"] = True
+            else:
+                resolved_snapshot = _resolve_dora_state_payload_snapshot(
+                    state_json,
+                    selected_character_id,
+                    selected_prompt_id,
+                    library_user_id,
+                )
+                resolved = dict(resolved_snapshot["payload"])
+                payload["library_revision"] = resolved_snapshot["library_revision"]
             queued_seed = _queued_runtime_seed_from_ui_state(ui_state_json)
             if queued_seed is not None:
-                resolved = dict(resolved)
                 resolved["settings"] = _settings_with_runtime_seed(resolved.get("settings", {}), queued_seed)
-            payload["library_revision"] = _get_state_manager_store(library_user_id).revision()
         except (InvalidStateLibrary, StatePresetNotFound, OSError) as exc:
             resolved = {}
             payload["library_error"] = type(exc).__name__
@@ -4853,13 +4863,19 @@ class StateManager:
         selected_prompt_id: Any = "",
     ):
         library_user_id = _queued_library_user_from_ui_state(ui_state_json)
+        queued_snapshot = _queued_state_manager_snapshot(ui_state_json)
         try:
-            _resolve_state_manager_selection(
-                state_json,
-                selected_character_id,
-                selected_prompt_id,
-                library_user_id,
-            )
+            if not (
+                queued_snapshot is not None
+                and queued_snapshot["character_id"] == str(selected_character_id or "")
+                and queued_snapshot["prompt_id"] == str(selected_prompt_id or "")
+            ):
+                _resolve_state_manager_selection(
+                    state_json,
+                    selected_character_id,
+                    selected_prompt_id,
+                    library_user_id,
+                )
         except StatePresetNotFound as exc:
             return f"State Manager: {exc}"
         except Exception as exc:
@@ -4874,14 +4890,24 @@ class StateManager:
         selected_prompt_id: Any = "",
     ):
         library_user_id = _queued_library_user_from_ui_state(ui_state_json)
-        character, prompt = _resolve_state_manager_selection(
-            state_json,
-            selected_character_id,
-            selected_prompt_id,
-            library_user_id,
-        )
-        state = {"version": _DORA_STATE_MANAGER_SCHEMA_VERSION, "characters": [character]}
-        payload = _resolve_dora_state_payload_from_state(state, character.get("id"), prompt.get("id"))
+        queued_snapshot = _queued_state_manager_snapshot(ui_state_json)
+        if (
+            queued_snapshot is not None
+            and queued_snapshot["character_id"] == str(selected_character_id or "")
+            and queued_snapshot["prompt_id"] == str(selected_prompt_id or "")
+        ):
+            payload = dict(queued_snapshot["payload"])
+            character = payload.get("character") if isinstance(payload.get("character"), dict) else {}
+            prompt = payload.get("prompt") if isinstance(payload.get("prompt"), dict) else {}
+        else:
+            character, prompt = _resolve_state_manager_selection(
+                state_json,
+                selected_character_id,
+                selected_prompt_id,
+                library_user_id,
+            )
+            state = {"version": _DORA_STATE_MANAGER_SCHEMA_VERSION, "characters": [character]}
+            payload = _resolve_dora_state_payload_from_state(state, character.get("id"), prompt.get("id"))
         queued_seed = _queued_runtime_seed_from_ui_state(ui_state_json)
         if queued_seed is not None:
             payload = dict(payload)
