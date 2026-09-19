@@ -162,6 +162,57 @@ def test_real_impact_populate_handler_and_processor_match_reviewed_wildcard_engi
     assert processor_cls().doit(**inputs) == (expected,)
 
 
+def test_real_impact_linked_seed_supported_queue_lookup_matches_literal_seed(impact_contract):
+    wildcards, handler, processor_cls, _server = impact_contract
+    template = "Linked __managed/scene__"
+    expected = wildcards.process(template, 123)
+    payload = _payload(
+        mode="populate",
+        wildcard_text=template,
+        populated_text="STALE_POPULATED_TEXT",
+        seed=["13", 0],
+    )
+    payload["prompt"]["13"] = {
+        "class_type": "PrimitiveNode",
+        "inputs": {"value": 123},
+    }
+
+    handler(payload)
+    inputs = payload["prompt"]["12"]["inputs"]
+    assert inputs["mode"] == "reproduce"
+    assert inputs["populated_text"] == expected
+
+    # ComfyUI resolves the linked INT before execution; the Processor then sees
+    # the same seed value as the queue handler.
+    execution_inputs = {**inputs, "seed": 123}
+    assert processor_cls().doit(**execution_inputs) == (expected,)
+
+
+def test_real_impact_unresolved_linked_seed_preserves_native_queue_skip_and_later_resolution(impact_contract):
+    wildcards, handler, processor_cls, _server = impact_contract
+    template = "Deferred __managed/scene__"
+    payload = _payload(
+        mode="populate",
+        wildcard_text=template,
+        populated_text=template,
+        seed=["13", 0],
+    )
+    payload["prompt"]["13"] = {
+        "class_type": "UnsupportedSeedSource",
+        "inputs": {"text": "not an integer"},
+    }
+
+    handler(payload)
+    inputs = payload["prompt"]["12"]["inputs"]
+    assert inputs["mode"] == "populate"
+    assert inputs["populated_text"] == template
+
+    # Simulate normal executor resolution after Impact intentionally skipped
+    # queue-time expansion. No derived/replacement seed is invented.
+    execution_inputs = {**inputs, "seed": 123}
+    assert processor_cls().doit(**execution_inputs) == (wildcards.process(template, 123),)
+
+
 def test_real_impact_fixed_skips_queue_expansion_but_processes_populated_text_at_execution(impact_contract):
     wildcards, handler, processor_cls, _server = impact_contract
     populated = "Fixed __managed/scene__"
