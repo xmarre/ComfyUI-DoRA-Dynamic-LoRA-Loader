@@ -63,6 +63,7 @@ def register_routes(
     normalize_state: Callable[[Any], Dict[str, Any]],
     default_state: Callable[[], Dict[str, Any]],
     prompt_transport_provider: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
+    prompt_transport_ordering_contract: Optional[Callable[[], Optional[str]]] = None,
 ) -> None:
     global _ROUTES_REGISTERED
     if _ROUTES_REGISTERED:
@@ -187,11 +188,16 @@ def register_routes(
         try:
             _store, user_id = store_for_request(request)
             provider = prompt_transport_provider() if callable(prompt_transport_provider) else None
+            ordering_contract = (
+                prompt_transport_ordering_contract()
+                if callable(prompt_transport_ordering_contract)
+                else None
+            )
             return web.json_response({
                 "contract_version": 5,
                 "capability": "prompt_document_v1",
                 "provider": provider,
-                "ordering_contract": "ordered-impact-v1",
+                "ordering_contract": ordering_contract,
                 "user_id": user_id,
             })
         except Exception as exc:
