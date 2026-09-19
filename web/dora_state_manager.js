@@ -1998,17 +1998,128 @@ async function updateManagedStateTextBox(managerNode, textNode, text, { persist 
   };
 }
 
+async function updateManagedPromptDocument(
+  managerNode,
+  textNode,
+  { text, prompt_document },
+  { render = true } = {},
+) {
+  if (!isStateManagerNode(managerNode)) {
+    throw new Error("The connected state_control source is not a State Manager node.");
+  }
+  if (textNode != null) {
+    if (!isStateTextNode(textNode)) {
+      throw new Error("The managed Sequence Prompt source is not a State Manager Text Box.");
+    }
+    if (!getControlledNodes(managerNode).includes(textNode)) {
+      throw new Error("The State Manager does not own the connected Text Box through state_control.");
+    }
+  }
+
+  const document = normalizePromptDocument(prompt_document, { preserveFuture: false });
+  if (!document) throw new Error("prompt_document is required.");
+  const role = textNode ? getStateTextRole(textNode) : null;
+  const slot = textNode ? getStateTextSlot(textNode, role, "default") : null;
+  const value = String(text ?? "");
+
+  await waitForStateManagerLibraryIdle();
+  const current = getRenderableState(managerNode);
+  const nextState = structuredCloneCompat(current.state);
+  const { prompt } = ensureSelection(managerNode, nextState);
+  if (!prompt || prompt.__dsm_ephemeral) {
+    throw new Error("The selected State Manager prompt is not available locally.");
+  }
+
+  const resolvedRole = role || "positive";
+  const resolvedSlot = slot || "default";
+  const selectedBox = findPromptTextBox(
+    prompt,
+    resolvedRole,
+    resolvedSlot,
+    { allowRoleFallback: false },
+  );
+  const label = selectedBox?.label || stateTextLabel(textNode, resolvedRole, resolvedSlot);
+  const widgets = getWidgets(managerNode);
+  const characterId = String(widgetValue(widgets.characterWidget, "") || "");
+  const promptId = String(widgetValue(widgets.promptWidget, "") || "");
+
+  const receipt = await stateLibraryRequest(
+    `/characters/${encodeURIComponent(characterId)}/prompts/${encodeURIComponent(promptId)}/prompt-document`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expected_revision: stateLibraryClient.revision,
+        role: resolvedRole,
+        slot: resolvedSlot,
+        label,
+        text: value,
+        prompt_document: document,
+      }),
+    },
+  );
+
+  if (
+    receipt?.persistent_verified !== true
+    || receipt?.contract_version !== 5
+    || receipt?.write_revision !== "backend-document-write-v1"
+    || canonicalJson(receipt?.prompt_document) !== canonicalJson(document)
+  ) {
+    throw new Error("State Manager did not return the exact v5 prompt-document persistence receipt.");
+  }
+  if (!installLibrarySnapshot(receipt?.snapshot)) {
+    throw new Error("State Manager rejected the managed prompt-document snapshot as stale.");
+  }
+
+  const persistedCharacter = (stateLibraryClient.state?.characters || []).find(
+    (item) => item?.id === characterId,
+  );
+  const persistedPrompt = persistedCharacter?.prompts?.find((item) => item?.id === promptId);
+  const persistedBox = persistedPrompt
+    ? findPromptTextBox(persistedPrompt, resolvedRole, resolvedSlot, { allowRoleFallback: false })
+    : null;
+  if (
+    !persistedBox
+    || String(persistedBox.text ?? "") !== value
+    || canonicalJson(persistedBox.prompt_document) !== canonicalJson(document)
+  ) {
+    throw new Error(
+      `State Manager prompt-document write did not persist ${resolvedRole}/${resolvedSlot} exactly.`,
+    );
+  }
+
+  refreshNodeFromLibrary(managerNode, {
+    status: "Saved prompt interpretation metadata.",
+  });
+  if (textNode) {
+    applyTextToNode(textNode, value, resolvedRole);
+    mirrorStateTextToDownstreamWidgets(textNode, value, resolvedRole);
+    markDownstreamDirty(textNode);
+  }
+  if (render) scheduleRender(managerNode);
+  return receipt;
+}
+
+
 function installStateManagerPromptIntegrationApi() {
   globalThis.__doraStateManagerPromptApi = {
-    contract_version: 4,
+    contract_version: 5,
     capabilities: Object.freeze([
       "authoritative_persistent_text_v1",
       "impact_wildcard_queue_bridge_v1",
       "backend_impact_prompt_bridge_v1",
       "backend_persistent_text_write_v1",
+      "prompt_document_v1",
     ]),
     async setTextBox(managerNode, textNode, text) {
+      // Exact v4 compatibility: this method and its backend receipt remain v4.
       return updateManagedStateTextBox(managerNode, textNode, text, { persist: true });
+    },
+    async setPromptDocument(managerNode, textNode, payload) {
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("setPromptDocument requires {text, prompt_document}.");
+      }
+      return updateManagedPromptDocument(managerNode, textNode, payload, { render: true });
     },
   };
 }
@@ -5017,6 +5128,7 @@ function maybeInjectWidgetInput(nodeData) {
 
 installLoaderStateSyncApi();
 installStateManagerPromptIntegrationApi();
+void loadPromptTransportProvider();
 
 app.registerExtension({
   name: EXT_NAME,
