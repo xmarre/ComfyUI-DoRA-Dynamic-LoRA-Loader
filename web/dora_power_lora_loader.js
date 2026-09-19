@@ -584,6 +584,7 @@ function defaultState() {
       auto_strength_device: "gpu",
       auto_strength_ratio_floor: 0.30,
       auto_strength_ratio_ceiling: 1.50,
+      auto_strength_residual_beta: 0.50,
       dora_decompose_debug: false,
       dora_decompose_debug_n: 30,
       dora_decompose_debug_stack_depth: 10,
@@ -627,6 +628,9 @@ function sanitizeState(st) {
     auto_strength_ratio_ceiling: Number.isFinite(+globalsIn.auto_strength_ratio_ceiling)
       ? Math.max(0, +globalsIn.auto_strength_ratio_ceiling)
       : 1.50,
+    auto_strength_residual_beta: Number.isFinite(+globalsIn.auto_strength_residual_beta)
+      ? Math.max(0, Math.min(1, +globalsIn.auto_strength_residual_beta))
+      : 0.50,
     dora_decompose_debug: globalsIn.dora_decompose_debug !== undefined ? !!globalsIn.dora_decompose_debug : false,
     dora_decompose_debug_n: Number.isFinite(+globalsIn.dora_decompose_debug_n)
       ? Math.max(0, Math.floor(+globalsIn.dora_decompose_debug_n))
@@ -1478,7 +1482,24 @@ class DoraAutoStrengthReportWidget {
       ctx.fillText(fitText(ctx, topLine, cardWidth - 24), x + 12, y + 48);
 
       const cohortNames = Array.isArray(row.report?.cohorts)
-        ? row.report.cohorts.map((cohort) => `${cohort.group}/${cohort.family}`).join("  ·  ")
+        ? row.report.cohorts
+            .map((cohort) => {
+              const name = `${cohort.group}/${cohort.family}/${cohort.semantic_role || "unclassified"}`;
+              if (cohort.family !== "linear") return name;
+              const minDepthGain = toFiniteNumberOrNull(cohort.depth_gain_min_raw);
+              const maxDepthGain = toFiniteNumberOrNull(cohort.depth_gain_max_raw);
+              const roleGain = toFiniteNumberOrNull(cohort.role_gain_raw);
+              let gainText = "gain —";
+              if (minDepthGain !== null && maxDepthGain !== null) {
+                gainText = Math.abs(maxDepthGain - minDepthGain) <= 1e-6
+                  ? `depth ×${formatNumber(minDepthGain, 2)}`
+                  : `depth ×${formatNumber(minDepthGain, 2)}–${formatNumber(maxDepthGain, 2)}`;
+              } else if (roleGain !== null) {
+                gainText = `role ×${formatNumber(roleGain, 2)}`;
+              }
+              return `${name} ${gainText} · ${cohort.corrected_logical_count || 0}/${cohort.outlier_candidate_count || 0} outliers corrected`;
+            })
+            .join("  ·  ")
         : "";
       ctx.fillText(fitText(ctx, cohortNames, cardWidth - 24), x + 12, y + 66);
 
@@ -1832,6 +1853,20 @@ function buildUI(node, state, loraValues) {
   );
   wAutoStrengthCeiling.label = "Auto-strength ratio ceiling";
 
+  const wAutoStrengthResidualBeta = node.addWidget(
+    "number",
+    "auto_strength_residual_beta",
+    Number.isFinite(+node._doraGlobals.auto_strength_residual_beta)
+      ? +node._doraGlobals.auto_strength_residual_beta
+      : 0.50,
+    (v) => {
+      node._doraGlobals.auto_strength_residual_beta = Math.max(0, Math.min(1, +v || 0));
+      persistNodeState(node);
+    },
+    { min: 0.0, max: 1.0, step: 0.05 }
+  );
+  wAutoStrengthResidualBeta.label = "Auto-strength residual β (0=local, 1=old per-layer)";
+
   const autoStrengthReportWidget =
     reusableCustomWidgets.report || new DoraAutoStrengthReportWidget("auto_strength_visualization", node);
   autoStrengthReportWidget.parentNode = node;
@@ -1903,6 +1938,7 @@ app.registerExtension({
               auto_strength_device: "gpu",
               auto_strength_ratio_floor: 0.30,
               auto_strength_ratio_ceiling: 1.50,
+              auto_strength_residual_beta: 0.50,
               dora_decompose_debug: false,
               dora_decompose_debug_n: 30,
               dora_decompose_debug_stack_depth: 10,
