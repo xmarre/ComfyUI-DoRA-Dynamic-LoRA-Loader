@@ -1884,9 +1884,30 @@ function ensureSelection(node, state) {
   return { character, prompt };
 }
 
-function markNodeDirty(node) {
+function captureStateManagerWorkflowState() {
+  const canvas = app?.canvas;
+  if (
+    typeof canvas?.emitBeforeChange !== "function"
+    || typeof canvas?.emitAfterChange !== "function"
+  ) {
+    return false;
+  }
+
+  // State Manager controls are DOM widgets. ComfyUI's global mouseup capture
+  // runs before a DOM click handler, so the workflow snapshot can be taken
+  // before updateState() changes the hidden selection widgets/properties.
+  // Emit an explicit completed change transaction after the mutation so the
+  // active workflow ChangeTracker snapshots the authoritative State Manager
+  // selection and workflow persistence receives graphChanged.
+  canvas.emitBeforeChange();
+  canvas.emitAfterChange();
+  return true;
+}
+
+function markNodeDirty(node, { captureWorkflow = false } = {}) {
   node?.setDirtyCanvas?.(true, true);
   node?.graph?.change?.();
+  if (captureWorkflow) captureStateManagerWorkflowState();
 }
 
 function markDownstreamDirty(node) {
@@ -1954,7 +1975,7 @@ function updateState(node, state, uiState, opts = {}) {
     syncCharacterLoaderStacksToConnectedNodes(node, character, opts.syncLoaderSlot);
   }
   if (opts.persist !== false) scheduleLibraryPersist(node, normalizedState);
-  if (opts.dirty !== false) markNodeDirty(node);
+  if (opts.dirty !== false) markNodeDirty(node, { captureWorkflow: true });
   if (opts.render !== false) scheduleRender(node);
 }
 
