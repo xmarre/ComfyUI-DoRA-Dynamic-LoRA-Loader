@@ -134,6 +134,24 @@ jobs:
           ref: ${{ matrix.comfy_ref }}
           path: ComfyUI
 
+      - name: Check out reviewed Impact Pack source
+        if: matrix.comfy_version == '2026-08-21'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          repository: ltdrdata/ComfyUI-Impact-Pack
+          ref: 429d0159ad429e64d2b3916e6e7be9c22d025c3c
+          path: ImpactPack
+
+      - name: Check out reviewed managed H3 Continuum source
+        if: matrix.comfy_version == '2026-08-21'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          repository: xmarre/ComfyUI-H3-Continuum-Plus
+          ref: 5f50456659e8eca0d6215c299f7c567ed41aed4a
+          path: H3Continuum
+
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
@@ -177,3 +195,14 @@ jobs:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
           PYTHONPATH: ${{ github.workspace }}/ComfyUI
         run: python -m pytest -q --import-mode=importlib .
+
+      - name: Run managed State Manager → real Impact → Continuum integration
+        if: matrix.comfy_version == '2026-08-21'
+        working-directory: /tmp/dora-loader-tests
+        env:
+          DORA_REPO_ROOT: ${{ github.workspace }}
+          COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
+          PYTHONPATH: ${{ github.workspace }}/ComfyUI
+          IMPACT_PACK_SOURCE: ${{ github.workspace }}/ImpactPack
+          H3_CONTINUUM_SOURCE: ${{ github.workspace }}/H3Continuum
+        run: python -m pytest -q --import-mode=importlib test_managed_transport_end_to_end.py
