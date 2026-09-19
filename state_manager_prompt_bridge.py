@@ -5,6 +5,8 @@ import logging
 import re
 from typing import Any, Callable, Dict, Optional
 
+from .state_manager_prompt_document import normalize_prompt_document
+
 
 _LOG = logging.getLogger(__name__)
 
@@ -413,7 +415,16 @@ def prompt_transport_provider_capabilities() -> Optional[Dict[str, Any]]:
 
 
 def _document_supported_by_provider(document: Any, provider: Dict[str, Any]) -> bool:
-    if not isinstance(document, dict) or document.get("schema_version") != 1:
+    if not isinstance(document, dict):
+        return False
+    try:
+        normalized = normalize_prompt_document(document, preserve_future=False)
+    except (TypeError, ValueError):
+        return False
+    # Current-schema sidecars are a strict wire contract. Persistence already
+    # canonicalizes them, so accepting coercible/noncanonical shapes here would
+    # only create a sidecar that Continuum must reject later.
+    if normalized != document:
         return False
     if document.get("format") != "timeline" or document.get("routing") != "logical_chunks":
         return True
@@ -421,8 +432,8 @@ def _document_supported_by_provider(document: Any, provider: Dict[str, Any]) -> 
     if not isinstance(geometry, dict):
         return False
     try:
-        chunks = int(geometry.get("chunks"))
-        seconds = float(geometry.get("chunk_seconds"))
+        chunks = geometry["chunks"]
+        seconds = float(geometry["chunk_seconds"])
         chunk_range = provider["chunks"]
         seconds_range = provider["chunk_seconds"]
         return (
