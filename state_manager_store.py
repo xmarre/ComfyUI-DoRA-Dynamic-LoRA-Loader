@@ -362,6 +362,20 @@ class StateLibraryStore:
             os.fsync(handle.fileno())
         return backup
 
+    def _promote_v2_for_prompt_documents_unlocked(
+        self,
+        document: Dict[str, Any],
+        characters: Any,
+    ) -> Optional[str]:
+        """Promote a v1 container before a write that would persist descriptors."""
+        if int(document.get("version", self.LEGACY_VERSION)) != self.LEGACY_VERSION:
+            return None
+        if not self._prompt_documents_by_identity(characters):
+            return None
+        backup = self._backup_v1_unlocked(document)
+        document["version"] = self.VERSION
+        return backup
+
     def replace(self, characters: Any, expected_revision: Any) -> Dict[str, Any]:
         with self._lock:
             document = self._load_unlocked()
@@ -380,6 +394,7 @@ class StateLibraryStore:
                 raise InvalidStateLibrary(
                     "The submitted library snapshot would strip or rewrite persistent prompt_document metadata; reload before saving."
                 )
+            self._promote_v2_for_prompt_documents_unlocked(document, normalized_characters)
             document["characters"] = normalized_characters
             document["revision"] += 1
             self._write_unlocked(document)
@@ -458,15 +473,27 @@ class StateLibraryStore:
         if not isinstance(legacy_state, dict) or not isinstance(legacy_state.get("characters"), list):
             raise InvalidStateLibrary("Legacy State Manager data is malformed.")
         normalized = self._normalize_state(legacy_state)
+        normalized_characters = self._normalize_characters(
+            normalized.get("characters"),
+            require_uuids=False,
+        )
+        normalized = {**normalized, "characters": normalized_characters}
         fingerprint = hashlib.sha256(_canonical(normalized).encode("utf-8")).hexdigest()
         with self._lock:
             document = self._load_unlocked()
             self._require_recovery_acknowledgement()
+            promoted_backup = self._promote_v2_for_prompt_documents_unlocked(
+                document,
+                normalized_characters,
+            )
             existing_migration = next(
                 (entry for entry in document["migrations"] if entry["fingerprint"] == fingerprint),
                 None,
             )
             if existing_migration is not None:
+                if promoted_backup is not None:
+                    document["revision"] += 1
+                    self._write_unlocked(document)
                 return {
                     "snapshot": self._public(document),
                     "fingerprint": fingerprint,
@@ -515,7 +542,9 @@ class StateLibraryStore:
         with self._lock:
             document = self._load_unlocked()
             self._require_recovery_acknowledgement()
-            character, _, _, _ = self._merge_character(document, raw_character, deduplicate_content=False)
+            normalized = self._normalize_characters([raw_character], require_uuids=False)[0]
+            self._promote_v2_for_prompt_documents_unlocked(document, [normalized])
+            character, _, _, _ = self._merge_character(document, normalized, deduplicate_content=False)
             document["revision"] += 1
             self._write_unlocked(document)
             return {"snapshot": self._public(document), "character": _json_copy(character)}
@@ -526,8 +555,13 @@ class StateLibraryStore:
         with self._lock:
             document = self._load_unlocked()
             self._require_recovery_acknowledgement()
+            normalized_characters = [
+                self._normalize_characters([character], require_uuids=False)[0]
+                for character in characters
+            ]
+            self._promote_v2_for_prompt_documents_unlocked(document, normalized_characters)
             imported_ids = []
-            for character in characters:
+            for character in normalized_characters:
                 imported, _, _, _ = self._merge_character(document, character, deduplicate_content=True)
                 imported_ids.append(imported["id"])
             document["revision"] += 1
@@ -608,6 +642,14 @@ class StateLibraryStore:
                 prompt["positive"] = value
             elif role == "negative" and slot == "default":
                 prompt["negative"] = value
+
+            # If an unreleased/partial v2 client already left descriptors in a
+            # v1 container, any subsequent mutation repairs the container before
+            # writing it again and preserves a recoverable v1 backup.
+            self._promote_v2_for_prompt_documents_unlocked(
+                document,
+                document["characters"],
+            )
 
             # Re-run the normal schema normalizer so mirrors, IDs and validation
             # stay identical to every other persistent-library write path.
@@ -727,7 +769,10 @@ class StateLibraryStore:
             character = next((entry for entry in document["characters"] if entry["id"] == character_id), None)
             if character is None:
                 raise StatePresetNotFound(character_id)
-            version = 2 if int(document.get("version", self.LEGACY_VERSION)) >= 2 else 1
+            version = 2 if (
+                int(document.get("version", self.LEGACY_VERSION)) >= 2
+                or bool(self._prompt_documents_by_identity(document["characters"]))
+            ) else 1
             payload = {
                 "version": version,
                 "kind": "dora_state_manager_character_export",
@@ -740,7 +785,10 @@ class StateLibraryStore:
 
     def export_library(self) -> Dict[str, Any]:
         snapshot = self.snapshot()
-        version = 2 if int(snapshot.get("version", self.LEGACY_VERSION)) >= 2 else 1
+        version = 2 if (
+            int(snapshot.get("version", self.LEGACY_VERSION)) >= 2
+            or bool(self._prompt_documents_by_identity(snapshot["characters"]))
+        ) else 1
         payload = {
             "version": version,
             "kind": "dora_state_manager_library_export",
