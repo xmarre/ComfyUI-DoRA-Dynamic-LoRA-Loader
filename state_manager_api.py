@@ -3,7 +3,7 @@ import hashlib
 import json
 import logging
 import re
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from .state_manager_store import (
     InvalidStateLibrary,
@@ -52,13 +52,14 @@ def register_routes(
     web: Any,
     normalize_state: Callable[[Any], Dict[str, Any]],
     default_state: Callable[[], Dict[str, Any]],
+    prompt_transport_provider: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
 ) -> None:
     global _ROUTES_REGISTERED
     if _ROUTES_REGISTERED:
         return
     _ROUTES_REGISTERED = True
     routes = prompt_server.instance.routes
-    LOGGER.info("[State Manager] managed prompt API registered contract=v4 capability=backend_persistent_text_write_v1 revision=backend-write-v1")
+    LOGGER.info("[State Manager] managed prompt API registered contract=v5 capabilities=backend_persistent_text_write_v1,prompt_document_v1 revision=backend-document-write-v1")
 
     def store_for_request(request):
         user_manager = getattr(prompt_server.instance, "user_manager", None)
@@ -164,6 +165,86 @@ def register_routes(
         except Exception as exc:
             LOGGER.warning(
                 "[State Manager] managed prompt write rejected revision=backend-write-v1 character=%r prompt=%r error=%s: %s",
+                locals().get("character_id", ""),
+                locals().get("prompt_id", ""),
+                type(exc).__name__,
+                exc,
+            )
+            return error_response(exc)
+
+    @routes.get("/dora_dynamic_lora/state-library/prompt-document-provider")
+    async def state_manager_prompt_document_provider(request):
+        try:
+            _store, user_id = store_for_request(request)
+            provider = prompt_transport_provider() if callable(prompt_transport_provider) else None
+            return web.json_response({
+                "contract_version": 5,
+                "capability": "prompt_document_v1",
+                "provider": provider,
+                "ordering_contract": "ordered-impact-v1",
+                "user_id": user_id,
+            })
+        except Exception as exc:
+            return error_response(exc)
+
+    @routes.put("/dora_dynamic_lora/state-library/characters/{character_id}/prompts/{prompt_id}/prompt-document")
+    async def state_manager_update_prompt_document(request):
+        try:
+            store, user_id = store_for_request(request)
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise InvalidStateLibrary("The State Manager prompt-document request is malformed.")
+            character_id = request.match_info["character_id"]
+            prompt_id = request.match_info["prompt_id"]
+            role = str(payload.get("role", "positive") or "positive")
+            slot = str(payload.get("slot", "default") or "default")
+            text = str(payload.get("text", "") or "")
+            label = str(payload.get("label", "") or "")
+            result = await asyncio.to_thread(
+                store.update_prompt_document,
+                character_id,
+                prompt_id,
+                role,
+                slot,
+                text,
+                payload.get("prompt_document"),
+                payload.get("expected_revision"),
+                label,
+            )
+            snapshot = with_user_id(result["snapshot"], user_id)
+            response = {
+                "status": "updated",
+                "role": role,
+                "slot": slot,
+                "character_id": character_id,
+                "prompt_id": prompt_id,
+                "text_sha256": result["text_sha256"],
+                "prompt_document": result["prompt_document"],
+                "library_revision": result["library_revision"],
+                "persistent_verified": True,
+                "contract_version": 5,
+                "write_revision": "backend-document-write-v1",
+                "migrated_container_v2": bool(result.get("migrated_container_v2")),
+                "snapshot": snapshot,
+                "user_id": user_id,
+            }
+            LOGGER.info(
+                "[State Manager] prompt-document write revision=backend-document-write-v1 "
+                "character=%r prompt=%r role=%r slot=%r digest=%s library_revision=%d format=%s routing=%s",
+                character_id,
+                prompt_id,
+                role,
+                slot,
+                result["text_sha256"],
+                int(result["library_revision"]),
+                (result["prompt_document"] or {}).get("format"),
+                (result["prompt_document"] or {}).get("routing"),
+            )
+            return web.json_response(response)
+        except Exception as exc:
+            LOGGER.warning(
+                "[State Manager] prompt-document write rejected revision=backend-document-write-v1 "
+                "character=%r prompt=%r error=%s: %s",
                 locals().get("character_id", ""),
                 locals().get("prompt_id", ""),
                 type(exc).__name__,
