@@ -150,12 +150,16 @@ def _workflow(json_data: Any) -> Dict[str, Any]:
     return workflow if isinstance(workflow, dict) else {}
 
 
-def _workflow_input_source(json_data: Any, node_id: Any, input_name: str) -> Optional[str]:
+def _workflow_input_source(
+    json_data: Any,
+    node_id: Any,
+    input_name: str,
+) -> tuple[Optional[str], Optional[int]]:
     workflow = _workflow(json_data)
     nodes = workflow.get("nodes")
     links = workflow.get("links")
     if not isinstance(nodes, list) or not isinstance(links, list):
-        return None
+        return None, None
 
     workflow_node = next(
         (
@@ -166,11 +170,11 @@ def _workflow_input_source(json_data: Any, node_id: Any, input_name: str) -> Opt
         None,
     )
     if not isinstance(workflow_node, dict):
-        return None
+        return None, None
 
     inputs = workflow_node.get("inputs")
     if not isinstance(inputs, list):
-        return None
+        return None, None
     input_entry = next(
         (
             item
@@ -180,11 +184,11 @@ def _workflow_input_source(json_data: Any, node_id: Any, input_name: str) -> Opt
         None,
     )
     if not isinstance(input_entry, dict):
-        return None
+        return None, None
 
     link_id = input_entry.get("link")
     if link_id is None:
-        return None
+        return None, None
     for row in links:
         if not isinstance(row, (list, tuple)) or len(row) < 5:
             continue
@@ -192,8 +196,12 @@ def _workflow_input_source(json_data: Any, node_id: Any, input_name: str) -> Opt
             continue
         if str(row[3]) != str(node_id):
             continue
-        return str(row[1])
-    return None
+        try:
+            origin_slot = int(row[2])
+        except (TypeError, ValueError):
+            return None, None
+        return str(row[1]), origin_slot
+    return None, None
 
 
 def _link(value: Any) -> tuple[Optional[str], Optional[int]]:
@@ -552,8 +560,11 @@ def materialize_state_manager_impact_prompts(
             continue
         source_id, output_index = _link(impact_inputs.get("wildcard_text"))
         if source_id is None:
-            source_id = _workflow_input_source(json_data, impact_id, "wildcard_text")
-            output_index = 0 if source_id is not None else None
+            source_id, output_index = _workflow_input_source(
+                json_data,
+                impact_id,
+                "wildcard_text",
+            )
         if output_index not in (None, 0) or source_id not in managed:
             continue
         info = managed[source_id]
