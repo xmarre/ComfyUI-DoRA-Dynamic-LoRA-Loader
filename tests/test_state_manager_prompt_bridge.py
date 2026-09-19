@@ -761,6 +761,65 @@ def test_handler_registration_remains_first_when_impact_registers_later(bridge):
     assert PromptServer.instance.on_prompt_handlers == [owned, impact_handler]
 
 
+def test_later_third_party_prepend_disables_ordered_sidecar_at_request_time(
+    configured_nodes, bridge, monkeypatch
+):
+    nodes = configured_nodes
+    _install_fake_continuum_provider(monkeypatch)
+    text = "[0-5s]\nONE"
+    character = _persistent_character(text)
+    _add_descriptor(
+        nodes,
+        character,
+        text,
+        {
+            "schema_version": 1,
+            "format": "timeline",
+            "routing": "logical_chunks",
+            "geometry": {"chunks": 1, "chunk_seconds": "5"},
+        },
+    )
+    payload = _prompt(nodes, character)
+    payload["prompt"]["260"] = {
+        "class_type": "H3 Continuum Production",
+        "inputs": {
+            "sequence_prompt": ["251", 0],
+            "managed_prompt_source_json": "",
+        },
+    }
+
+    class Server:
+        def __init__(self):
+            self.on_prompt_handlers = []
+
+        def add_on_prompt_handler(self, handler):
+            self.on_prompt_handlers.append(handler)
+
+    class PromptServer:
+        instance = Server()
+
+    bridge.register_prompt_bridge(
+        PromptServer,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        resolve_snapshot=nodes._resolve_dora_state_payload_snapshot,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=nodes._state_payload_text_for_box,
+    )
+    owned = PromptServer.instance.on_prompt_handlers[0]
+    assert bridge.prompt_transport_ordering_contract() == "ordered-impact-v1"
+
+    def rogue_prepend(value):
+        return value
+
+    PromptServer.instance.on_prompt_handlers.insert(0, rogue_prepend)
+    assert bridge.prompt_transport_ordering_contract() is None
+
+    result = owned(payload)
+    assert result["prompt"]["251"]["inputs"]["wildcard_text"] == text
+    assert result["prompt"]["251"]["inputs"]["populated_text"] == text
+    assert result["prompt"]["260"]["inputs"]["managed_prompt_source_json"] == ""
+
+
 def test_handler_registration_prepends_without_reordering_other_handlers(bridge):
     calls = []
 
