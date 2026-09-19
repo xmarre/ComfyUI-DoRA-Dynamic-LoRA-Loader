@@ -726,21 +726,29 @@ class StateLibraryStore:
             character = next((entry for entry in document["characters"] if entry["id"] == character_id), None)
             if character is None:
                 raise StatePresetNotFound(character_id)
-            return {
-                "version": 1,
+            version = 2 if int(document.get("version", self.LEGACY_VERSION)) >= 2 else 1
+            payload = {
+                "version": version,
                 "kind": "dora_state_manager_character_export",
                 "exported_at": int(time.time() * 1000),
                 "character": _json_copy(character),
             }
+            if version >= 2:
+                payload["capabilities"] = ["prompt_document_v1"]
+            return payload
 
     def export_library(self) -> Dict[str, Any]:
         snapshot = self.snapshot()
-        return {
-            "version": 1,
+        version = 2 if int(snapshot.get("version", self.LEGACY_VERSION)) >= 2 else 1
+        payload = {
+            "version": version,
             "kind": "dora_state_manager_library_export",
             "exported_at": int(time.time() * 1000),
             "characters": snapshot["characters"],
         }
+        if version >= 2:
+            payload["capabilities"] = ["prompt_document_v1"]
+        return payload
 
     def resolve(self, character_id: Any, prompt_id: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         character, prompt, _revision = self.resolve_with_revision(character_id, prompt_id)
