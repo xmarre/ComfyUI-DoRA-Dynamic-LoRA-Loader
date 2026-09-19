@@ -192,6 +192,21 @@ def _parse_ui_state(value: Any) -> Dict[str, Any]:
     return {}
 
 
+def _discard_queue_snapshot(manager_inputs: Dict[str, Any]) -> bool:
+    """Remove an untrusted client-supplied reserved queue snapshot."""
+    ui_state = _parse_ui_state(manager_inputs.get("ui_state_json", ""))
+    if "__dsm_queue_snapshot_v1" not in ui_state:
+        return False
+    ui_state.pop("__dsm_queue_snapshot_v1", None)
+    manager_inputs["ui_state_json"] = json.dumps(
+        ui_state,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return True
+
+
 def _install_queue_snapshot(manager_inputs: Dict[str, Any], snapshot: Dict[str, Any]) -> None:
     ui_state = _parse_ui_state(manager_inputs.get("ui_state_json", ""))
     # The reserved snapshot is server-owned. Never trust a client copy.
@@ -331,11 +346,72 @@ def materialize_state_manager_impact_prompts(
 
     changed = 0
     snapshots: Dict[str, Dict[str, Any]] = {}
+    manager_context: Dict[str, Dict[str, Any]] = {}
     managed: Dict[str, Dict[str, Any]] = {}
 
-    # First resolve every managed Text Box from exactly one request-local manager
-    # snapshot. This makes fan-out deterministic and prevents later library edits
-    # from splitting one queued request across revisions.
+    # Freeze every queued State Manager exactly once, independently of whether a
+    # managed Text Box is present. The reserved UI-state field is server-owned:
+    # discard any submitted copy before resolving the authoritative snapshot.
+    for manager_id, manager_node in prompt.items():
+        manager_id = str(manager_id)
+        if str(manager_node.get("class_type", "")) not in _MANAGER_CLASSES:
+            continue
+        manager_inputs = _inputs(manager_node)
+        if manager_inputs is None:
+            continue
+        if _discard_queue_snapshot(manager_inputs):
+            changed += 1
+        ui_state_json = manager_inputs.get("ui_state_json", "")
+        library_user_id = library_user_from_ui_state(ui_state_json)
+        selected_character_id, selected_prompt_id, selection_source = _queued_runtime_selection(
+            ui_state_json,
+            manager_inputs.get("selected_character_id", ""),
+            manager_inputs.get("selected_prompt_id", ""),
+        )
+        manager_context[manager_id] = {
+            "inputs": manager_inputs,
+            "library_user_id": library_user_id,
+            "selected_character_id": selected_character_id,
+            "selected_prompt_id": selected_prompt_id,
+            "selection_source": selection_source,
+        }
+        try:
+            if resolve_snapshot is not None:
+                snapshot = resolve_snapshot(
+                    manager_inputs.get("state_json", ""),
+                    selected_character_id,
+                    selected_prompt_id,
+                    library_user_id,
+                )
+            else:
+                payload = resolve_payload(
+                    manager_inputs.get("state_json", ""),
+                    selected_character_id,
+                    selected_prompt_id,
+                    library_user_id,
+                )
+                snapshot = {
+                    "version": 1,
+                    "library_revision": -1,
+                    "character_id": selected_character_id,
+                    "prompt_id": selected_prompt_id,
+                    "payload": payload,
+                }
+            if not isinstance(snapshot, dict) or not isinstance(snapshot.get("payload"), dict):
+                raise ValueError("invalid State Manager queue snapshot")
+            snapshots[manager_id] = snapshot
+            if int(snapshot.get("library_revision", -1)) >= 0:
+                _install_queue_snapshot(manager_inputs, snapshot)
+                changed += 1
+        except Exception:
+            _LOG.exception(
+                "[State Manager] backend prompt bridge could not freeze manager=%s",
+                manager_id,
+            )
+
+    # Materialize each managed Text Box from its owning manager's frozen payload.
+    # This makes fan-out deterministic and keeps text/settings/references on one
+    # library revision for the complete queued request.
     for text_id, text_node in prompt.items():
         text_id = str(text_id)
         if str(text_node.get("class_type", "")) not in _TEXT_BOX_CLASSES:
@@ -346,59 +422,11 @@ def materialize_state_manager_impact_prompts(
         manager_id = _link_source(text_inputs.get("state_control"))
         if manager_id is None:
             continue
-        manager_node = _node(prompt, manager_id)
-        manager_inputs = _inputs(manager_node)
-        if manager_node is None or manager_inputs is None:
-            continue
-        if str(manager_node.get("class_type", "")) not in _MANAGER_CLASSES:
-            continue
-
-        ui_state_json = manager_inputs.get("ui_state_json", "")
-        library_user_id = library_user_from_ui_state(ui_state_json)
-        selected_character_id, selected_prompt_id, selection_source = _queued_runtime_selection(
-            ui_state_json,
-            manager_inputs.get("selected_character_id", ""),
-            manager_inputs.get("selected_prompt_id", ""),
-        )
-        if manager_id not in snapshots:
-            try:
-                if resolve_snapshot is not None:
-                    snapshot = resolve_snapshot(
-                        manager_inputs.get("state_json", ""),
-                        selected_character_id,
-                        selected_prompt_id,
-                        library_user_id,
-                    )
-                else:
-                    payload = resolve_payload(
-                        manager_inputs.get("state_json", ""),
-                        selected_character_id,
-                        selected_prompt_id,
-                        library_user_id,
-                    )
-                    snapshot = {
-                        "version": 1,
-                        "library_revision": -1,
-                        "character_id": selected_character_id,
-                        "prompt_id": selected_prompt_id,
-                        "payload": payload,
-                    }
-                if not isinstance(snapshot, dict) or not isinstance(snapshot.get("payload"), dict):
-                    raise ValueError("invalid State Manager queue snapshot")
-                snapshots[manager_id] = snapshot
-                if int(snapshot.get("library_revision", -1)) >= 0:
-                    _install_queue_snapshot(manager_inputs, snapshot)
-                    changed += 1
-            except Exception:
-                _LOG.exception(
-                    "[State Manager] backend prompt bridge could not freeze manager=%s",
-                    manager_id,
-                )
-                continue
-
+        context = manager_context.get(manager_id)
         snapshot = snapshots.get(manager_id)
-        if snapshot is None:
+        if context is None or snapshot is None:
             continue
+
         payload = snapshot["payload"]
         role = str(text_inputs.get("role", "positive"))
         slot = str(text_inputs.get("state_slot", "default"))
@@ -417,7 +445,7 @@ def materialize_state_manager_impact_prompts(
             "prompt_document": box.get("prompt_document") if isinstance(box, dict) else None,
             "role": role,
             "slot": slot,
-            "selection_source": selection_source,
+            "selection_source": context["selection_source"],
         }
 
     # Preserve native Impact semantics: both source widgets are made authoritative,
