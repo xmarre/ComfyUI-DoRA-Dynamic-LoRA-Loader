@@ -461,6 +461,103 @@ def test_prompt_document_write_rejects_stale_revision_without_backup_or_mutation
     assert list(parent.glob("state-library.json.v1-backup-*")) == []
 
 
+def test_descriptor_bearing_bulk_replace_promotes_v1_with_prewrite_backup(store):
+    character = make_character("Descriptor Replace")
+    character["prompts"][0]["text_boxes"][0]["prompt_document"] = {
+        "schema_version": 1,
+        "format": "fixed",
+    }
+
+    result = store.replace([character], 0)
+
+    assert result["version"] == 2
+    backups = list(Path(store.path).parent.glob("state-library.json.v1-backup-*"))
+    assert len(backups) == 1
+    backup = json.loads(backups[0].read_text(encoding="utf-8"))
+    assert backup == {
+        "version": 1,
+        "revision": 0,
+        "characters": [],
+        "migrations": [],
+    }
+
+
+def test_descriptor_bearing_character_import_promotes_v1_but_plain_import_does_not(store):
+    plain = make_character("Plain Import")
+    plain_result = store.import_character(plain)
+    assert plain_result["snapshot"]["version"] == 1
+    assert list(Path(store.path).parent.glob("state-library.json.v1-backup-*")) == []
+
+    descriptor = make_character("Descriptor Import")
+    descriptor["prompts"][0]["text_boxes"][0]["prompt_document"] = {
+        "schema_version": 1,
+        "format": "fixed",
+    }
+    imported = store.import_character(descriptor)
+
+    assert imported["snapshot"]["version"] == 2
+    backups = list(Path(store.path).parent.glob("state-library.json.v1-backup-*"))
+    assert len(backups) == 1
+    backup = json.loads(backups[0].read_text(encoding="utf-8"))
+    assert backup["version"] == 1
+    assert backup["revision"] == plain_result["snapshot"]["revision"]
+    assert [item["name"] for item in backup["characters"]] == ["Plain Import"]
+
+
+def test_descriptor_bearing_library_merge_promotes_v1_before_import(store):
+    descriptor = make_character("Descriptor Library Import")
+    descriptor["prompts"][0]["text_boxes"][0]["prompt_document"] = {
+        "schema_version": 1,
+        "format": "timeline",
+        "routing": "logical_chunks",
+        "geometry": {"chunks": 1, "chunk_seconds": "5"},
+    }
+
+    imported = store.merge_library([descriptor])
+
+    assert imported["snapshot"]["version"] == 2
+    assert imported["snapshot"]["characters"][0]["prompts"][0]["text_boxes"][0]["prompt_document"]["format"] == "timeline"
+    backups = list(Path(store.path).parent.glob("state-library.json.v1-backup-*"))
+    assert len(backups) == 1
+    assert json.loads(backups[0].read_text(encoding="utf-8"))["characters"] == []
+
+
+def test_text_only_mutation_repairs_descriptor_bearing_v1_container(store):
+    character = make_character("Partial V2")
+    character["prompts"][0]["text_boxes"][0]["prompt_document"] = {
+        "schema_version": 99,
+        "future_mode": "opaque",
+        "future_data": {"keep": True},
+    }
+    path = Path(store.path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = {
+        "version": 1,
+        "revision": 7,
+        "characters": [character],
+        "migrations": [],
+    }
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    result = store.update_prompt_text_box(
+        character["id"],
+        character["prompts"][0]["id"],
+        "positive",
+        "default",
+        "edited",
+        7,
+    )
+
+    assert result["version"] == 2
+    assert result["characters"][0]["prompts"][0]["text_boxes"][0]["prompt_document"] == character["prompts"][0]["text_boxes"][0]["prompt_document"]
+    backups = list(path.parent.glob("state-library.json.v1-backup-*"))
+    assert len(backups) == 1
+    backup = json.loads(backups[0].read_text(encoding="utf-8"))
+    assert backup["version"] == 1
+    assert backup["revision"] == 7
+    assert backup["characters"][0]["prompts"][0]["text_boxes"][0]["prompt_document"] == character["prompts"][0]["text_boxes"][0]["prompt_document"]
+
+
 def test_descriptor_aware_export_advertises_support_and_preserves_future_schema(store):
     character = make_character("Selected")
     character["prompts"][0]["text_boxes"][0]["prompt_document"] = {
