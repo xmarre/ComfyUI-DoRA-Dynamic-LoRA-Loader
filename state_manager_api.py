@@ -33,6 +33,16 @@ def configure_store(
 
 
 def _import_payload(store, payload: Dict[str, Any]):
+    try:
+        export_version = int(payload.get("version", 1) or 1)
+    except (TypeError, ValueError) as exc:
+        raise InvalidStateLibrary("The State Manager import version is invalid.") from exc
+    if export_version >= 2:
+        capabilities = payload.get("capabilities")
+        if not isinstance(capabilities, list) or "prompt_document_v1" not in capabilities:
+            raise InvalidStateLibrary(
+                "Descriptor-aware State Manager v2 imports must advertise prompt_document_v1."
+            )
     kind = str(payload.get("kind", ""))
     if kind == "dora_state_manager_library_export":
         return store.merge_library(payload.get("characters"))
