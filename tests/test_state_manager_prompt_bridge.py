@@ -435,6 +435,27 @@ def _add_descriptor(nodes, character, text, descriptor):
     return result
 
 
+def test_provider_support_rejects_noncanonical_or_coerced_prompt_documents(
+    bridge, monkeypatch
+):
+    provider = _install_fake_continuum_provider(monkeypatch)
+    valid = {
+        "schema_version": 1,
+        "format": "timeline",
+        "routing": "logical_chunks",
+        "geometry": {"chunks": 2, "chunk_seconds": "5"},
+    }
+    assert bridge._document_supported_by_provider(valid, provider) is True
+
+    for malformed in [
+        {**valid, "schema_version": "1"},
+        {**valid, "geometry": {"chunks": "2", "chunk_seconds": "5"}},
+        {**valid, "geometry": {"chunks": 2, "chunk_seconds": 5}},
+        {**valid, "geometry": {"chunks": 2, "chunk_seconds": "5.000"}},
+    ]:
+        assert bridge._document_supported_by_provider(malformed, provider) is False
+
+
 def test_provider_preview_and_skeleton_delegate_without_private_error_text(
     bridge, monkeypatch
 ):
