@@ -95,6 +95,8 @@ def register_routes(
     default_state: Callable[[], Dict[str, Any]],
     prompt_transport_provider: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
     prompt_transport_ordering_contract: Optional[Callable[[], Optional[str]]] = None,
+    prompt_transport_preview: Optional[Callable[[Any], Dict[str, Any]]] = None,
+    prompt_transport_logical_skeleton: Optional[Callable[[Any, Any], Dict[str, Any]]] = None,
 ) -> None:
     global _ROUTES_REGISTERED
     if _ROUTES_REGISTERED:
@@ -241,6 +243,44 @@ def register_routes(
                 "provider": provider,
                 "ordering_contract": ordering_contract,
                 "user_id": user_id,
+            })
+        except Exception as exc:
+            return error_response(exc)
+
+    @routes.post("/dora_dynamic_lora/state-library/prompt-document-provider/inspect")
+    async def state_manager_prompt_document_inspect(request):
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
+                raise ValueError("Prompt inspection requires a text string.")
+            if not callable(prompt_transport_preview):
+                return web.json_response({"available": False, "valid": False})
+            result = prompt_transport_preview(payload["text"])
+            return web.json_response({
+                "contract_version": 5,
+                **dict(result),
+            })
+        except Exception as exc:
+            return error_response(exc)
+
+    @routes.post("/dora_dynamic_lora/state-library/prompt-document-provider/logical-skeleton")
+    async def state_manager_prompt_document_logical_skeleton(request):
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Logical Timeline skeleton request is malformed.")
+            chunks = payload.get("chunks")
+            chunk_seconds = payload.get("chunk_seconds")
+            if type(chunks) is not int or not isinstance(chunk_seconds, str):
+                raise ValueError(
+                    "Logical Timeline skeleton requires integer chunks and decimal-string chunk_seconds."
+                )
+            if not callable(prompt_transport_logical_skeleton):
+                return web.json_response({"available": False})
+            result = prompt_transport_logical_skeleton(chunks, chunk_seconds)
+            return web.json_response({
+                "contract_version": 5,
+                **dict(result),
             })
         except Exception as exc:
             return error_response(exc)
