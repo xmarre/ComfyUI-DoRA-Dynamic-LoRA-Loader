@@ -66,6 +66,8 @@ jobs:
           listing="$(unzip -Z1 "${archive}")"
           for required in \
             state_manager_api.py \
+            state_manager_prompt_bridge.py \
+            state_manager_prompt_document.py \
             state_manager_store.py \
             web/dora_state_manager.js; do
             printf '%s\n' "${listing}" | grep -Fx "${prefix}/${required}"

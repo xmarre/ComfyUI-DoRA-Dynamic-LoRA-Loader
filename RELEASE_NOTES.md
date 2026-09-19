@@ -1,3 +1,32 @@
+# DoRA Dynamic LoRA Loader v1.0.46
+
+This release hardens State Manager prompt persistence and queue transport, and adds the managed prompt-document contract used by H3 Continuum and other verified STRING consumers.
+
+## Managed prompt-document transport
+
+- Adds State Manager managed-prompt contract v5 with atomic persistent text + `prompt_document` writes while keeping the v4 text-only write path available for compatibility.
+- Persists explicit Fixed/List/Timeline intent and geometry; missing legacy metadata is represented only by a request-local `inherit` sidecar and is never inferred back into persistent storage.
+- Freezes the selected persistent preset at queue time, verifies handler ordering, and binds the authoritative State Manager Text Box through ImpactWildcardProcessor to the intended downstream consumer.
+- Keeps explicit persisted documents authoritative and never promotes stale Impact `populated_text` or other downstream mirrors into persistent State Manager authority.
+
+## Queue/persistence synchronization
+
+- Tracks the active State Manager library write and drains pending/in-flight persistence before queue materialization.
+- Aborts queue submission when a persistent write is blocked or fails instead of launching with stale data.
+- Fails fast with `DSM_UNSAVED_MANAGED_TEXT` when a connected local Text Box is non-empty but the selected persistent managed text is still empty.
+- Preserves unrelated library data, revision protection, request-user scoping, and existing State Manager/loader synchronization behavior.
+
+## Packaging and compatibility
+
+- Ships the new `state_manager_prompt_bridge.py` and `state_manager_prompt_document.py` modules in the Comfy package.
+- Existing presets without prompt-document metadata remain loadable. When paired with H3 Continuum 3.4.3, historical exact chunk separators such as `[0-7s]` / `[7-14s]` can be validated request-locally without rewriting the preset.
+- Impact/Core remain compatibility inputs; no Impact or ComfyUI Core patch is required.
+
+## Validation
+
+- Exact-head Actions run 35423724177 completed successfully.
+- Production validation confirmed the managed queue receipt, Impact edge receipt, and consumer sidecar carried the same non-empty 6680-character prompt, the same snapshot revision, and the same SHA-256 before H3 Continuum execution.
+
 # DoRA Dynamic LoRA Loader v1.0.45
 
 This release fixes split state between the State Manager and connected DoRA Power LoRA Loader nodes so the visible loader configuration, saved preset, and runtime state remain consistent.
