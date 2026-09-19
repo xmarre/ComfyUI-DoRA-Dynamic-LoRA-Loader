@@ -352,7 +352,14 @@ def prompt_transport_provider_preview(text: Any) -> Dict[str, Any]:
     if provider is None:
         return {"available": False, "valid": False}
     try:
-        classification = provider["classify"](str(text))
+        classification = str(provider["classify"](str(text)))
+    except Exception as exc:
+        return {
+            "available": True,
+            "valid": False,
+            "error": _bounded_provider_error(exc),
+        }
+    try:
         structure = provider["inspect"](str(text))
         json_safe_structure = json.loads(
             json.dumps(structure, ensure_ascii=False, separators=(",", ":"))
@@ -360,13 +367,14 @@ def prompt_transport_provider_preview(text: Any) -> Dict[str, Any]:
         return {
             "available": True,
             "valid": True,
-            "classification": str(classification),
+            "classification": classification,
             "structure": json_safe_structure,
         }
     except Exception as exc:
         return {
             "available": True,
             "valid": False,
+            "classification": classification,
             "error": _bounded_provider_error(exc),
         }
 
