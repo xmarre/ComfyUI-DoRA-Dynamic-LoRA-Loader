@@ -15,6 +15,7 @@ from .nodes import (
 from .runtime_bypass import RuntimeBypassDoraPowerLoraLoader
 from .state_manager_api import register_routes as register_state_manager_routes
 from .state_manager_prompt_bridge import (
+    prompt_transport_ordering_contract,
     prompt_transport_provider_capabilities,
     register_prompt_bridge,
 )
@@ -40,6 +41,7 @@ try:
         _normalize_state_manager_state,
         _state_manager_default_state,
         prompt_transport_provider=prompt_transport_provider_capabilities,
+        prompt_transport_ordering_contract=prompt_transport_ordering_contract,
     )
 except Exception:
     logging.getLogger(__name__).exception(
