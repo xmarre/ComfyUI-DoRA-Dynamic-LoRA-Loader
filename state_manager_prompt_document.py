@@ -3,18 +3,22 @@ from __future__ import annotations
 
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
+import re
 from typing import Any, Dict, Optional
 
 
 PROMPT_DOCUMENT_SCHEMA_VERSION = 1
 PROMPT_DOCUMENT_FORMATS = {"inherit", "fixed", "list", "timeline"}
 PROMPT_DOCUMENT_ROUTINGS = {"logical_chunks", "physical_timeline"}
+_DECIMAL = re.compile(r"^(?:0|[1-9]\d*)(?:\.\d+)?$")
 
 
 def _decimal_string(value: Any) -> str:
-    text = str(value).strip()
-    if not text or "e" in text.lower() or text.startswith(("+", "-")):
-        raise ValueError("chunk_seconds must be a positive decimal string")
+    if not isinstance(value, str):
+        raise ValueError("chunk_seconds must be an unsigned decimal string")
+    text = value.strip()
+    if _DECIMAL.fullmatch(text) is None:
+        raise ValueError("chunk_seconds must be an unsigned decimal string")
     try:
         number = Decimal(text)
     except InvalidOperation as exc:
