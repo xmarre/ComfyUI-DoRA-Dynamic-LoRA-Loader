@@ -308,21 +308,23 @@ function promptDocumentEditor(node, box) {
 
   let current = null;
   let futureSchema = false;
+  let malformedMetadata = false;
   if (Object.prototype.hasOwnProperty.call(box, "prompt_document")) {
     try {
       current = normalizePromptDocument(box.prompt_document, { preserveFuture: true });
-      futureSchema = Number(current?.schema_version) !== PROMPT_DOCUMENT_SCHEMA_VERSION;
+      futureSchema = current?.schema_version !== PROMPT_DOCUMENT_SCHEMA_VERSION;
     } catch {
       current = structuredCloneCompat(box.prompt_document);
-      futureSchema = true;
+      malformedMetadata = true;
     }
   }
   const status = document.createElement("div");
   status.className = "dsm-muted";
 
-  if (futureSchema) {
-    status.textContent =
-      `Prompt interpretation metadata uses unsupported schema ${String(current?.schema_version ?? "unknown")}; it is preserved unchanged.`;
+  if (futureSchema || malformedMetadata) {
+    status.textContent = malformedMetadata
+      ? "Prompt interpretation metadata is malformed for the supported schema; it is preserved unchanged until explicitly replaced."
+      : `Prompt interpretation metadata uses unsupported schema ${String(current?.schema_version ?? "unknown")}; it is preserved unchanged.`;
     panel.append(
       status,
       makeButton("Replace metadata with Inherit", async () => {
@@ -349,7 +351,7 @@ function promptDocumentEditor(node, box) {
 
   const format = makeSelect(
     [
-      { value: "inherit", label: "Inherit" },
+      { value: "inherit", label: "Legacy / consumer" },
       { value: "fixed", label: "Fixed" },
       { value: "list", label: "List" },
       { value: "timeline", label: "Timeline" },
