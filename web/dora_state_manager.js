@@ -75,6 +75,7 @@ const LAST_SEED_BUTTON_LABEL = "♻️ (Use Last Queued Seed)";
 const LIBRARY_API = "/dora_dynamic_lora/state-library";
 const BINDING_KIND = "dora_state_manager_binding";
 const BINDING_VERSION = 1;
+const SELECTION_MIRROR_PROPERTY = "dora_state_manager_selection_v1";
 const QUEUE_SESSION_MAX_AGE_MS = 30000;
 
 const PROMPT_DOCUMENT_SCHEMA_VERSION = 1;
@@ -1494,6 +1495,11 @@ async function initializeStateLibrary(node, legacyState, selectedCharacterId, se
   setWidgetValue(widgets.stateWidget, serializeBinding());
   setWidgetValue(widgets.characterWidget, characterId || "default_character");
   setWidgetValue(widgets.promptWidget, promptId || "default_prompt");
+  writeSelectionMirror(
+    node,
+    widgetValue(widgets.characterWidget, ""),
+    widgetValue(widgets.promptWidget, ""),
+  );
   const state = stateViewForSelection(
     widgetValue(widgets.characterWidget, ""),
     widgetValue(widgets.promptWidget, ""),
@@ -1569,6 +1575,76 @@ function getWidgets(node) {
     characterWidget: map.get(SELECTED_CHARACTER_WIDGET),
     promptWidget: map.get(SELECTED_PROMPT_WIDGET),
   };
+}
+
+function normalizeSelectionIdentity(characterId = "", promptId = "") {
+  return {
+    characterId: String(characterId || "").trim(),
+    promptId: String(promptId || "").trim(),
+  };
+}
+
+function readSelectionMirror(node, serializedNode = null) {
+  const raw = serializedNode?.properties?.[SELECTION_MIRROR_PROPERTY]
+    ?? node?.properties?.[SELECTION_MIRROR_PROPERTY];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const selection = normalizeSelectionIdentity(raw.character_id, raw.prompt_id);
+  if (!selection.characterId && !selection.promptId) return null;
+  return selection;
+}
+
+function writeSelectionMirror(node, characterId, promptId) {
+  if (!node) return;
+  const selection = normalizeSelectionIdentity(characterId, promptId);
+  node.properties = node.properties || {};
+  node.properties[SELECTION_MIRROR_PROPERTY] = {
+    version: 1,
+    character_id: selection.characterId || "default_character",
+    prompt_id: selection.promptId || "default_prompt",
+  };
+}
+
+function configuredSelectionIdentity(node, serializedNode = null) {
+  const widgets = getWidgets(node);
+  const named = serializedNode?.widgets_values_named;
+  if (named && typeof named === "object") {
+    const hasCharacter = Object.prototype.hasOwnProperty.call(named, SELECTED_CHARACTER_WIDGET);
+    const hasPrompt = Object.prototype.hasOwnProperty.call(named, SELECTED_PROMPT_WIDGET);
+    if (hasCharacter || hasPrompt) {
+      return normalizeSelectionIdentity(
+        hasCharacter ? named[SELECTED_CHARACTER_WIDGET] : widgetValue(widgets.characterWidget, ""),
+        hasPrompt ? named[SELECTED_PROMPT_WIDGET] : widgetValue(widgets.promptWidget, ""),
+      );
+    }
+  }
+
+  const values = serializedNode?.widgets_values;
+  if (Array.isArray(values)) {
+    const characterIndex = (node?.widgets || []).indexOf(widgets.characterWidget);
+    const promptIndex = (node?.widgets || []).indexOf(widgets.promptWidget);
+    const hasCharacter = characterIndex >= 0 && characterIndex < values.length;
+    const hasPrompt = promptIndex >= 0 && promptIndex < values.length;
+    if (hasCharacter || hasPrompt) {
+      return normalizeSelectionIdentity(
+        hasCharacter ? values[characterIndex] : widgetValue(widgets.characterWidget, ""),
+        hasPrompt ? values[promptIndex] : widgetValue(widgets.promptWidget, ""),
+      );
+    }
+  }
+
+  return null;
+}
+
+function selectionIdentityForLibraryLoad(node, serializedNode = null) {
+  const configured = configuredSelectionIdentity(node, serializedNode);
+  if (configured) return configured;
+  const mirror = readSelectionMirror(node, serializedNode);
+  if (mirror) return mirror;
+  const widgets = getWidgets(node);
+  return normalizeSelectionIdentity(
+    widgetValue(widgets.characterWidget, ""),
+    widgetValue(widgets.promptWidget, ""),
+  );
 }
 
 function setWidgetValue(widget, value) {
@@ -1678,6 +1754,11 @@ function updateState(node, state, uiState, opts = {}) {
   setWidgetValue(widgets.uiStateWidget, serializeWorkflowUiState(nextUiState));
   setWidgetValue(widgets.characterWidget, materialized.characterId || character.id);
   setWidgetValue(widgets.promptWidget, materialized.promptId || prompt.id);
+  writeSelectionMirror(
+    node,
+    widgetValue(widgets.characterWidget, ""),
+    widgetValue(widgets.promptWidget, ""),
+  );
   node.properties = node.properties || {};
   delete node.properties.dora_state_manager;
   delete node.properties.dora_state_manager_backup_node_uid;
@@ -4662,7 +4743,8 @@ function initializeNode(node, widget) {
   node.setSize?.([Math.max(oldSize[0], MIN_NODE_WIDTH), Math.max(oldSize[1], MIN_NODE_HEIGHT)]);
 
   stateLibraryClient.nodes.add(node);
-  const load = async () => {
+  let initialLoadFrame = 0;
+  const load = async (serializedNode = null) => {
     const token = (node.__dsmLibraryLoadToken || 0) + 1;
     node.__dsmLibraryLoadToken = token;
     const currentWidgets = getWidgets(node);
@@ -4678,8 +4760,9 @@ function initializeNode(node, widget) {
     node.properties = node.properties || {};
     delete node.properties.dora_state_manager;
     delete node.properties.dora_state_manager_backup_node_uid;
-    const characterId = String(widgetValue(currentWidgets.characterWidget, "") || "");
-    const promptId = String(widgetValue(currentWidgets.promptWidget, "") || "");
+    const selection = selectionIdentityForLibraryLoad(node, serializedNode);
+    const characterId = selection.characterId;
+    const promptId = selection.promptId;
     try {
       const loaded = await initializeStateLibrary(node, legacy, characterId, promptId, token);
       if (loaded) {
@@ -4697,10 +4780,24 @@ function initializeNode(node, widget) {
       scheduleRender(node);
     }
   };
-  void load();
 
-  chainNodeCallback(node, "onConfigure", function () {
-    void Promise.resolve().then(load);
+  // The custom DOM widget can be constructed before ComfyUI has restored this
+  // node's serialized widget values. Starting the persistent-library request
+  // immediately from constructor defaults lets an async response overwrite the
+  // saved preset with default_character/default_prompt. Defer the first load
+  // until the next frame, and let onConfigure cancel/supersede it with the
+  // selection taken directly from the serialized workflow payload.
+  initialLoadFrame = requestAnimationFrame(() => {
+    initialLoadFrame = 0;
+    void load();
+  });
+
+  chainNodeCallback(node, "onConfigure", function (serializedNode) {
+    if (initialLoadFrame) {
+      cancelAnimationFrame(initialLoadFrame);
+      initialLoadFrame = 0;
+    }
+    void Promise.resolve().then(() => load(serializedNode));
   });
 
   chainNodeCallback(node, "onResize", function () {
@@ -4719,6 +4816,10 @@ function initializeNode(node, widget) {
     if (ctx.postLoadSyncFrame) {
       cancelAnimationFrame(ctx.postLoadSyncFrame);
       ctx.postLoadSyncFrame = 0;
+    }
+    if (initialLoadFrame) {
+      cancelAnimationFrame(initialLoadFrame);
+      initialLoadFrame = 0;
     }
   });
 
@@ -5535,8 +5636,16 @@ app.registerExtension({
           ? serializeState(this.__dsmPendingLegacyState)
           : binding;
         const workflowUiState = serializeWorkflowUiState(snapshot.uiState);
+        const selection = normalizeSelectionIdentity(
+          widgetValue(widgets.characterWidget, ""),
+          widgetValue(widgets.promptWidget, ""),
+        );
         setWidgetValue(widgets.stateWidget, binding);
+        writeSelectionMirror(this, selection.characterId, selection.promptId);
         o.properties = o.properties || {};
+        o.properties[SELECTION_MIRROR_PROPERTY] = structuredCloneCompat(
+          this.properties?.[SELECTION_MIRROR_PROPERTY],
+        );
         delete o.properties.dora_state_manager;
         delete o.properties.dora_state_manager_backup_node_uid;
         if (this.properties) {
@@ -5551,6 +5660,8 @@ app.registerExtension({
         for (const [widget, value] of [
           [widgets.stateWidget, serializedState],
           [widgets.uiStateWidget, workflowUiState],
+          [widgets.characterWidget, selection.characterId || "default_character"],
+          [widgets.promptWidget, selection.promptId || "default_prompt"],
         ]) {
           const index = (this.widgets || []).indexOf(widget);
           if (values && index >= 0) values[index] = value;
