@@ -595,11 +595,12 @@ def register_prompt_bridge(
     text_for_box: Callable[[Optional[Dict[str, Any]], Any, Any], Optional[str]],
     resolve_snapshot: Optional[Callable[[Any, Any, Any, Any], Dict[str, Any]]] = None,
 ) -> None:
+    global _PROMPT_BRIDGE_ORDERING_VERIFIED
+    _PROMPT_BRIDGE_ORDERING_VERIFIED = False
+
     server = getattr(PromptServer, "instance", None)
     if server is None or not hasattr(server, "add_on_prompt_handler"):
         raise RuntimeError("ComfyUI PromptServer does not expose add_on_prompt_handler")
-
-    global _PROMPT_BRIDGE_ORDERING_VERIFIED
 
     marker = "_dora_state_manager_backend_prompt_bridge_callback_v2"
     handlers = getattr(server, "on_prompt_handlers", None)
