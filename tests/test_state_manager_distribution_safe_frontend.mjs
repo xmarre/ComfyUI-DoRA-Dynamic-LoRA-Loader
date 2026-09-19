@@ -35,6 +35,11 @@ function makeNode(StateManagerNode, enabled) {
   const node = new StateManagerNode();
   node.properties = {
     dora_state_manager_distribution_safe_serialization: enabled,
+    dora_state_manager_selection_v1: {
+      version: 1,
+      character_id: "private-character-uuid",
+      prompt_id: "private-prompt-uuid",
+    },
   };
   node.widgets = [
     { name: "state_json", value: '{"version":1,"kind":"dora_state_manager_binding"}' },
@@ -80,6 +85,7 @@ test("distribution-safe mode scrubs only serialized selection bindings", async (
   assert.equal(output.widgets_values_named.selected_character_id, "default_character");
   assert.equal(output.widgets_values_named.selected_prompt_id, "default_prompt");
   assert.equal(output.properties.dora_state_manager_distribution_safe_serialization, true);
+  assert.equal(output.properties.dora_state_manager_selection_v1, undefined);
 
   // The live widgets remain on the real local selection, so queue/generation state is unchanged.
   const liveUiState = JSON.parse(node.widgets[1].value);
