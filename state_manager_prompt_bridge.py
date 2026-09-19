@@ -13,6 +13,7 @@ _PROMPT_BRIDGE_ORDERING_VERIFIED = False
 _MANAGER_CLASSES = {"State Manager", "DoRA State Manager", "StateManager"}
 _TEXT_BOX_CLASSES = {"State Manager Text Box", "StateManagerTextBox"}
 _IMPACT_CLASSES = {"ImpactWildcardProcessor", "ImpactWildcardEncode"}
+_IMPACT_PROCESSOR_CLASSES = {"ImpactWildcardProcessor"}
 _TIMELINE_HEADER = re.compile(r"(?m)^\s*\[[0-9]+(?:\.[0-9]+)?-[0-9]+(?:\.[0-9]+)?s\]\s*$")
 
 
@@ -550,7 +551,11 @@ def materialize_state_manager_impact_prompts(
                 impact_inputs[key] = effective_text
                 changed += 1
                 impact_changed = True
-        impact_sources[impact_id] = {**info, "text_id": source_id}
+        impact_sources[impact_id] = {
+            **info,
+            "text_id": source_id,
+            "impact_class": str(impact_node.get("class_type", "")),
+        }
 
         frontend_contract_version, frontend_contract_revision = _queued_frontend_contract(
             _inputs(_node(prompt, info["manager_id"])).get("ui_state_json", "")
@@ -611,6 +616,8 @@ def materialize_state_manager_impact_prompts(
             text_id = source_id
         elif source_id in impact_sources:
             info = impact_sources[source_id]
+            if str(info.get("impact_class", "")) not in _IMPACT_PROCESSOR_CLASSES:
+                continue
             impact_id = source_id
             # The Impact inputs were intentionally materialized above. Use the
             # source id captured before that replacement instead of attempting
