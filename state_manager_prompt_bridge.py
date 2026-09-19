@@ -472,7 +472,7 @@ def materialize_state_manager_impact_prompts(
                 impact_inputs[key] = effective_text
                 changed += 1
                 impact_changed = True
-        impact_sources[impact_id] = info
+        impact_sources[impact_id] = {**info, "text_id": source_id}
 
         frontend_contract_version, frontend_contract_revision = _queued_frontend_contract(
             _inputs(_node(prompt, info["manager_id"])).get("ui_state_json", "")
@@ -522,13 +522,11 @@ def materialize_state_manager_impact_prompts(
         elif source_id in impact_sources:
             info = impact_sources[source_id]
             impact_id = source_id
-            # Recover the exact managed Text Box feeding this known Impact node.
-            impact_inputs = _inputs(_node(prompt, source_id))
-            text_id, text_output = _link(impact_inputs.get("wildcard_text") if impact_inputs else None)
-            if text_id is None:
-                text_id = _workflow_input_source(json_data, source_id, "wildcard_text")
-                text_output = 0 if text_id is not None else None
-            if text_id not in managed or text_output not in (None, 0):
+            # The Impact inputs were intentionally materialized above. Use the
+            # source id captured before that replacement instead of attempting
+            # to rediscover a link that no longer exists in the prompt payload.
+            text_id = str(info.get("text_id", "") or "")
+            if text_id not in managed:
                 continue
         else:
             continue
