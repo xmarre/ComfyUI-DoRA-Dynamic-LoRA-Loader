@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import sys
 import types
+from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -45,7 +46,15 @@ def _load_continuum_contract(source_root: Path):
         sys.modules[full_name] = module
         spec.loader.exec_module(module)
         modules[short_name] = module
-    return modules["v2.prompts"], modules["v2.prompt_transport"]
+    physical_runtime = importlib.import_module(f"{package_name}.v2.physical_runtime")
+    masked_continuation = importlib.import_module(f"{package_name}.masked_continuation")
+    return (
+        modules["v2.prompts"],
+        modules["v2.prompt_transport"],
+        modules["v2.physical_prompts"],
+        physical_runtime,
+        masked_continuation,
+    )
 
 
 def _compile_reviewed_defs(path: Path, names: set[str], namespace: dict):
@@ -225,7 +234,9 @@ def reviewed_stack(dora_modules, tmp_path, monkeypatch):
     store_module.reset_state_manager_store_for_tests()
     monkeypatch.setattr(nodes.folder_paths, "get_user_directory", lambda: str(tmp_path))
 
-    prompts, transport = _load_continuum_contract(Path(CONTINUUM_SOURCE).resolve())
+    prompts, transport, physical_prompts, physical_runtime, masked_continuation = (
+        _load_continuum_contract(Path(CONTINUUM_SOURCE).resolve())
+    )
     wildcards, impact_handler, processor_cls, feedback = _load_real_impact(Path(IMPACT_SOURCE).resolve())
 
     class ContinuumConsumer:
@@ -253,12 +264,22 @@ def reviewed_stack(dora_modules, tmp_path, monkeypatch):
     wildcards.loaded_wildcards.clear()
     wildcards._on_demand_mode = False
 
-    yield nodes, bridge, prompts, impact_handler, processor_cls, feedback
+    yield (
+        nodes,
+        bridge,
+        prompts,
+        impact_handler,
+        processor_cls,
+        feedback,
+        physical_prompts,
+        physical_runtime,
+        masked_continuation,
+    )
     store_module.reset_state_manager_store_for_tests()
 
 
 def _bridge_and_expand(stack, character, descriptor, *, mode="populate"):
-    nodes, bridge, _prompts, impact_handler, processor_cls, _feedback = stack
+    nodes, bridge, _prompts, impact_handler, processor_cls, _feedback, *_continuum = stack
     raw = character["prompts"][0]["positive"]
     persisted = _install_document(nodes, character, raw, descriptor)
     payload = _queue(nodes, character, mode=mode)
@@ -282,7 +303,7 @@ def _bridge_and_expand(stack, character, descriptor, *, mode="populate"):
 
 
 def test_direct_state_manager_real_impact_to_continuum_sequence_contract(reviewed_stack):
-    _nodes, _bridge, prompts, _impact_handler, _processor, _feedback = reviewed_stack
+    _nodes, _bridge, prompts, _impact_handler, _processor, _feedback, *_continuum = reviewed_stack
     raw = (
         "__managed/shared__\n\n"
         "[0-5s]\n__managed/one__\n\n"
@@ -321,6 +342,60 @@ def test_direct_state_manager_real_impact_to_continuum_sequence_contract(reviewe
         "SHARED_ENV_SENTINEL\n\nTWO_GREEN_SPHERE_SENTINEL",
         "SHARED_ENV_SENTINEL\n\nTHREE_BLUE_PYRAMID_SENTINEL",
     ]
+
+    # Carry the exact plan produced by real Store -> queue bridge -> Impact
+    # through Continuum's real physical compiler to the Qwen/CLIP input boundary.
+    physical_prompts, physical_runtime, masked_continuation = reviewed_stack[6:]
+    descriptor = physical_prompts.make_physical_sample_descriptor(
+        group_id="managed-e2e-chunk-2",
+        logical_indices=(1,),
+        retained_before=120,
+        context_frames=24,
+        total_frames=144,
+        target_duration_frames=360,
+        continuation_method=masked_continuation.CONTINUATION_GUIDE,
+        initial_state_origin="sequence",
+        include_first=False,
+        include_last=False,
+        presentation_contract={"include_first": False, "include_last": False},
+        guided_overlap=True,
+    )
+    original_flag = physical_runtime.physical_prompt_compiler_enabled
+    physical_runtime.physical_prompt_compiler_enabled = lambda: True
+
+    class CaptureClip:
+        def __init__(self):
+            self.prompt = None
+
+        def tokenize(self, prompt, **_kwargs):
+            self.prompt = prompt
+            return prompt
+
+        def encode_from_tokens_scheduled(self, tokens):
+            return [["conditioning", {"captured": tokens}]]
+
+    clip = CaptureClip()
+    assets = SimpleNamespace(first_image=None, last_image=None)
+    try:
+        _conditioning, compiled, _metadata, _cache_key = (
+            physical_runtime.encode_physical_prompt_conditioning(
+                clip=clip,
+                plan=plan,
+                descriptor=descriptor,
+                legacy_text=plan["prompts"][1],
+                assets=assets,
+                include_first=False,
+                include_last=False,
+            )
+        )
+    finally:
+        physical_runtime.physical_prompt_compiler_enabled = original_flag
+
+    assert clip.prompt == compiled.text
+    assert "SHARED_ENV_SENTINEL" in clip.prompt
+    assert "TWO_GREEN_SPHERE_SENTINEL" in clip.prompt
+    assert "ONE_RED_CUBE_SENTINEL" not in clip.prompt
+    assert "THREE_BLUE_PYRAMID_SENTINEL" not in clip.prompt
 
 
 def test_real_impact_header_injection_cannot_become_verified_schedule(reviewed_stack):
