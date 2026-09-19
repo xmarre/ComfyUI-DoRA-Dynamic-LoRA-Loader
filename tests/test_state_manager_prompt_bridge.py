@@ -285,3 +285,263 @@ def test_prompt_bridge_registration_is_idempotent(bridge):
     )
 
     assert len(PromptServer.instance.handlers) == 1
+
+
+def _install_fake_continuum_provider(monkeypatch):
+    import sys
+    import types
+
+    provider = {
+        "provider_version": 1,
+        "managed_source_schema_versions": [1],
+        "prompt_document_schema_versions": [1],
+        "formats": ["inherit", "fixed", "list", "timeline"],
+        "timeline_routings": ["logical_chunks", "physical_timeline"],
+        "chunks": {"min": 1, "max": 16},
+        "chunk_seconds": {"min": 4.0, "max": 15.0},
+        "classify": lambda text: "timeline" if "[0-" in text else "fixed",
+        "inspect": lambda text: {"text": text},
+    }
+
+    class FakeContinuum:
+        H3_CONTINUUM_PROMPT_TRANSPORT_PROVIDER_V1 = provider
+
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {
+                "required": {"sequence_prompt": ("STRING",)},
+                "optional": {"managed_prompt_source_json": ("STRING", {"default": ""})},
+            }
+
+    fake_nodes = types.SimpleNamespace(
+        NODE_CLASS_MAPPINGS={"H3 Continuum Production": FakeContinuum}
+    )
+    monkeypatch.setitem(sys.modules, "nodes", fake_nodes)
+    return provider
+
+
+def _add_descriptor(nodes, character, text, descriptor):
+    first = nodes._get_state_manager_store().replace([character], 0)
+    result = nodes._get_state_manager_store().update_prompt_document(
+        character["id"],
+        character["prompts"][0]["id"],
+        "positive",
+        "default",
+        text,
+        descriptor,
+        first["revision"],
+        "Positive",
+    )
+    return result
+
+
+def test_queue_snapshot_and_direct_continuum_sidecar_share_one_revision(
+    configured_nodes, bridge, monkeypatch
+):
+    nodes = configured_nodes
+    _install_fake_continuum_provider(monkeypatch)
+    text = "Shared.\n\n[0-5s]\nONE\n\n[5-10s]\nTWO\n\n[10-15s]\nTHREE"
+    character = _persistent_character(text)
+    character["prompts"][0]["settings"] = {"seed": 77, "sampler": "keep"}
+    character["prompts"][0]["reference_image"] = {
+        "filename": "ref.png", "subfolder": "dora_state_manager", "type": "input"
+    }
+    descriptor = {
+        "schema_version": 1,
+        "format": "timeline",
+        "routing": "logical_chunks",
+        "geometry": {"chunks": 3, "chunk_seconds": "5"},
+    }
+    persisted = _add_descriptor(nodes, character, text, descriptor)
+
+    payload = _prompt(nodes, character)
+    payload["prompt"].pop("251")
+    payload["prompt"]["249"]["inputs"]["ui_state_json"] = json.dumps({
+        "__dsm_queue_snapshot_v1": {
+            "version": 1,
+            "library_revision": 9999,
+            "character_id": "client",
+            "prompt_id": "client",
+            "payload": {"private": "untrusted"},
+        }
+    })
+    payload["prompt"]["260"] = {
+        "class_type": "H3 Continuum Production",
+        "inputs": {
+            "sequence_prompt": ["250", 0],
+            "managed_prompt_source_json": "",
+        },
+    }
+
+    changed = bridge.materialize_state_manager_impact_prompts(
+        payload,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        resolve_snapshot=nodes._resolve_dora_state_payload_snapshot,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=nodes._state_payload_text_for_box,
+        ordering_verified=True,
+    )
+
+    assert changed >= 3
+    manager_ui = json.loads(payload["prompt"]["249"]["inputs"]["ui_state_json"])
+    frozen = manager_ui["__dsm_queue_snapshot_v1"]
+    assert frozen["library_revision"] == persisted["library_revision"]
+    assert frozen["character_id"] == character["id"]
+    assert frozen["prompt_id"] == character["prompts"][0]["id"]
+    assert frozen["payload"]["settings"]["seed"] == 77
+    assert frozen["payload"]["reference_image"]["filename"] == "ref.png"
+    assert "private" not in frozen["payload"]
+
+    sidecar = json.loads(payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"])
+    assert sidecar["magic"] == "DSM_H3_PROMPT_SOURCE"
+    assert sidecar["schema_version"] == 1
+    assert sidecar["text"] == text
+    assert sidecar["prompt_document"] == descriptor
+    assert sidecar["library_revision"] == persisted["library_revision"]
+    assert sidecar["binding"] == {
+        "manager_node": "249",
+        "text_node": "250",
+        "impact_node": None,
+        "role": "positive",
+        "slot": "default",
+    }
+    assert sidecar["queue_contract"] == "ordered-impact-v1"
+
+
+def test_impact_to_continuum_sidecar_proves_exact_output_zero_path(
+    configured_nodes, bridge, monkeypatch
+):
+    nodes = configured_nodes
+    _install_fake_continuum_provider(monkeypatch)
+    text = "Shared.\n\n[0-5s]\nONE\n\n[5-10s]\nTWO\n\n[10-15s]\nTHREE"
+    character = _persistent_character(text)
+    descriptor = {
+        "schema_version": 1,
+        "format": "timeline",
+        "routing": "logical_chunks",
+        "geometry": {"chunks": 3, "chunk_seconds": "5"},
+    }
+    persisted = _add_descriptor(nodes, character, text, descriptor)
+    payload = _prompt(nodes, character, mode="populate")
+    payload["prompt"]["260"] = {
+        "class_type": "H3 Continuum Production",
+        "inputs": {
+            "sequence_prompt": ["251", 0],
+            "managed_prompt_source_json": "",
+        },
+    }
+
+    bridge.materialize_state_manager_impact_prompts(
+        payload,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        resolve_snapshot=nodes._resolve_dora_state_payload_snapshot,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=nodes._state_payload_text_for_box,
+        ordering_verified=True,
+    )
+
+    assert payload["prompt"]["251"]["inputs"]["wildcard_text"] == text
+    assert payload["prompt"]["251"]["inputs"]["populated_text"] == text
+    assert payload["prompt"]["251"]["inputs"]["mode"] == "populate"
+    assert payload["prompt"]["251"]["inputs"]["seed"] == 123
+    sidecar = json.loads(payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"])
+    assert sidecar["binding"]["impact_node"] == "251"
+    assert sidecar["library_revision"] == persisted["library_revision"]
+
+
+def test_unknown_transform_never_receives_or_forwards_managed_provenance(
+    configured_nodes, bridge, monkeypatch
+):
+    nodes = configured_nodes
+    _install_fake_continuum_provider(monkeypatch)
+    text = "[0-5s]\nONE"
+    character = _persistent_character(text)
+    _add_descriptor(
+        nodes,
+        character,
+        text,
+        {
+            "schema_version": 1,
+            "format": "timeline",
+            "routing": "logical_chunks",
+            "geometry": {"chunks": 1, "chunk_seconds": "5"},
+        },
+    )
+    payload = _prompt(nodes, character)
+    payload["prompt"].pop("251")
+    payload["prompt"]["255"] = {
+        "class_type": "Unknown String Transform",
+        "inputs": {"text": ["250", 0]},
+    }
+    payload["prompt"]["260"] = {
+        "class_type": "H3 Continuum Production",
+        "inputs": {
+            "sequence_prompt": ["255", 0],
+            "managed_prompt_source_json": "",
+        },
+    }
+
+    bridge.materialize_state_manager_impact_prompts(
+        payload,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        resolve_snapshot=nodes._resolve_dora_state_payload_snapshot,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=nodes._state_payload_text_for_box,
+        ordering_verified=True,
+    )
+    assert payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"] == ""
+
+
+def test_handler_registration_prepends_without_reordering_other_handlers(bridge):
+    calls = []
+
+    def impact_handler(value):
+        calls.append("impact")
+        return value
+
+    def other_handler(value):
+        calls.append("other")
+        return value
+
+    class Server:
+        def __init__(self):
+            self.on_prompt_handlers = [impact_handler, other_handler]
+
+        def add_on_prompt_handler(self, handler):
+            self.on_prompt_handlers.append(handler)
+
+    class PromptServer:
+        instance = Server()
+
+    bridge.register_prompt_bridge(
+        PromptServer,
+        resolve_payload=lambda *_args: {},
+        resolve_snapshot=lambda *_args: {
+            "version": 1,
+            "library_revision": 0,
+            "character_id": "",
+            "prompt_id": "",
+            "payload": {},
+        },
+        library_user_from_ui_state=lambda _value: "default",
+        text_for_box=lambda *_args: None,
+    )
+    first_owned = PromptServer.instance.on_prompt_handlers[0]
+    assert PromptServer.instance.on_prompt_handlers[1:] == [impact_handler, other_handler]
+
+    bridge.register_prompt_bridge(
+        PromptServer,
+        resolve_payload=lambda *_args: {},
+        resolve_snapshot=lambda *_args: {
+            "version": 1,
+            "library_revision": 0,
+            "character_id": "",
+            "prompt_id": "",
+            "payload": {},
+        },
+        library_user_from_ui_state=lambda _value: "default",
+        text_for_box=lambda *_args: None,
+    )
+    assert len(PromptServer.instance.on_prompt_handlers) == 3
+    assert PromptServer.instance.on_prompt_handlers[0] is not first_owned
+    assert PromptServer.instance.on_prompt_handlers[1:] == [impact_handler, other_handler]
