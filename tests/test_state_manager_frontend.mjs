@@ -1086,14 +1086,53 @@ test("legacy embedded state remains detectable for controlled migration", async 
 });
 
 
-test("browser persistence code cannot resurrect a private library", async () => {
+test("browser persistence is selection-only and cannot resurrect a private library", async () => {
+  const helpers = await loadStateManagerHelpers();
   const source = await readFile(new URL("../web/dora_state_manager.js", import.meta.url), "utf8");
-  assert.equal(source.includes("localStorage"), false);
   assert.equal(source.includes("tryRestoreStateBackup"), false);
   assert.equal(source.includes("writeStateBackup"), false);
   assert.equal(source.includes("dora_state_manager_backup_workflow_id"), true, "legacy metadata should only appear in the serialization scrubber");
   assert.match(source, /delete app\.graph\.extra\.dora_state_manager_backup_workflow_id/);
   assert.equal(source.includes("setWidgetValue(widgets.uiStateWidget, serializeUiState"), false);
+
+  const previousStorage = globalThis.localStorage;
+  const storage = new Map();
+  globalThis.localStorage = {
+    getItem(key) { return storage.has(key) ? storage.get(key) : null; },
+    setItem(key, value) { storage.set(key, String(value)); },
+    removeItem(key) { storage.delete(key); },
+  };
+  const node = {
+    id: 42,
+    properties: {
+      dora_state_manager_distribution_safe_serialization: true,
+      dora_state_manager_local_selection_binding_v1: "opaque-binding",
+    },
+  };
+  try {
+    assert.equal(helpers.writeLocalSelection(node, "character-a", "prompt-a"), true);
+    assert.equal(storage.size, 1);
+    const [key, raw] = [...storage.entries()][0];
+    assert.match(key, /^dora_state_manager_local_selection_v1:opaque-binding:42$/);
+    assert.deepEqual(Object.keys(JSON.parse(raw)).sort(), [
+      "character_id",
+      "prompt_id",
+      "version",
+    ]);
+    assert.deepEqual(JSON.parse(raw), {
+      version: 1,
+      character_id: "character-a",
+      prompt_id: "prompt-a",
+    });
+    assert.equal(raw.includes("characters"), false);
+    assert.equal(raw.includes("text_boxes"), false);
+    assert.equal(raw.includes("settings"), false);
+    assert.equal(raw.includes("loras"), false);
+  } finally {
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+  }
+
   const stashIndex = source.indexOf("node.__dsmPendingLegacyState = structuredCloneCompat(embeddedLegacy)");
   const scrubIndex = source.indexOf("setWidgetValue(currentWidgets.stateWidget, serializeBinding())");
   const successIndex = source.indexOf("delete node.__dsmPendingLegacyState;");
