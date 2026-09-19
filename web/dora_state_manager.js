@@ -278,6 +278,151 @@ function promptDocumentProviderLimits() {
 }
 
 
+function promptDocumentEditor(node, box) {
+  const panel = document.createElement("div");
+  panel.className = "dsm-stack-box";
+
+  let current = null;
+  let futureSchema = false;
+  if (Object.prototype.hasOwnProperty.call(box, "prompt_document")) {
+    try {
+      current = normalizePromptDocument(box.prompt_document, { preserveFuture: true });
+      futureSchema = Number(current?.schema_version) !== PROMPT_DOCUMENT_SCHEMA_VERSION;
+    } catch {
+      current = structuredCloneCompat(box.prompt_document);
+      futureSchema = true;
+    }
+  }
+  const status = document.createElement("div");
+  status.className = "dsm-muted";
+
+  if (futureSchema) {
+    status.textContent =
+      `Prompt interpretation metadata uses unsupported schema ${String(current?.schema_version ?? "unknown")}; it is preserved unchanged.`;
+    panel.append(
+      status,
+      makeButton("Replace metadata with Inherit", async () => {
+        try {
+          await updateManagedPromptDocument(node, null, {
+            text: box.text,
+            prompt_document: inheritedPromptDocument(),
+            role: box.role,
+            slot: box.slot,
+            label: box.label,
+          });
+        } catch (err) {
+          setStatus(node, `Prompt interpretation update failed: ${err?.message || err}`);
+        }
+      }),
+    );
+    return panel;
+  }
+
+  const descriptor = current || inheritedPromptDocument();
+  status.textContent = current
+    ? "Saved prompt interpretation metadata."
+    : "No prompt interpretation metadata is saved; runtime behavior inherits the consumer's existing parsing.";
+
+  const format = makeSelect(
+    [
+      { value: "inherit", label: "Inherit" },
+      { value: "fixed", label: "Fixed" },
+      { value: "list", label: "List" },
+      { value: "timeline", label: "Timeline" },
+    ],
+    descriptor.format,
+    () => {},
+  );
+  const routing = makeSelect(
+    [
+      { value: "", label: "Choose routing…" },
+      { value: "logical_chunks", label: "Logical chunks" },
+      { value: "physical_timeline", label: "Physical timeline" },
+    ],
+    descriptor.routing || "",
+    () => {},
+  );
+  const chunks = makeInput(
+    descriptor.geometry?.chunks ?? "",
+    () => {},
+    { type: "number", step: "1", min: "1", max: "16" },
+  );
+  const seconds = makeInput(
+    descriptor.geometry?.chunk_seconds ?? "",
+    () => {},
+    { type: "text", inputMode: "decimal", placeholder: "e.g. 7" },
+  );
+
+  const provider = promptTransportProviderClient.provider;
+  const limits = promptDocumentProviderLimits();
+  const providerNote = document.createElement("div");
+  providerNote.className = "dsm-muted";
+  providerNote.textContent = provider
+    ? `Detected Continuum provider v${provider.provider_version}; logical chunks ${limits.chunkMin ?? "?"}–${limits.chunkMax ?? "?"}, chunk duration ${limits.secondsMin ?? "?"}–${limits.secondsMax ?? "?"}s.`
+    : "No compatible Continuum prompt-transport provider is currently advertised; metadata can be saved, but managed sequence verification remains unavailable until a compatible consumer is installed.";
+
+  const save = makeButton("Save interpretation", async () => {
+    try {
+      let next;
+      if (format.value !== "timeline") {
+        next = normalizePromptDocument({
+          schema_version: PROMPT_DOCUMENT_SCHEMA_VERSION,
+          format: format.value,
+        }, { preserveFuture: false });
+      } else {
+        if (!routing.value) throw new Error("Choose Timeline routing before saving.");
+        const raw = {
+          schema_version: PROMPT_DOCUMENT_SCHEMA_VERSION,
+          format: "timeline",
+          routing: routing.value,
+        };
+        if (routing.value === "logical_chunks") {
+          raw.geometry = {
+            chunks: Number(chunks.value),
+            chunk_seconds: String(seconds.value || "").trim(),
+          };
+        }
+        next = normalizePromptDocument(raw, { preserveFuture: false });
+        if (routing.value === "logical_chunks" && provider) {
+          const chunkValue = Number(next.geometry.chunks);
+          const secondsValue = Number(next.geometry.chunk_seconds);
+          if (
+            (limits.chunkMin != null && chunkValue < limits.chunkMin)
+            || (limits.chunkMax != null && chunkValue > limits.chunkMax)
+            || (limits.secondsMin != null && secondsValue < limits.secondsMin)
+            || (limits.secondsMax != null && secondsValue > limits.secondsMax)
+          ) {
+            throw new Error(
+              `Logical Timeline geometry is outside the installed consumer limits (${limits.chunkMin}–${limits.chunkMax} chunks, ${limits.secondsMin}–${limits.secondsMax}s).`,
+            );
+          }
+        }
+      }
+      await updateManagedPromptDocument(node, null, {
+        text: box.text,
+        prompt_document: next,
+        role: box.role,
+        slot: box.slot,
+        label: box.label,
+      });
+    } catch (err) {
+      setStatus(node, `Prompt interpretation update failed: ${err?.message || err}`);
+    }
+  });
+
+  panel.append(
+    status,
+    labelledControl("Interpretation", format),
+    labelledControl("Timeline routing", routing),
+    labelledControl("Logical chunks", chunks),
+    labelledControl("Chunk seconds", seconds),
+    providerNote,
+    save,
+  );
+  return panel;
+}
+
+
 function defaultTextBox(role = "positive", slot = "default", text = "") {
   const normalizedRole = normalizeTextRole(role, "generic");
   const normalizedSlot = normalizeTextSlot(slot, "default");
@@ -3766,7 +3911,8 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
         syncPromptTextMirror(prompt);
         updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Deleted text box ${box.role}/${box.slot}.` });
       }),
-      labelledControl("Text", text)
+      labelledControl("Text", text),
+      promptDocumentEditor(node, box)
     );
     savedTextBoxes.appendChild(row);
   }
