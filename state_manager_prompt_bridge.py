@@ -325,8 +325,7 @@ def prompt_transport_ordering_contract() -> Optional[str]:
     return "ordered-impact-v1" if _prompt_bridge_ordering_is_verified() else None
 
 
-def prompt_transport_provider_capabilities() -> Optional[Dict[str, Any]]:
-    """Return JSON-safe public capability data for the State Manager editor."""
+def _first_registered_continuum_provider() -> Optional[Dict[str, Any]]:
     try:
         import nodes as comfy_nodes
 
@@ -336,14 +335,76 @@ def prompt_transport_provider_capabilities() -> Optional[Dict[str, Any]]:
                 continue
             if not callable(provider.get("classify")) or not callable(provider.get("inspect")):
                 continue
-            return {
-                key: value
-                for key, value in provider.items()
-                if key not in {"classify", "inspect"} and isinstance(value, (str, int, float, bool, list, dict, type(None)))
-            }
+            return provider
     except Exception:
         return None
     return None
+
+
+def _bounded_provider_error(exc: BaseException, *, limit: int = 240) -> str:
+    first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+    return first_line[: max(1, int(limit))]
+
+
+def prompt_transport_provider_preview(text: Any) -> Dict[str, Any]:
+    """Delegate text classification/structure inspection to Continuum provider v1."""
+    provider = _first_registered_continuum_provider()
+    if provider is None:
+        return {"available": False, "valid": False}
+    try:
+        classification = provider["classify"](str(text))
+        structure = provider["inspect"](str(text))
+        json_safe_structure = json.loads(
+            json.dumps(structure, ensure_ascii=False, separators=(",", ":"))
+        )
+        return {
+            "available": True,
+            "valid": True,
+            "classification": str(classification),
+            "structure": json_safe_structure,
+        }
+    except Exception as exc:
+        return {
+            "available": True,
+            "valid": False,
+            "error": _bounded_provider_error(exc),
+        }
+
+
+def prompt_transport_logical_skeleton(chunks: Any, chunk_seconds: Any) -> Dict[str, Any]:
+    """Delegate canonical logical Timeline skeleton rendering to Continuum."""
+    provider = _first_registered_continuum_provider()
+    if provider is None:
+        return {"available": False}
+    renderer = provider.get("logical_skeleton")
+    if not callable(renderer):
+        return {"available": True, "supported": False}
+    try:
+        text = renderer(chunks=chunks, chunk_seconds=chunk_seconds)
+        return {
+            "available": True,
+            "supported": True,
+            "text": str(text),
+        }
+    except Exception as exc:
+        return {
+            "available": True,
+            "supported": True,
+            "error": _bounded_provider_error(exc),
+        }
+
+
+def prompt_transport_provider_capabilities() -> Optional[Dict[str, Any]]:
+    """Return JSON-safe public capability data for the State Manager editor."""
+    provider = _first_registered_continuum_provider()
+    if provider is None:
+        return None
+    return {
+        key: value
+        for key, value in provider.items()
+        if not callable(value)
+        and isinstance(value, (str, int, float, bool, list, dict, type(None)))
+    }
 
 
 def _document_supported_by_provider(document: Any, provider: Dict[str, Any]) -> bool:
