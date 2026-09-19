@@ -182,8 +182,8 @@ function normalizePromptDocument(raw, { preserveFuture = true } = {}) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("prompt_document must be an object");
   }
-  const schemaVersion = Number(raw.schema_version);
-  if (!Number.isInteger(schemaVersion) || schemaVersion < 1) {
+  const schemaVersion = raw.schema_version;
+  if (typeof schemaVersion !== "number" || !Number.isInteger(schemaVersion) || schemaVersion < 1) {
     throw new Error("prompt_document schema_version is invalid");
   }
   if (schemaVersion !== PROMPT_DOCUMENT_SCHEMA_VERSION) {
@@ -219,11 +219,14 @@ function normalizePromptDocument(raw, { preserveFuture = true } = {}) {
   if (!geometry || typeof geometry !== "object" || Array.isArray(geometry)) {
     throw new Error("Logical Timeline prompt documents require geometry.");
   }
-  const chunks = Number(geometry.chunks);
-  if (!Number.isInteger(chunks) || chunks < 1 || chunks > 16) {
+  const chunks = geometry.chunks;
+  if (typeof chunks !== "number" || !Number.isInteger(chunks) || chunks < 1 || chunks > 16) {
     throw new Error("Logical Timeline chunks must be in 1..16.");
   }
-  const secondsText = String(geometry.chunk_seconds ?? "").trim();
+  if (typeof geometry.chunk_seconds !== "string") {
+    throw new Error("chunk_seconds must be an unsigned decimal string.");
+  }
+  const secondsText = geometry.chunk_seconds.trim();
   if (!/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(secondsText)) {
     throw new Error("chunk_seconds must be an unsigned decimal string.");
   }
