@@ -108,6 +108,49 @@ def test_backend_bridge_materializes_authoritative_timeline_for_impact_modes(
     assert payload["prompt"]["251"]["inputs"]["seed"] == 123
 
 
+def test_state_manager_text_ownership_requires_exact_state_control_output(
+    configured_nodes, bridge, monkeypatch
+):
+    nodes = configured_nodes
+    _install_fake_continuum_provider(monkeypatch)
+    text = "[0-5s]\nManaged."
+    character = _persistent_character(text)
+    _add_descriptor(
+        nodes,
+        character,
+        text,
+        {
+            "schema_version": 1,
+            "format": "timeline",
+            "routing": "logical_chunks",
+            "geometry": {"chunks": 1, "chunk_seconds": "5"},
+        },
+    )
+    payload = _prompt(nodes, character)
+    payload["prompt"]["250"]["inputs"]["state_control"] = ["249", 6]
+    payload["prompt"]["260"] = {
+        "class_type": "H3 Continuum Production",
+        "inputs": {
+            "sequence_prompt": ["251", 0],
+            "managed_prompt_source_json": "",
+        },
+    }
+
+    bridge.materialize_state_manager_impact_prompts(
+        payload,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        resolve_snapshot=nodes._resolve_dora_state_payload_snapshot,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=nodes._state_payload_text_for_box,
+        ordering_verified=True,
+    )
+
+    assert payload["prompt"]["250"]["inputs"]["text"] == "stale text"
+    assert payload["prompt"]["251"]["inputs"]["wildcard_text"] == ["250", 0]
+    assert payload["prompt"]["251"]["inputs"]["populated_text"] == "stale populated"
+    assert payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"] == ""
+
+
 def test_backend_bridge_recovers_source_after_frontend_literalized_impact_input(configured_nodes, bridge):
     nodes = configured_nodes
     timeline = "[0-7s]\nRecovered from persistent State Manager text."
