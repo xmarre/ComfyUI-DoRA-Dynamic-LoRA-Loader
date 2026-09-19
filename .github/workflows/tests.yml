@@ -80,10 +80,18 @@ jobs:
       - name: Install focused contract dependencies
         run: python -m pip install pytest numpy pyyaml
 
+      - name: Stage reviewed Impact contract test outside package tree
+        shell: bash
+        run: |
+          rm -rf /tmp/dora-impact-contract
+          mkdir -p /tmp/dora-impact-contract
+          cp tests/test_impact_wildcard_contract.py /tmp/dora-impact-contract/
+
       - name: Execute reviewed Impact handler and Processor semantics
+        working-directory: /tmp/dora-impact-contract
         env:
           IMPACT_PACK_SOURCE: ${{ github.workspace }}/.impact-pack-source
-        run: python -m pytest -q tests/test_impact_wildcard_contract.py
+        run: python -m pytest -q test_impact_wildcard_contract.py
 
   compatibility-and-runtime-bypass:
     name: ComfyUI ${{ matrix.comfy_version }} compatibility/runtime tests
