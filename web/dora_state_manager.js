@@ -269,6 +269,26 @@ async function loadPromptTransportProvider() {
   return promptTransportProviderClient.loading;
 }
 
+async function previewPromptTransportText(text) {
+  return stateLibraryRequest("/prompt-document-provider/inspect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: String(text ?? "") }),
+  });
+}
+
+async function requestLogicalTimelineSkeleton(chunks, chunkSeconds) {
+  return stateLibraryRequest("/prompt-document-provider/logical-skeleton", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chunks,
+      chunk_seconds: chunkSeconds,
+    }),
+  });
+}
+
+
 function promptDocumentProviderLimits() {
   const provider = promptTransportProviderClient.provider;
   const chunks = provider?.chunks;
@@ -361,6 +381,8 @@ function promptDocumentEditor(node, box) {
   const limits = promptDocumentProviderLimits();
   const providerNote = document.createElement("div");
   providerNote.className = "dsm-muted";
+  const previewNote = document.createElement("div");
+  previewNote.className = "dsm-muted";
   const orderingVerified = promptTransportProviderClient.orderingContract === "ordered-impact-v1";
   providerNote.textContent = provider
     ? (
@@ -369,6 +391,74 @@ function promptDocumentEditor(node, box) {
           : `Detected Continuum provider v${provider.provider_version}, but ordered Impact transport is not verified in this runtime. Interpretation metadata can be saved; managed sequence verification will remain disabled.`
       )
     : "No compatible Continuum prompt-transport provider is currently advertised; metadata can be saved, but managed sequence verification remains unavailable until a compatible consumer is installed.";
+
+  const preview = makeButton("Preview parsing", async () => {
+    try {
+      const result = await previewPromptTransportText(box.text);
+      if (!result?.available) {
+        previewNote.textContent = "No compatible Continuum prompt parser is currently available.";
+      } else if (format.value === "timeline") {
+        if (result.valid) {
+          const count = Array.isArray(result.structure?.sections)
+            ? result.structure.sections.length
+            : 0;
+          previewNote.textContent =
+            `Continuum parser: valid ${result.classification || "timeline"} structure with ${count} outer section${count === 1 ? "" : "s"}.`;
+        } else {
+          previewNote.textContent =
+            `Continuum parser: Timeline structure is not valid (${result.error || "unrecognized structure"}). Saving the text remains allowed; runtime will use the existing diagnostic fallback policy.`;
+        }
+      } else {
+        previewNote.textContent =
+          `Continuum parser classifies the current text as ${result.classification || "unknown"}; saved ${format.value} intent remains authoritative.`;
+      }
+    } catch (err) {
+      previewNote.textContent = `Prompt preview failed: ${err?.message || err}`;
+    }
+  });
+
+  const insertSkeleton = makeButton("Insert empty Timeline skeleton", async () => {
+    try {
+      if (format.value !== "timeline" || routing.value !== "logical_chunks") {
+        throw new Error("Choose Timeline with Logical chunks before inserting a skeleton.");
+      }
+      if (String(box.text ?? "").trim()) {
+        throw new Error("Skeleton insertion requires an empty text box and will not overwrite existing prompt text.");
+      }
+      const next = normalizePromptDocument({
+        schema_version: PROMPT_DOCUMENT_SCHEMA_VERSION,
+        format: "timeline",
+        routing: "logical_chunks",
+        geometry: {
+          chunks: Number(chunks.value),
+          chunk_seconds: String(seconds.value || "").trim(),
+        },
+      }, { preserveFuture: false });
+      const result = await requestLogicalTimelineSkeleton(
+        next.geometry.chunks,
+        next.geometry.chunk_seconds,
+      );
+      if (!result?.available) {
+        throw new Error("No compatible Continuum prompt provider is currently available.");
+      }
+      if (result.supported !== true) {
+        throw new Error("The installed Continuum provider does not expose logical Timeline skeleton rendering.");
+      }
+      if (result.error) throw new Error(result.error);
+      if (typeof result.text !== "string" || !result.text) {
+        throw new Error("Continuum returned an invalid logical Timeline skeleton.");
+      }
+      await updateManagedPromptDocument(node, null, {
+        text: result.text,
+        prompt_document: next,
+        role: box.role,
+        slot: box.slot,
+        label: box.label,
+      });
+    } catch (err) {
+      setStatus(node, `Timeline skeleton insertion failed: ${err?.message || err}`);
+    }
+  });
 
   const save = makeButton("Save interpretation", async () => {
     try {
@@ -426,6 +516,9 @@ function promptDocumentEditor(node, box) {
     labelledControl("Logical chunks", chunks),
     labelledControl("Chunk seconds", seconds),
     providerNote,
+    previewNote,
+    preview,
+    insertSkeleton,
     save,
   );
   return panel;
