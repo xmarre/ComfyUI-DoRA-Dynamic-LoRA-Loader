@@ -144,6 +144,31 @@ class StateLibraryStore:
             return []
         if any(not isinstance(character, dict) for character in characters):
             raise InvalidStateLibrary("One or more State Manager characters are malformed.")
+        # Validate descriptor-bearing boxes before the UI/runtime normalizer runs.
+        # Known malformed descriptors must not be silently stripped; unknown
+        # future schemas remain opaque and losslessly preserved.
+        for character in characters:
+            prompts = character.get("prompts")
+            if not isinstance(prompts, list):
+                continue
+            for prompt in prompts:
+                if not isinstance(prompt, dict):
+                    continue
+                boxes = prompt.get("text_boxes")
+                if not isinstance(boxes, list):
+                    continue
+                for box in boxes:
+                    if not isinstance(box, dict) or "prompt_document" not in box:
+                        continue
+                    if box.get("prompt_document") is None:
+                        raise InvalidStateLibrary("prompt_document must be an object when present.")
+                    try:
+                        normalize_prompt_document(
+                            box.get("prompt_document"),
+                            preserve_future=True,
+                        )
+                    except ValueError as exc:
+                        raise InvalidStateLibrary(f"Invalid prompt_document: {exc}") from exc
         normalized = self._normalize_state({"version": 3, "characters": characters})
         result = normalized.get("characters") if isinstance(normalized, dict) else None
         if not isinstance(result, list):
@@ -613,6 +638,8 @@ class StateLibraryStore:
         value = str(text or "")
         label = str(label or "").strip()
         descriptor = normalize_prompt_document(prompt_document, preserve_future=False)
+        if descriptor is None:
+            raise InvalidStateLibrary("prompt_document is required for an explicit descriptor write.")
 
         with self._lock:
             document = self._load_unlocked()
