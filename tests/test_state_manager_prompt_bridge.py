@@ -202,6 +202,57 @@ def test_backend_bridge_recovers_source_after_frontend_literalized_impact_input(
     assert payload["prompt"]["251"]["inputs"]["populated_text"] == timeline
 
 
+def test_workflow_link_recovery_preserves_exact_output_slot(
+    configured_nodes, bridge
+):
+    nodes = configured_nodes
+    timeline = "[0-7s]\nManaged."
+    character = _persistent_character(timeline)
+    nodes._get_state_manager_store().replace([character], 0)
+    payload = _prompt(nodes, character)
+
+    payload["prompt"]["251"]["inputs"]["wildcard_text"] = "stale frontend literal"
+    payload["prompt"]["251"]["inputs"]["populated_text"] = "stale frontend literal"
+    payload["extra_data"] = {
+        "extra_pnginfo": {
+            "workflow": {
+                "nodes": [
+                    {
+                        "id": 250,
+                        "type": "State Manager Text Box",
+                        "inputs": [
+                            {"name": "state_control", "type": "STATE_MANAGER_CONTROL", "link": 12},
+                        ],
+                    },
+                    {
+                        "id": 251,
+                        "type": "ImpactWildcardProcessor",
+                        "inputs": [
+                            {"name": "wildcard_text", "type": "STRING", "link": 13},
+                        ],
+                    },
+                ],
+                "links": [
+                    [12, 249, 7, 250, 0, "STATE_MANAGER_CONTROL"],
+                    # Invalid provenance: the managed Text Box only owns output 0.
+                    [13, 250, 1, 251, 0, "STRING"],
+                ],
+            }
+        }
+    }
+
+    bridge.materialize_state_manager_impact_prompts(
+        payload,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=nodes._state_payload_text_for_box,
+    )
+
+    assert payload["prompt"]["250"]["inputs"]["text"] == timeline
+    assert payload["prompt"]["251"]["inputs"]["wildcard_text"] == "stale frontend literal"
+    assert payload["prompt"]["251"]["inputs"]["populated_text"] == "stale frontend literal"
+
+
 def test_backend_bridge_uses_queued_library_user(configured_nodes, bridge):
     nodes = configured_nodes
     first = _persistent_character("wrong")
