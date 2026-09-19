@@ -19,8 +19,10 @@ import torch
 
 try:
     from .state_manager_store import InvalidStateLibrary, StatePresetNotFound, get_state_manager_store, state_manager_library_path
+    from .state_manager_prompt_document import normalize_prompt_document
 except ImportError:  # pragma: no cover - direct module loading outside the package
     from state_manager_store import InvalidStateLibrary, StatePresetNotFound, get_state_manager_store, state_manager_library_path
+    from state_manager_prompt_document import normalize_prompt_document
 
 _LOG = logging.getLogger(__name__)
 
@@ -687,12 +689,23 @@ def _normalize_manager_text_box(raw: Any, index: int = 0) -> Optional[Dict[str, 
     src = raw if isinstance(raw, dict) else {"text": raw}
     role = _normalize_manager_text_role(src.get("role", src.get("kind", src.get("type", "generic"))))
     slot = _clean_text_slot(src.get("slot", src.get("id", src.get("name", ""))), f"text_{index + 1}" if role == "generic" else "default")
-    return {
+    result = {
         "role": role,
         "slot": slot,
         "label": str(src.get("label", src.get("name", f"{role} {slot}")) or f"{role} {slot}").strip() or f"{role} {slot}",
         "text": str(src.get("text", src.get("value", src.get("prompt", ""))) or ""),
     }
+    if "prompt_document" in src:
+        try:
+            result["prompt_document"] = normalize_prompt_document(
+                src.get("prompt_document"),
+                preserve_future=True,
+            )
+        except ValueError:
+            # Malformed descriptors are not allowed to poison runtime state, but
+            # future-version objects are preserved losslessly by the helper.
+            pass
+    return result
 
 
 def _normalize_manager_text_boxes(prompt: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1167,12 +1180,12 @@ def _state_manager_is_default_legacy_state(state: Dict[str, Any]) -> bool:
     return _normalize_state_manager_state(state) == _normalize_state_manager_state(_state_manager_default_state())
 
 
-def _resolve_state_manager_selection(
+def _resolve_state_manager_selection_with_revision(
     state_json: Any,
     selected_character_id: Any,
     selected_prompt_id: Any,
     library_user_id: Any = "default",
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
     character_id = str(selected_character_id or "").strip()
     prompt_id = str(selected_prompt_id or "").strip()
     legacy = _state_manager_legacy_state(state_json)
@@ -1190,7 +1203,45 @@ def _resolve_state_manager_selection(
     elif legacy is not None:
         character_id = character_id or "default_character"
         prompt_id = prompt_id or "default_prompt"
-    return store.resolve(character_id, prompt_id)
+    return store.resolve_with_revision(character_id, prompt_id)
+
+
+def _resolve_state_manager_selection(
+    state_json: Any,
+    selected_character_id: Any,
+    selected_prompt_id: Any,
+    library_user_id: Any = "default",
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    character, prompt, _revision = _resolve_state_manager_selection_with_revision(
+        state_json,
+        selected_character_id,
+        selected_prompt_id,
+        library_user_id,
+    )
+    return character, prompt
+
+
+def _resolve_dora_state_payload_snapshot(
+    state_json: Any,
+    selected_character_id: Any,
+    selected_prompt_id: Any,
+    library_user_id: Any = "default",
+) -> Dict[str, Any]:
+    character, prompt, revision = _resolve_state_manager_selection_with_revision(
+        state_json,
+        selected_character_id,
+        selected_prompt_id,
+        library_user_id,
+    )
+    state = {"version": _DORA_STATE_MANAGER_SCHEMA_VERSION, "characters": [character]}
+    payload = _resolve_dora_state_payload_from_state(state, character.get("id"), prompt.get("id"))
+    return {
+        "version": 1,
+        "library_revision": int(revision),
+        "character_id": str(character.get("id", "")),
+        "prompt_id": str(prompt.get("id", "")),
+        "payload": payload,
+    }
 
 
 def _resolve_dora_state_payload(
@@ -1199,14 +1250,12 @@ def _resolve_dora_state_payload(
     selected_prompt_id: Any,
     library_user_id: Any = "default",
 ) -> Dict[str, Any]:
-    character, prompt = _resolve_state_manager_selection(
+    return _resolve_dora_state_payload_snapshot(
         state_json,
         selected_character_id,
         selected_prompt_id,
         library_user_id,
-    )
-    state = {"version": _DORA_STATE_MANAGER_SCHEMA_VERSION, "characters": [character]}
-    return _resolve_dora_state_payload_from_state(state, character.get("id"), prompt.get("id"))
+    )["payload"]
 
 
 def _build_state_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1219,6 +1268,33 @@ def _build_state_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "prompt": payload.get("prompt") if isinstance(payload.get("prompt"), dict) else {},
         "settings": settings,
         "seed": seed,
+    }
+
+
+_QUEUE_SNAPSHOT_KEY = "__dsm_queue_snapshot_v1"
+
+
+def _queued_state_manager_snapshot(ui_state_json: Any) -> Optional[Dict[str, Any]]:
+    parsed = _safe_json_load(ui_state_json, {})
+    if not isinstance(parsed, dict):
+        return None
+    snapshot = parsed.get(_QUEUE_SNAPSHOT_KEY)
+    if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
+        return None
+    if not isinstance(snapshot.get("payload"), dict):
+        return None
+    try:
+        revision = int(snapshot.get("library_revision"))
+    except (TypeError, ValueError):
+        return None
+    if revision < 0:
+        return None
+    return {
+        "version": 1,
+        "library_revision": revision,
+        "character_id": str(snapshot.get("character_id", "") or ""),
+        "prompt_id": str(snapshot.get("prompt_id", "") or ""),
+        "payload": snapshot["payload"],
     }
 
 
