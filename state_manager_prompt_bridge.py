@@ -96,6 +96,30 @@ def _text_fingerprint(value: Any) -> tuple[int, bool, str]:
     )
 
 
+def _literal_text_sha256(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _input_provenance(value: Any) -> str:
+    source_id, output_index = _link(value)
+    if source_id is not None:
+        return f"link:{source_id}:{output_index}"
+    if value is None:
+        return "missing"
+    return "literal"
+
+
+def _impact_expansion_state(mode: Any) -> str:
+    value = str(mode or "").strip().lower()
+    if value == "populate":
+        return "pending_native_populate"
+    if value in {"fixed", "reproduce"}:
+        return "native_queue_skip"
+    return "unknown"
+
+
 def _workflow(json_data: Any) -> Dict[str, Any]:
     if not isinstance(json_data, dict):
         return {}
@@ -441,19 +465,48 @@ def materialize_state_manager_impact_prompts(
         if controlled_text is None:
             continue
         effective_text = str(controlled_text)
-        if text_inputs.get("text") != effective_text:
+        queued_text = text_inputs.get("text")
+        queued_matches_persistent = isinstance(queued_text, str) and queued_text == effective_text
+        if queued_text != effective_text:
             text_inputs["text"] = effective_text
             changed += 1
         box = _box_from_payload(payload, role, slot)
+        prompt_document = box.get("prompt_document") if isinstance(box, dict) else None
         managed[text_id] = {
             "manager_id": manager_id,
             "snapshot": snapshot,
             "text": effective_text,
-            "prompt_document": box.get("prompt_document") if isinstance(box, dict) else None,
+            "prompt_document": prompt_document,
             "role": role,
             "slot": slot,
             "selection_source": context["selection_source"],
         }
+
+        frontend_contract_version, frontend_contract_revision = _queued_frontend_contract(
+            context["inputs"].get("ui_state_json", "")
+        )
+        _chars, _timeline, raw_digest = _text_fingerprint(effective_text)
+        document_format = prompt_document.get("format") if isinstance(prompt_document, dict) else None
+        document_routing = prompt_document.get("routing") if isinstance(prompt_document, dict) else None
+        _LOG.info(
+            "[State Manager] managed prompt queue receipt transport=v1 contract=v5 "
+            "frontend_contract=%d frontend_revision=%r manager=%s text_node=%s "
+            "role=%r slot=%r selection_source=%s snapshot_revision=%d "
+            "format=%r routing=%r ordering_verified=%s queued_match=%s raw_sha256=%s",
+            frontend_contract_version,
+            frontend_contract_revision,
+            manager_id,
+            text_id,
+            role,
+            slot,
+            context["selection_source"],
+            int(snapshot.get("library_revision", -1)),
+            document_format,
+            document_routing,
+            bool(ordering_verified),
+            queued_matches_persistent,
+            raw_digest,
+        )
 
     # Preserve native Impact semantics: both source widgets are made authoritative,
     # but mode and seed remain untouched for Impact's own handler/execution.
@@ -473,6 +526,10 @@ def materialize_state_manager_impact_prompts(
             continue
         info = managed[source_id]
         effective_text = info["text"]
+        submitted_populated_sha256 = _literal_text_sha256(impact_inputs.get("populated_text"))
+        seed_provenance = _input_provenance(impact_inputs.get("seed"))
+        impact_mode = impact_inputs.get("mode")
+        expansion_state = _impact_expansion_state(impact_mode)
         impact_changed = False
         for key in ("wildcard_text", "populated_text"):
             if impact_inputs.get(key) != effective_text:
@@ -485,23 +542,35 @@ def materialize_state_manager_impact_prompts(
             _inputs(_node(prompt, info["manager_id"])).get("ui_state_json", "")
         )
         chars, timeline, digest = _text_fingerprint(effective_text)
+        document = info.get("prompt_document")
+        snapshot_revision = int(info["snapshot"].get("library_revision", -1))
         _LOG.info(
-            "[State Manager] backend Impact prompt bridge revision=identity-v2 contract=v5 "
+            "[State Manager] managed Impact edge receipt transport=v1 contract=v5 "
             "frontend_contract=%d frontend_revision=%r text_node=%s manager=%s impact_node=%s "
-            "impact_class=%s mode=%r role=%r slot=%r selection_source=%s chars=%d timeline=%s digest=%s changed=%s",
+            "impact_class=%s mode=%r seed_provenance=%s expansion_state=%s role=%r slot=%r "
+            "selection_source=%s snapshot_revision=%d format=%r routing=%r "
+            "ordering_verified=%s chars=%d timeline=%s template_sha256=%s "
+            "submitted_populated_sha256=%s changed=%s",
             frontend_contract_version,
             frontend_contract_revision,
             source_id,
             info["manager_id"],
             impact_id,
             str(impact_node.get("class_type", "")),
-            impact_inputs.get("mode"),
+            impact_mode,
+            seed_provenance,
+            expansion_state,
             info["role"],
             info["slot"],
             info["selection_source"],
+            snapshot_revision,
+            document.get("format") if isinstance(document, dict) else None,
+            document.get("routing") if isinstance(document, dict) else None,
+            bool(ordering_verified),
             chars,
             timeline,
             digest,
+            submitted_populated_sha256,
             impact_changed,
         )
 
@@ -562,6 +631,20 @@ def materialize_state_manager_impact_prompts(
         if consumer_inputs.get("managed_prompt_source_json") != sidecar:
             consumer_inputs["managed_prompt_source_json"] = sidecar
             changed += 1
+        _LOG.info(
+            "[State Manager] managed consumer sidecar receipt transport=v1 consumer=%s source=%s "
+            "manager=%s text_node=%s impact_node=%s snapshot_revision=%d format=%r routing=%r "
+            "ordering_verified=true queue_contract=ordered-impact-v1 raw_sha256=%s",
+            consumer_id,
+            source_id,
+            info["manager_id"],
+            text_id,
+            impact_id,
+            int(snapshot["library_revision"]),
+            document.get("format") if isinstance(document, dict) else None,
+            document.get("routing") if isinstance(document, dict) else None,
+            hashlib.sha256(info["text"].encode("utf-8")).hexdigest(),
+        )
 
     return changed
 
