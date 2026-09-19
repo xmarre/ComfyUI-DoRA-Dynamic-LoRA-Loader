@@ -376,7 +376,12 @@ class StateLibraryStore:
         document["version"] = self.VERSION
         return backup
 
-    def replace(self, characters: Any, expected_revision: Any) -> Dict[str, Any]:
+    def replace(
+        self,
+        characters: Any,
+        expected_revision: Any,
+        document_capable: bool = False,
+    ) -> Dict[str, Any]:
         with self._lock:
             document = self._load_unlocked()
             self._require_recovery_acknowledgement()
@@ -393,6 +398,15 @@ class StateLibraryStore:
             if missing:
                 raise InvalidStateLibrary(
                     "The submitted library snapshot would strip or rewrite persistent prompt_document metadata; reload before saving."
+                )
+            descriptor_aware = (
+                int(document.get("version", self.LEGACY_VERSION)) >= self.VERSION
+                or bool(existing_documents)
+                or bool(replacement_documents)
+            )
+            if descriptor_aware and not bool(document_capable):
+                raise InvalidStateLibrary(
+                    "Descriptor-aware State Manager bulk writes require contract v5 with prompt_document_v1."
                 )
             self._promote_v2_for_prompt_documents_unlocked(document, normalized_characters)
             document["characters"] = normalized_characters
