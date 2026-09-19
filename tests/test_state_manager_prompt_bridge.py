@@ -449,7 +449,7 @@ def test_impact_to_continuum_sidecar_proves_exact_output_zero_path(
     assert sidecar["library_revision"] == persisted["library_revision"]
 
 
-def test_nonzero_impact_output_never_receives_managed_provenance(
+def test_impact_wildcard_encode_string_output_is_not_claimed_as_processor_transport(
     configured_nodes, bridge, monkeypatch
 ):
     nodes = configured_nodes
@@ -467,11 +467,13 @@ def test_nonzero_impact_output_never_receives_managed_provenance(
             "geometry": {"chunks": 1, "chunk_seconds": "5"},
         },
     )
-    payload = _prompt(nodes, character)
+    payload = _prompt(nodes, character, impact_class="ImpactWildcardEncode")
     payload["prompt"]["260"] = {
         "class_type": "H3 Continuum Production",
         "inputs": {
-            "sequence_prompt": ["251", 1],
+            # ImpactWildcardEncode's STRING result is output 3. The managed
+            # transport contract deliberately supports Processor output 0 only.
+            "sequence_prompt": ["251", 3],
             "managed_prompt_source_json": "",
         },
     }
@@ -486,6 +488,7 @@ def test_nonzero_impact_output_never_receives_managed_provenance(
     )
 
     assert payload["prompt"]["251"]["inputs"]["wildcard_text"] == text
+    assert payload["prompt"]["251"]["inputs"]["populated_text"] == text
     assert payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"] == ""
 
 
