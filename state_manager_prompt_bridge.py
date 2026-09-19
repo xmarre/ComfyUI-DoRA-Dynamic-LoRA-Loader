@@ -120,6 +120,20 @@ def _impact_expansion_state(mode: Any) -> str:
     return "unknown"
 
 
+def _receipt_document_field(document: Any, field: str) -> Optional[str]:
+    if not isinstance(document, dict):
+        return None
+    value = document.get(field)
+    allowed = {
+        "format": {"inherit", "fixed", "list", "timeline"},
+        "routing": {"logical_chunks", "physical_timeline"},
+    }.get(field, set())
+    if value is None:
+        return None
+    text = str(value)
+    return text if text in allowed else "other"
+
+
 def _workflow(json_data: Any) -> Dict[str, Any]:
     if not isinstance(json_data, dict):
         return {}
@@ -486,8 +500,8 @@ def materialize_state_manager_impact_prompts(
             context["inputs"].get("ui_state_json", "")
         )
         _chars, _timeline, raw_digest = _text_fingerprint(effective_text)
-        document_format = prompt_document.get("format") if isinstance(prompt_document, dict) else None
-        document_routing = prompt_document.get("routing") if isinstance(prompt_document, dict) else None
+        document_format = _receipt_document_field(prompt_document, "format")
+        document_routing = _receipt_document_field(prompt_document, "routing")
         _LOG.info(
             "[State Manager] managed prompt queue receipt transport=v1 contract=v5 "
             "frontend_contract=%d frontend_revision=%r manager=%s text_node=%s "
@@ -564,8 +578,8 @@ def materialize_state_manager_impact_prompts(
             info["slot"],
             info["selection_source"],
             snapshot_revision,
-            document.get("format") if isinstance(document, dict) else None,
-            document.get("routing") if isinstance(document, dict) else None,
+            _receipt_document_field(document, "format"),
+            _receipt_document_field(document, "routing"),
             bool(ordering_verified),
             chars,
             timeline,
@@ -655,12 +669,12 @@ def _handler_order_receipt(handlers: Any, *, limit: int = 32) -> Dict[str, Any]:
     for handler in values[: max(0, int(limit))]:
         shown.append(
             {
-                "module": str(getattr(handler, "__module__", "") or ""),
+                "module": str(getattr(handler, "__module__", "") or "")[:160],
                 "name": str(
                     getattr(handler, "__qualname__", None)
                     or getattr(handler, "__name__", None)
                     or type(handler).__name__
-                ),
+                )[:160],
             }
         )
     return {
