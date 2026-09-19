@@ -499,6 +499,53 @@ def test_provider_preview_and_skeleton_delegate_without_private_error_text(
     }
 
 
+def test_legacy_box_without_prompt_document_uses_request_local_inherit_document(
+    bridge, monkeypatch
+):
+    provider = _install_fake_continuum_provider(monkeypatch)
+    document, origin = bridge._transport_document_for_provider(None, provider)
+    assert document == {"schema_version": 1, "format": "inherit"}
+    assert origin == "legacy_absent"
+
+
+def test_legacy_managed_impact_path_attaches_inherit_sidecar_without_persisting_descriptor(
+    configured_nodes, bridge, monkeypatch
+):
+    nodes = configured_nodes
+    _install_fake_continuum_provider(monkeypatch)
+    text = "Shared. [0-7s] ONE [7-14s] TWO"
+    character = _persistent_character(text)
+    persisted = nodes._get_state_manager_store().replace([character], 0)
+    payload = _prompt(nodes, character, mode="populate")
+    payload["prompt"]["260"] = {
+        "class_type": "H3 Continuum Production",
+        "inputs": {
+            "sequence_prompt": ["251", 0],
+            "managed_prompt_source_json": "",
+        },
+    }
+
+    bridge.materialize_state_manager_impact_prompts(
+        payload,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        resolve_snapshot=nodes._resolve_dora_state_payload_snapshot,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=nodes._state_payload_text_for_box,
+        ordering_verified=True,
+    )
+
+    sidecar = json.loads(payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"])
+    assert sidecar["prompt_document"] == {"schema_version": 1, "format": "inherit"}
+    assert sidecar["prompt_document_origin"] == "legacy_absent"
+    assert sidecar["library_revision"] == persisted["revision"]
+
+    # Compatibility is request-local. Existing libraries are not silently
+    # rewritten just because a legacy prompt was queued.
+    stored = nodes._get_state_manager_store().snapshot()
+    box = stored["characters"][0]["prompts"][0]["text_boxes"][0]
+    assert "prompt_document" not in box
+
+
 def test_queue_snapshot_and_direct_continuum_sidecar_share_one_revision(
     configured_nodes, bridge, monkeypatch
 ):
