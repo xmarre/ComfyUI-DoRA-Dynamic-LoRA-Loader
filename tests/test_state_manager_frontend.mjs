@@ -10,7 +10,7 @@ async function loadStateManagerHelpers() {
     .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
     .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi(...args) { if (typeof globalThis.__dsmTestFetchApi === 'function') return globalThis.__dsmTestFetchApi(...args); throw new Error('not used'); }, apiURL(value) { return value; } };")
     .replace('import "../../scripts/domWidget.js";', "");
-  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary, flushPendingLibraryWrites, validateManagedQueueTextState, prepareStateManagerQueuePayload };\n`;
+  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, normalizeSelectionIdentity, readSelectionMirror, readLocalSelection, writeLocalSelection, writeSelectionMirror, configuredSelectionIdentity, selectionResolutionForLibraryLoad, selectionIdentityForLibraryLoad, authoritativeSelectionIdentity, rememberAuthoritativeSelection, initializeNode, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary, flushPendingLibraryWrites, validateManagedQueueTextState, prepareStateManagerQueuePayload };\n`;
   const encoded = Buffer.from(source, "utf8").toString("base64");
   return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
 }
@@ -24,6 +24,350 @@ function privateCharacter(id, name, promptText) {
   };
 }
 
+
+test("startup selection reads serialized workflow ids instead of constructor defaults", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const node = {
+    widgets: [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: "default_character" },
+      { name: "selected_prompt_id", value: "default_prompt" },
+    ],
+    properties: {
+      dora_state_manager_selection_v1: {
+        version: 1,
+        character_id: "stale-character",
+        prompt_id: "stale-prompt",
+      },
+    },
+  };
+  const serialized = {
+    widgets_values: [
+      helpers.serializeBinding(),
+      helpers.serializeWorkflowUiState({}),
+      "character-a",
+      "prompt-a",
+    ],
+    properties: structuredClone(node.properties),
+  };
+
+  assert.deepEqual(
+    helpers.selectionIdentityForLibraryLoad(node, serialized),
+    { characterId: "character-a", promptId: "prompt-a" },
+  );
+});
+
+
+test("startup selection mirror rescues a configured preset when live widgets are still defaults", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const node = {
+    widgets: [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: "default_character" },
+      { name: "selected_prompt_id", value: "default_prompt" },
+    ],
+    properties: {
+      dora_state_manager_selection_v1: {
+        version: 1,
+        character_id: "character-a",
+        prompt_id: "prompt-a",
+      },
+    },
+  };
+
+  assert.deepEqual(
+    helpers.selectionIdentityForLibraryLoad(node),
+    { characterId: "character-a", promptId: "prompt-a" },
+  );
+});
+
+
+test("nondefault mirror repairs serialized defaults left by the startup race", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const node = {
+    widgets: [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: "default_character" },
+      { name: "selected_prompt_id", value: "default_prompt" },
+    ],
+    properties: {
+      dora_state_manager_selection_v1: {
+        version: 1,
+        character_id: "character-a",
+        prompt_id: "prompt-a",
+      },
+    },
+  };
+  const serialized = {
+    widgets_values_named: {
+      selected_character_id: "default_character",
+      selected_prompt_id: "default_prompt",
+    },
+    properties: structuredClone(node.properties),
+  };
+
+  assert.deepEqual(
+    helpers.selectionIdentityForLibraryLoad(node, serialized),
+    { characterId: "character-a", promptId: "prompt-a" },
+  );
+});
+
+test("distribution-safe startup migrates the PR82 workflow mirror before local binding exists", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const previousStorage = globalThis.localStorage;
+  const storage = new Map();
+  globalThis.localStorage = {
+    getItem(key) { return storage.has(key) ? storage.get(key) : null; },
+    setItem(key, value) { storage.set(key, String(value)); },
+    removeItem(key) { storage.delete(key); },
+  };
+  const node = {
+    id: 42,
+    widgets: [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: "default_character" },
+      { name: "selected_prompt_id", value: "default_prompt" },
+    ],
+    properties: {
+      dora_state_manager_distribution_safe_serialization: true,
+      dora_state_manager_selection_v1: {
+        version: 1,
+        character_id: "character-a",
+        prompt_id: "prompt-a",
+      },
+    },
+  };
+  const serialized = {
+    id: 42,
+    widgets_values_named: {
+      selected_character_id: "default_character",
+      selected_prompt_id: "default_prompt",
+    },
+    properties: structuredClone(node.properties),
+  };
+
+  try {
+    assert.deepEqual(
+      helpers.selectionIdentityForLibraryLoad(node, serialized),
+      { characterId: "character-a", promptId: "prompt-a" },
+    );
+  } finally {
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+  }
+});
+
+
+test("distribution-safe startup restores only this browser's local selection", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const previousStorage = globalThis.localStorage;
+  const storage = new Map();
+  globalThis.localStorage = {
+    getItem(key) { return storage.has(key) ? storage.get(key) : null; },
+    setItem(key, value) { storage.set(key, String(value)); },
+    removeItem(key) { storage.delete(key); },
+  };
+  const node = {
+    id: 42,
+    widgets: [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: "character-a" },
+      { name: "selected_prompt_id", value: "prompt-a" },
+    ],
+    properties: {
+      dora_state_manager_distribution_safe_serialization: true,
+      dora_state_manager_local_selection_binding_v1: "opaque-binding",
+    },
+  };
+
+  try {
+    helpers.writeSelectionMirror(node, "character-a", "prompt-a");
+    assert.equal(node.properties.dora_state_manager_selection_v1, undefined);
+    assert.deepEqual(
+      helpers.readLocalSelection(node),
+      { characterId: "character-a", promptId: "prompt-a" },
+    );
+
+    const serialized = {
+      id: 42,
+      widgets_values_named: {
+        selected_character_id: "default_character",
+        selected_prompt_id: "default_prompt",
+      },
+      properties: structuredClone(node.properties),
+    };
+    assert.deepEqual(
+      helpers.selectionIdentityForLibraryLoad(node, serialized),
+      { characterId: "character-a", promptId: "prompt-a" },
+    );
+
+    storage.clear();
+    assert.deepEqual(
+      helpers.selectionIdentityForLibraryLoad(node, serialized),
+      { characterId: "default_character", promptId: "default_prompt" },
+    );
+  } finally {
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+  }
+});
+
+
+test("selection mirror is updated with the selected persistent preset", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const node = { properties: {} };
+  helpers.writeSelectionMirror(node, "character-a", "prompt-a");
+  assert.deepEqual(node.properties.dora_state_manager_selection_v1, {
+    version: 1,
+    character_id: "character-a",
+    prompt_id: "prompt-a",
+  });
+});
+
+
+test("State Manager workflow hydration uses the loadedGraphNode lifecycle barrier", async () => {
+  const source = await readFile(new URL("../web/dora_state_manager.js", import.meta.url), "utf8");
+  const initializeIndex = source.indexOf("function initializeNode");
+  const queueIndex = source.indexOf("function queueSessionTotalFromArguments");
+  const block = source.slice(initializeIndex, queueIndex);
+  assert.match(block, /__dsmScheduleNewNodeLibraryLoad/);
+  assert.match(block, /onConfigure"[\s\S]*selectionResolutionForLibraryLoad/);
+  assert.equal(block.includes("Promise.resolve().then(() => load(serializedNode))"), false);
+  assert.match(
+    source,
+    /loadedGraphNode\(node\)[\s\S]*__dsmLoadedGraphSeen\s*=\s*true[\s\S]*__dsmLoadConfiguredLibrary/,
+  );
+});
+
+test("late workflow configure cannot be poisoned by an already-completed default startup fetch", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const previousRaf = globalThis.requestAnimationFrame;
+  const previousCancel = globalThis.cancelAnimationFrame;
+  const frames = new Map();
+  let nextFrame = 1;
+  globalThis.requestAnimationFrame = (callback) => {
+    const id = nextFrame++;
+    frames.set(id, callback);
+    return id;
+  };
+  globalThis.cancelAnimationFrame = (id) => {
+    frames.delete(id);
+  };
+
+  const savedCharacter = {
+    id: "character-a",
+    name: "Character A",
+    prompts: [{
+      id: "prompt-a",
+      name: "Prompt A",
+      positive: "saved",
+      negative: "",
+      text_boxes: [
+        { role: "positive", slot: "default", label: "Default positive", text: "saved" },
+        { role: "negative", slot: "default", label: "Default negative", text: "" },
+      ],
+      settings: {},
+    }],
+  };
+  globalThis.__dsmTestFetchApi = async () => ({
+    ok: true,
+    async json() {
+      return {
+        version: 2,
+        revision: 9,
+        characters: [structuredClone(savedCharacter)],
+        user_id: "default",
+      };
+    },
+  });
+
+  const widgets = [
+    { name: "state_json", value: helpers.serializeBinding() },
+    { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+    { name: "selected_character_id", value: "default_character" },
+    { name: "selected_prompt_id", value: "default_prompt" },
+  ];
+  const node = {
+    id: 42,
+    type: "State Manager",
+    comfyClass: "State Manager",
+    widgets,
+    properties: {},
+    size: [820, 720],
+    __dsm: {
+      state: null,
+      uiState: null,
+      renderFrame: 0,
+      postLoadSyncFrame: 0,
+    },
+    setSize() {},
+    setDirtyCanvas() {},
+    graph: { change() {} },
+  };
+
+  try {
+    helpers.initializeNode(node, {});
+
+    // Force the old failing ordering: allow an unconfigured default fetch to
+    // finish before ComfyUI supplies the workflow payload. It may render the
+    // built-in default, but it must not make that placeholder authoritative.
+    node.__dsmLoadConfiguredLibrary();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(widgets[2].value, "default_character");
+    assert.equal(widgets[3].value, "default_prompt");
+    assert.equal(helpers.authoritativeSelectionIdentity(node), null);
+    assert.equal(node.properties.dora_state_manager_selection_v1, undefined);
+
+    const serialized = {
+      widgets_values: [
+        helpers.serializeBinding(),
+        helpers.serializeWorkflowUiState({}),
+        "character-a",
+        "prompt-a",
+      ],
+      widgets_values_named: {
+        state_json: helpers.serializeBinding(),
+        ui_state_json: helpers.serializeWorkflowUiState({}),
+        selected_character_id: "character-a",
+        selected_prompt_id: "prompt-a",
+      },
+      properties: {},
+    };
+    node.onConfigure(serialized);
+
+    // Selection restoration is synchronous at configure time. No API response
+    // or animation frame may be required to stop post-load serialization from
+    // seeing constructor defaults.
+    assert.equal(widgets[2].value, "character-a");
+    assert.equal(widgets[3].value, "prompt-a");
+    assert.deepEqual(
+      helpers.authoritativeSelectionIdentity(node),
+      { characterId: "character-a", promptId: "prompt-a" },
+    );
+
+    helpers.capturedExtension.loadedGraphNode(node);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(widgets[2].value, "character-a");
+    assert.equal(widgets[3].value, "prompt-a");
+    assert.equal(node.__dsmLibraryHydrated, true);
+    assert.equal(node.__dsm.state.characters[0].id, "character-a");
+    assert.equal(node.__dsm.state.characters[0].prompts[0].id, "prompt-a");
+  } finally {
+    helpers.stateLibraryClient.nodes.delete(node);
+    delete globalThis.__dsmTestFetchApi;
+    if (previousRaf === undefined) delete globalThis.requestAnimationFrame;
+    else globalThis.requestAnimationFrame = previousRaf;
+    if (previousCancel === undefined) delete globalThis.cancelAnimationFrame;
+    else globalThis.cancelAnimationFrame = previousCancel;
+  }
+});
 
 test("managed State Manager text integration updates the authoritative selected prompt", async () => {
   const helpers = await loadStateManagerHelpers();
@@ -528,6 +872,49 @@ test("the installed onSerialize hook scrubs private widget and property payloads
 });
 
 
+test("onSerialize never replaces an authoritative workflow selection with transient default widgets", async () => {
+  const helpers = await loadStateManagerHelpers();
+  class StateManagerNode {
+    onSerialize(output) {
+      output.widgets_values = this.widgets.map((widget) => widget.value);
+      output.widgets_values_named = Object.fromEntries(this.widgets.map((widget) => [widget.name, widget.value]));
+      output.properties = { ...this.properties };
+    }
+  }
+  StateManagerNode.comfyClass = "State Manager";
+  await helpers.capturedExtension.beforeRegisterNodeDef(StateManagerNode, {
+    name: "State Manager",
+    input: { required: {} },
+  });
+
+  const node = new StateManagerNode();
+  node.properties = {};
+  node.widgets = [
+    { name: "state_json", value: helpers.serializeBinding() },
+    { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+    { name: "selected_character_id", value: "default_character" },
+    { name: "selected_prompt_id", value: "default_prompt" },
+  ];
+  node.__dsm = { state: helpers.defaultState(), uiState: {} };
+  helpers.rememberAuthoritativeSelection(node, "character-a", "prompt-a");
+
+  const output = {};
+  node.onSerialize(output);
+
+  assert.equal(node.widgets[2].value, "default_character");
+  assert.equal(node.widgets[3].value, "default_prompt");
+  assert.equal(output.widgets_values[2], "character-a");
+  assert.equal(output.widgets_values[3], "prompt-a");
+  assert.equal(output.widgets_values_named.selected_character_id, "character-a");
+  assert.equal(output.widgets_values_named.selected_prompt_id, "prompt-a");
+  assert.deepEqual(output.properties.dora_state_manager_selection_v1, {
+    version: 1,
+    character_id: "character-a",
+    prompt_id: "prompt-a",
+  });
+});
+
+
 test("failed legacy migration remains serialized for a lossless retry", async () => {
   const helpers = await loadStateManagerHelpers();
   class StateManagerNode {
@@ -766,14 +1153,53 @@ test("legacy embedded state remains detectable for controlled migration", async 
 });
 
 
-test("browser persistence code cannot resurrect a private library", async () => {
+test("browser persistence is selection-only and cannot resurrect a private library", async () => {
+  const helpers = await loadStateManagerHelpers();
   const source = await readFile(new URL("../web/dora_state_manager.js", import.meta.url), "utf8");
-  assert.equal(source.includes("localStorage"), false);
   assert.equal(source.includes("tryRestoreStateBackup"), false);
   assert.equal(source.includes("writeStateBackup"), false);
   assert.equal(source.includes("dora_state_manager_backup_workflow_id"), true, "legacy metadata should only appear in the serialization scrubber");
   assert.match(source, /delete app\.graph\.extra\.dora_state_manager_backup_workflow_id/);
   assert.equal(source.includes("setWidgetValue(widgets.uiStateWidget, serializeUiState"), false);
+
+  const previousStorage = globalThis.localStorage;
+  const storage = new Map();
+  globalThis.localStorage = {
+    getItem(key) { return storage.has(key) ? storage.get(key) : null; },
+    setItem(key, value) { storage.set(key, String(value)); },
+    removeItem(key) { storage.delete(key); },
+  };
+  const node = {
+    id: 42,
+    properties: {
+      dora_state_manager_distribution_safe_serialization: true,
+      dora_state_manager_local_selection_binding_v1: "opaque-binding",
+    },
+  };
+  try {
+    assert.equal(helpers.writeLocalSelection(node, "character-a", "prompt-a"), true);
+    assert.equal(storage.size, 1);
+    const [key, raw] = [...storage.entries()][0];
+    assert.match(key, /^dora_state_manager_local_selection_v1:opaque-binding:42$/);
+    assert.deepEqual(Object.keys(JSON.parse(raw)).sort(), [
+      "character_id",
+      "prompt_id",
+      "version",
+    ]);
+    assert.deepEqual(JSON.parse(raw), {
+      version: 1,
+      character_id: "character-a",
+      prompt_id: "prompt-a",
+    });
+    assert.equal(raw.includes("characters"), false);
+    assert.equal(raw.includes("text_boxes"), false);
+    assert.equal(raw.includes("settings"), false);
+    assert.equal(raw.includes("loras"), false);
+  } finally {
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+  }
+
   const stashIndex = source.indexOf("node.__dsmPendingLegacyState = structuredCloneCompat(embeddedLegacy)");
   const scrubIndex = source.indexOf("setWidgetValue(currentWidgets.stateWidget, serializeBinding())");
   const successIndex = source.indexOf("delete node.__dsmPendingLegacyState;");
