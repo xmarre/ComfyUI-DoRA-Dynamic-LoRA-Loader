@@ -10,7 +10,7 @@ async function loadStateManagerHelpers() {
     .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
     .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi(...args) { if (typeof globalThis.__dsmTestFetchApi === 'function') return globalThis.__dsmTestFetchApi(...args); throw new Error('not used'); }, apiURL(value) { return value; } };")
     .replace('import "../../scripts/domWidget.js";', "");
-  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, normalizeSelectionIdentity, readSelectionMirror, readLocalSelection, writeLocalSelection, writeSelectionMirror, configuredSelectionIdentity, selectionResolutionForLibraryLoad, selectionIdentityForLibraryLoad, authoritativeSelectionIdentity, rememberAuthoritativeSelection, initializeNode, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary, flushPendingLibraryWrites, validateManagedQueueTextState, prepareStateManagerQueuePayload };\n`;
+  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, normalizeSelectionIdentity, readSelectionMirror, readLocalSelection, writeLocalSelection, writeSelectionMirror, configuredSelectionIdentity, selectionResolutionForLibraryLoad, selectionIdentityForLibraryLoad, authoritativeSelectionIdentity, rememberAuthoritativeSelection, captureStateManagerWorkflowState, updateState, initializeNode, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary, flushPendingLibraryWrites, validateManagedQueueTextState, prepareStateManagerQueuePayload };\n`;
   const encoded = Buffer.from(source, "utf8").toString("base64");
   return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
 }
@@ -226,6 +226,75 @@ test("selection mirror is updated with the selected persistent preset", async ()
     version: 1,
     character_id: "character-a",
     prompt_id: "prompt-a",
+  });
+});
+
+
+test("State Manager DOM mutations force a post-click workflow snapshot", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const character = privateCharacter("character-a", "Character A", "saved");
+  const promptId = character.prompts[0].id;
+  const widgets = [
+    { name: "state_json", value: helpers.serializeBinding() },
+    { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+    { name: "selected_character_id", value: "default_character" },
+    { name: "selected_prompt_id", value: "default_prompt" },
+  ];
+  const snapshots = [{
+    characterId: widgets[2].value,
+    promptId: widgets[3].value,
+    mirror: null,
+  }];
+  const previousCanvas = helpers.app.canvas;
+  helpers.app.canvas = {
+    emitBeforeChange() {},
+    emitAfterChange() {
+      snapshots.push({
+        characterId: widgets[2].value,
+        promptId: widgets[3].value,
+        mirror: structuredClone(node.properties.dora_state_manager_selection_v1),
+      });
+    },
+  };
+  const node = {
+    widgets,
+    properties: {},
+    setDirtyCanvas() {},
+    graph: { change() {} },
+  };
+
+  try {
+    helpers.updateState(
+      node,
+      { version: 3, characters: [character] },
+      {},
+      {
+        characterId: character.id,
+        promptId,
+        persist: false,
+        render: false,
+      },
+    );
+  } finally {
+    helpers.app.canvas = previousCanvas;
+  }
+
+  // ComfyUI's global mouseup capture occurs before the DOM click handler. The
+  // explicit transaction emitted by updateState() must therefore produce a
+  // second snapshot after the selected UUIDs and mirror have been updated.
+  assert.deepEqual(snapshots[0], {
+    characterId: "default_character",
+    promptId: "default_prompt",
+    mirror: null,
+  });
+  assert.deepEqual(snapshots[1], {
+    characterId: "character-a",
+    promptId,
+    mirror: {
+      version: 1,
+      character_id: "character-a",
+      prompt_id: promptId,
+    },
   });
 });
 
