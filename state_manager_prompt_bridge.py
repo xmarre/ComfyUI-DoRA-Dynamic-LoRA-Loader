@@ -482,8 +482,8 @@ def materialize_state_manager_impact_prompts(
         text_inputs = _inputs(text_node)
         if text_inputs is None:
             continue
-        manager_id = _link_source(text_inputs.get("state_control"))
-        if manager_id is None:
+        manager_id, manager_output = _link(text_inputs.get("state_control"))
+        if manager_id is None or manager_output != 7:
             continue
         context = manager_context.get(manager_id)
         snapshot = snapshots.get(manager_id)
