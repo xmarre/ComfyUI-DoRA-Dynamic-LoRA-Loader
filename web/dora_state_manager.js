@@ -75,6 +75,10 @@ const LAST_SEED_BUTTON_LABEL = "♻️ (Use Last Queued Seed)";
 const LIBRARY_API = "/dora_dynamic_lora/state-library";
 const BINDING_KIND = "dora_state_manager_binding";
 const BINDING_VERSION = 1;
+const SELECTION_MIRROR_PROPERTY = "dora_state_manager_selection_v1";
+const DISTRIBUTION_SAFE_PROPERTY = "dora_state_manager_distribution_safe_serialization";
+const LOCAL_SELECTION_BINDING_PROPERTY = "dora_state_manager_local_selection_binding_v1";
+const LOCAL_SELECTION_STORAGE_PREFIX = "dora_state_manager_local_selection_v1";
 const QUEUE_SESSION_MAX_AGE_MS = 30000;
 
 const PROMPT_DOCUMENT_SCHEMA_VERSION = 1;
@@ -1494,6 +1498,11 @@ async function initializeStateLibrary(node, legacyState, selectedCharacterId, se
   setWidgetValue(widgets.stateWidget, serializeBinding());
   setWidgetValue(widgets.characterWidget, characterId || "default_character");
   setWidgetValue(widgets.promptWidget, promptId || "default_prompt");
+  writeSelectionMirror(
+    node,
+    widgetValue(widgets.characterWidget, ""),
+    widgetValue(widgets.promptWidget, ""),
+  );
   const state = stateViewForSelection(
     widgetValue(widgets.characterWidget, ""),
     widgetValue(widgets.promptWidget, ""),
@@ -1569,6 +1578,187 @@ function getWidgets(node) {
     characterWidget: map.get(SELECTED_CHARACTER_WIDGET),
     promptWidget: map.get(SELECTED_PROMPT_WIDGET),
   };
+}
+
+function normalizeSelectionIdentity(characterId = "", promptId = "") {
+  return {
+    characterId: String(characterId || "").trim(),
+    promptId: String(promptId || "").trim(),
+  };
+}
+
+function readSelectionMirror(node, serializedNode = null) {
+  const raw = serializedNode?.properties?.[SELECTION_MIRROR_PROPERTY]
+    ?? node?.properties?.[SELECTION_MIRROR_PROPERTY];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const selection = normalizeSelectionIdentity(raw.character_id, raw.prompt_id);
+  if (!selection.characterId && !selection.promptId) return null;
+  return selection;
+}
+
+function distributionSafeSelectionEnabled(node, serializedNode = null) {
+  const serializedValue = serializedNode?.properties?.[DISTRIBUTION_SAFE_PROPERTY];
+  if (serializedValue === true || serializedValue === false) return serializedValue;
+  return node?.properties?.[DISTRIBUTION_SAFE_PROPERTY] === true;
+}
+
+function ensureLocalSelectionBinding(node) {
+  if (!node) return "";
+  node.properties = node.properties || {};
+  let binding = String(node.properties[LOCAL_SELECTION_BINDING_PROPERTY] || "").trim();
+  if (!binding) {
+    binding = makeId("local_selection");
+    node.properties[LOCAL_SELECTION_BINDING_PROPERTY] = binding;
+  }
+  return binding;
+}
+
+function localSelectionStorageKeys(node, serializedNode = null, { create = false } = {}) {
+  const serializedBinding = String(
+    serializedNode?.properties?.[LOCAL_SELECTION_BINDING_PROPERTY] || "",
+  ).trim();
+  const binding = serializedBinding || String(
+    node?.properties?.[LOCAL_SELECTION_BINDING_PROPERTY] || "",
+  ).trim() || (create ? ensureLocalSelectionBinding(node) : "");
+  if (!binding) return [];
+  const base = `${LOCAL_SELECTION_STORAGE_PREFIX}:${binding}`;
+  const nodeId = String(serializedNode?.id ?? node?.id ?? "").trim();
+  return nodeId ? [`${base}:${nodeId}`, base] : [base];
+}
+
+function readLocalSelection(node, serializedNode = null) {
+  const storage = globalThis.localStorage;
+  if (!storage || typeof storage.getItem !== "function") return null;
+  try {
+    for (const key of localSelectionStorageKeys(node, serializedNode)) {
+      const raw = storage.getItem(key);
+      if (!raw) continue;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      const selection = normalizeSelectionIdentity(parsed.character_id, parsed.prompt_id);
+      if (selection.characterId || selection.promptId) return selection;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalSelection(node, characterId, promptId) {
+  if (!node) return false;
+  const storage = globalThis.localStorage;
+  if (!storage || typeof storage.setItem !== "function") return false;
+  const keys = localSelectionStorageKeys(node, null, { create: true });
+  if (!keys.length) return false;
+  const selection = normalizeSelectionIdentity(characterId, promptId);
+  const payload = JSON.stringify({
+    version: 1,
+    character_id: selection.characterId || "default_character",
+    prompt_id: selection.promptId || "default_prompt",
+  });
+  try {
+    storage.setItem(keys[0], payload);
+    // If selection was written before ComfyUI assigned a stable node id, the
+    // binding-only key remains a valid fallback. Once an id is available, keep
+    // the exact key authoritative and retire that construction-time fallback.
+    if (keys.length > 1 && typeof storage.removeItem === "function") {
+      storage.removeItem(keys[1]);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function writeSelectionMirror(node, characterId, promptId) {
+  if (!node) return;
+  const selection = normalizeSelectionIdentity(characterId, promptId);
+  node.properties = node.properties || {};
+  if (distributionSafeSelectionEnabled(node)) {
+    writeLocalSelection(node, selection.characterId, selection.promptId);
+    delete node.properties[SELECTION_MIRROR_PROPERTY];
+    return;
+  }
+  node.properties[SELECTION_MIRROR_PROPERTY] = {
+    version: 1,
+    character_id: selection.characterId || "default_character",
+    prompt_id: selection.promptId || "default_prompt",
+  };
+}
+
+function configuredSelectionIdentity(node, serializedNode = null) {
+  const widgets = getWidgets(node);
+  const named = serializedNode?.widgets_values_named;
+  if (named && typeof named === "object") {
+    const hasCharacter = Object.prototype.hasOwnProperty.call(named, SELECTED_CHARACTER_WIDGET);
+    const hasPrompt = Object.prototype.hasOwnProperty.call(named, SELECTED_PROMPT_WIDGET);
+    if (hasCharacter || hasPrompt) {
+      return normalizeSelectionIdentity(
+        hasCharacter ? named[SELECTED_CHARACTER_WIDGET] : widgetValue(widgets.characterWidget, ""),
+        hasPrompt ? named[SELECTED_PROMPT_WIDGET] : widgetValue(widgets.promptWidget, ""),
+      );
+    }
+  }
+
+  const values = serializedNode?.widgets_values;
+  if (Array.isArray(values)) {
+    const characterIndex = (node?.widgets || []).indexOf(widgets.characterWidget);
+    const promptIndex = (node?.widgets || []).indexOf(widgets.promptWidget);
+    const hasCharacter = characterIndex >= 0 && characterIndex < values.length;
+    const hasPrompt = promptIndex >= 0 && promptIndex < values.length;
+    if (hasCharacter || hasPrompt) {
+      return normalizeSelectionIdentity(
+        hasCharacter ? values[characterIndex] : widgetValue(widgets.characterWidget, ""),
+        hasPrompt ? values[promptIndex] : widgetValue(widgets.promptWidget, ""),
+      );
+    }
+  }
+
+  return null;
+}
+
+function selectionIdentityForLibraryLoad(node, serializedNode = null) {
+  const configured = configuredSelectionIdentity(node, serializedNode);
+  if (distributionSafeSelectionEnabled(node, serializedNode)) {
+    // Distribution-safe workflow JSON deliberately carries default IDs. Restore
+    // this browser's private selection from local storage. PR #82 briefly shipped
+    // a workflow-property mirror before distribution-safe restart behavior had a
+    // browser-local binding; accept that non-default mirror once as a migration
+    // source, then initializeStateLibrary() writes the local binding and future
+    // saves scrub the private UUID mirror from workflow JSON.
+    const local = readLocalSelection(node, serializedNode);
+    if (local) return local;
+    const legacyMirror = readSelectionMirror(node, serializedNode);
+    if (
+      legacyMirror
+      && !selectionIsDefault(legacyMirror.characterId, legacyMirror.promptId)
+    ) {
+      return legacyMirror;
+    }
+    if (configured) return configured;
+  } else {
+    const mirror = readSelectionMirror(node, serializedNode);
+    // A non-default configured selection is unambiguous. A default configured
+    // selection paired with a non-default mirror is the signature left by the
+    // startup/serialization race that this fallback exists to repair. A genuine
+    // user selection of the built-in default updates the mirror to default too.
+    if (
+      configured
+      && !selectionIsDefault(configured.characterId, configured.promptId)
+    ) {
+      return configured;
+    }
+    if (mirror && !selectionIsDefault(mirror.characterId, mirror.promptId)) {
+      return mirror;
+    }
+    if (configured) return configured;
+    if (mirror) return mirror;
+  }
+  const widgets = getWidgets(node);
+  return normalizeSelectionIdentity(
+    widgetValue(widgets.characterWidget, ""),
+    widgetValue(widgets.promptWidget, ""),
+  );
 }
 
 function setWidgetValue(widget, value) {
@@ -1678,6 +1868,11 @@ function updateState(node, state, uiState, opts = {}) {
   setWidgetValue(widgets.uiStateWidget, serializeWorkflowUiState(nextUiState));
   setWidgetValue(widgets.characterWidget, materialized.characterId || character.id);
   setWidgetValue(widgets.promptWidget, materialized.promptId || prompt.id);
+  writeSelectionMirror(
+    node,
+    widgetValue(widgets.characterWidget, ""),
+    widgetValue(widgets.promptWidget, ""),
+  );
   node.properties = node.properties || {};
   delete node.properties.dora_state_manager;
   delete node.properties.dora_state_manager_backup_node_uid;
@@ -4662,7 +4857,8 @@ function initializeNode(node, widget) {
   node.setSize?.([Math.max(oldSize[0], MIN_NODE_WIDTH), Math.max(oldSize[1], MIN_NODE_HEIGHT)]);
 
   stateLibraryClient.nodes.add(node);
-  const load = async () => {
+  let initialLoadFrame = 0;
+  const load = async (serializedNode = null) => {
     const token = (node.__dsmLibraryLoadToken || 0) + 1;
     node.__dsmLibraryLoadToken = token;
     const currentWidgets = getWidgets(node);
@@ -4678,8 +4874,9 @@ function initializeNode(node, widget) {
     node.properties = node.properties || {};
     delete node.properties.dora_state_manager;
     delete node.properties.dora_state_manager_backup_node_uid;
-    const characterId = String(widgetValue(currentWidgets.characterWidget, "") || "");
-    const promptId = String(widgetValue(currentWidgets.promptWidget, "") || "");
+    const selection = selectionIdentityForLibraryLoad(node, serializedNode);
+    const characterId = selection.characterId;
+    const promptId = selection.promptId;
     try {
       const loaded = await initializeStateLibrary(node, legacy, characterId, promptId, token);
       if (loaded) {
@@ -4697,10 +4894,24 @@ function initializeNode(node, widget) {
       scheduleRender(node);
     }
   };
-  void load();
 
-  chainNodeCallback(node, "onConfigure", function () {
-    void Promise.resolve().then(load);
+  // The custom DOM widget can be constructed before ComfyUI has restored this
+  // node's serialized widget values. Starting the persistent-library request
+  // immediately from constructor defaults lets an async response overwrite the
+  // saved preset with default_character/default_prompt. Defer the first load
+  // until the next frame, and let onConfigure cancel/supersede it with the
+  // selection taken directly from the serialized workflow payload.
+  initialLoadFrame = requestAnimationFrame(() => {
+    initialLoadFrame = 0;
+    void load();
+  });
+
+  chainNodeCallback(node, "onConfigure", function (serializedNode) {
+    if (initialLoadFrame) {
+      cancelAnimationFrame(initialLoadFrame);
+      initialLoadFrame = 0;
+    }
+    void Promise.resolve().then(() => load(serializedNode));
   });
 
   chainNodeCallback(node, "onResize", function () {
@@ -4719,6 +4930,10 @@ function initializeNode(node, widget) {
     if (ctx.postLoadSyncFrame) {
       cancelAnimationFrame(ctx.postLoadSyncFrame);
       ctx.postLoadSyncFrame = 0;
+    }
+    if (initialLoadFrame) {
+      cancelAnimationFrame(initialLoadFrame);
+      initialLoadFrame = 0;
     }
   });
 
@@ -5535,8 +5750,23 @@ app.registerExtension({
           ? serializeState(this.__dsmPendingLegacyState)
           : binding;
         const workflowUiState = serializeWorkflowUiState(snapshot.uiState);
+        const selection = normalizeSelectionIdentity(
+          widgetValue(widgets.characterWidget, ""),
+          widgetValue(widgets.promptWidget, ""),
+        );
         setWidgetValue(widgets.stateWidget, binding);
+        const distributionSafe = distributionSafeSelectionEnabled(this, o);
+        writeSelectionMirror(this, selection.characterId, selection.promptId);
         o.properties = o.properties || {};
+        if (distributionSafe) {
+          delete o.properties[SELECTION_MIRROR_PROPERTY];
+          const localBinding = this.properties?.[LOCAL_SELECTION_BINDING_PROPERTY];
+          if (localBinding) o.properties[LOCAL_SELECTION_BINDING_PROPERTY] = localBinding;
+        } else {
+          o.properties[SELECTION_MIRROR_PROPERTY] = structuredCloneCompat(
+            this.properties?.[SELECTION_MIRROR_PROPERTY],
+          );
+        }
         delete o.properties.dora_state_manager;
         delete o.properties.dora_state_manager_backup_node_uid;
         if (this.properties) {
@@ -5551,6 +5781,14 @@ app.registerExtension({
         for (const [widget, value] of [
           [widgets.stateWidget, serializedState],
           [widgets.uiStateWidget, workflowUiState],
+          [
+            widgets.characterWidget,
+            distributionSafe ? "default_character" : (selection.characterId || "default_character"),
+          ],
+          [
+            widgets.promptWidget,
+            distributionSafe ? "default_prompt" : (selection.promptId || "default_prompt"),
+          ],
         ]) {
           const index = (this.widgets || []).indexOf(widget);
           if (values && index >= 0) values[index] = value;
