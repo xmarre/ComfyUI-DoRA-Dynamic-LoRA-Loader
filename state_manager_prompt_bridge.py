@@ -559,6 +559,27 @@ def materialize_state_manager_impact_prompts(
     return changed
 
 
+def _handler_order_receipt(handlers: Any, *, limit: int = 32) -> Dict[str, Any]:
+    values = list(handlers) if isinstance(handlers, list) else []
+    shown = []
+    for handler in values[: max(0, int(limit))]:
+        shown.append(
+            {
+                "module": str(getattr(handler, "__module__", "") or ""),
+                "name": str(
+                    getattr(handler, "__qualname__", None)
+                    or getattr(handler, "__name__", None)
+                    or type(handler).__name__
+                ),
+            }
+        )
+    return {
+        "count": len(values),
+        "shown": shown,
+        "truncated": len(values) > len(shown),
+    }
+
+
 def register_prompt_bridge(
     PromptServer: Any,
     *,
@@ -603,8 +624,14 @@ def register_prompt_bridge(
         if not callable(previous):
             server.add_on_prompt_handler(on_prompt)
             setattr(server, marker, on_prompt)
+    handler_order = (
+        _handler_order_receipt(handlers)
+        if ordering_verified
+        else {"count": None, "shown": [], "truncated": False}
+    )
     _LOG.info(
         "[State Manager] backend prompt bridge registered revision=identity-v2 contract=v5 "
-        "backend_write=backend-document-write-v1 ordering_verified=%s",
+        "backend_write=backend-document-write-v1 ordering_verified=%s handler_order=%s",
         ordering_verified,
+        json.dumps(handler_order, sort_keys=True, separators=(",", ":")),
     )
