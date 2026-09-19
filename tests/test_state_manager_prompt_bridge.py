@@ -530,6 +530,44 @@ def test_registered_handler_rolls_back_all_staged_mutations_on_late_failure(
     assert "__dsm_queue_snapshot_v1" not in payload["prompt"]["249"]["inputs"]["ui_state_json"]
 
 
+def test_ordered_transport_capability_tracks_verified_handler_surface(bridge):
+    class FallbackServer:
+        def __init__(self):
+            self.handlers = []
+
+        def add_on_prompt_handler(self, handler):
+            self.handlers.append(handler)
+
+    class FallbackPromptServer:
+        instance = FallbackServer()
+
+    bridge.register_prompt_bridge(
+        FallbackPromptServer,
+        resolve_payload=lambda *_args: {},
+        library_user_from_ui_state=lambda _value: "default",
+        text_for_box=lambda *_args: None,
+    )
+    assert bridge.prompt_transport_ordering_contract() is None
+
+    class OrderedServer:
+        def __init__(self):
+            self.on_prompt_handlers = []
+
+        def add_on_prompt_handler(self, handler):
+            self.on_prompt_handlers.append(handler)
+
+    class OrderedPromptServer:
+        instance = OrderedServer()
+
+    bridge.register_prompt_bridge(
+        OrderedPromptServer,
+        resolve_payload=lambda *_args: {},
+        library_user_from_ui_state=lambda _value: "default",
+        text_for_box=lambda *_args: None,
+    )
+    assert bridge.prompt_transport_ordering_contract() == "ordered-impact-v1"
+
+
 def test_handler_order_receipt_is_bounded_and_names_handlers(bridge):
     handlers = []
     for index in range(40):
