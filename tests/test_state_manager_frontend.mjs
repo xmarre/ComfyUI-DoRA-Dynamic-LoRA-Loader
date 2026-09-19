@@ -10,7 +10,7 @@ async function loadStateManagerHelpers() {
     .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
     .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi(...args) { if (typeof globalThis.__dsmTestFetchApi === 'function') return globalThis.__dsmTestFetchApi(...args); throw new Error('not used'); }, apiURL(value) { return value; } };")
     .replace('import "../../scripts/domWidget.js";', "");
-  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers };\n`;
+  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary };\n`;
   const encoded = Buffer.from(source, "utf8").toString("base64");
   return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
 }
@@ -1623,6 +1623,57 @@ test("v5 setPromptDocument persists exact descriptor while setTextBox remains v4
     if (previousRaf === undefined) delete globalThis.requestAnimationFrame;
     else globalThis.requestAnimationFrame = previousRaf;
   }
+});
+
+
+test("ordinary bulk library writes advertise the v5 prompt-document capability", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const node = { id: 99 };
+  const base = [privateCharacter("character-a", "A", "old")];
+  const desired = [privateCharacter("character-a", "A", "new")];
+
+  helpers.stateLibraryClient.state = { version: 2, characters: structuredClone(base) };
+  helpers.stateLibraryClient.revision = 7;
+  helpers.stateLibraryClient.canonical = "__force_write__";
+  helpers.stateLibraryClient.pending = [{
+    node,
+    baseCharacters: structuredClone(base),
+    desiredCharacters: structuredClone(desired),
+  }];
+  helpers.stateLibraryClient.writing = false;
+  helpers.stateLibraryClient.blocked = false;
+  helpers.stateLibraryClient.lastAppliedNode = null;
+
+  const calls = [];
+  globalThis.__dsmTestFetchApi = async (path, options = {}) => {
+    calls.push({ path, options });
+    const request = JSON.parse(options.body);
+    return {
+      ok: true,
+      async json() {
+        return {
+          version: 2,
+          revision: 8,
+          characters: structuredClone(request.characters),
+          user_id: "default",
+        };
+      },
+    };
+  };
+
+  try {
+    await helpers.writePendingLibrary();
+  } finally {
+    delete globalThis.__dsmTestFetchApi;
+  }
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].path, "/dora_dynamic_lora/state-library");
+  const request = JSON.parse(calls[0].options.body);
+  assert.equal(request.expected_revision, 7);
+  assert.equal(request.contract_version, 5);
+  assert.deepEqual(request.capabilities, ["prompt_document_v1"]);
+  assert.equal(request.characters[0].prompts[0].positive, "new");
 });
 
 
