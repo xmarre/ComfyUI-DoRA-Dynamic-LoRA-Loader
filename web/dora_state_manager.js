@@ -1468,11 +1468,19 @@ async function reloadStateLibrary(node, { status = "Reloaded State Manager libra
   refreshNodeFromLibrary(node, { status });
 }
 
-async function initializeStateLibrary(node, legacyState, selectedCharacterId, selectedPromptId, token = null) {
+async function initializeStateLibrary(
+  node,
+  legacyState,
+  selectedCharacterId,
+  selectedPromptId,
+  token = null,
+  { selectionAuthoritative = false } = {},
+) {
   let snapshot;
   let characterId = String(selectedCharacterId || "");
   let promptId = String(selectedPromptId || "");
   let status = "";
+  let migratedLegacySelection = false;
   if (legacyState && !isDefaultStateValue(legacyState)) {
     const migration = await stateLibraryRequest("/migrate", {
       method: "POST",
@@ -1486,6 +1494,7 @@ async function initializeStateLibrary(node, legacyState, selectedCharacterId, se
     snapshot = migration.snapshot;
     characterId = migration.selected_character_id || "";
     promptId = migration.selected_prompt_id || "";
+    migratedLegacySelection = true;
     status = migration.already_migrated
       ? "Legacy embedded library was already migrated; restored its local UUID binding."
       : "Migrated the legacy embedded State Manager library into persistent user storage.";
@@ -1498,11 +1507,21 @@ async function initializeStateLibrary(node, legacyState, selectedCharacterId, se
   setWidgetValue(widgets.stateWidget, serializeBinding());
   setWidgetValue(widgets.characterWidget, characterId || "default_character");
   setWidgetValue(widgets.promptWidget, promptId || "default_prompt");
-  writeSelectionMirror(
-    node,
-    widgetValue(widgets.characterWidget, ""),
-    widgetValue(widgets.promptWidget, ""),
-  );
+
+  // A library fetch is not a selection event. In particular, constructor-time
+  // widget defaults are not evidence that the user selected the built-in
+  // default. Only a selection that came from workflow/browser persistence, or
+  // a legacy migration whose UUIDs were remapped, is allowed to become the
+  // authoritative startup selection.
+  if (selectionAuthoritative || migratedLegacySelection) {
+    rememberAuthoritativeSelection(
+      node,
+      widgetValue(widgets.characterWidget, ""),
+      widgetValue(widgets.promptWidget, ""),
+      { persist: migratedLegacySelection },
+    );
+  }
+
   const state = stateViewForSelection(
     widgetValue(widgets.characterWidget, ""),
     widgetValue(widgets.promptWidget, ""),
@@ -1717,48 +1736,92 @@ function configuredSelectionIdentity(node, serializedNode = null) {
   return null;
 }
 
-function selectionIdentityForLibraryLoad(node, serializedNode = null) {
+function selectionResolutionForLibraryLoad(node, serializedNode = null) {
   const configured = configuredSelectionIdentity(node, serializedNode);
   if (distributionSafeSelectionEnabled(node, serializedNode)) {
     // Distribution-safe workflow JSON deliberately carries default IDs. Restore
-    // this browser's private selection from local storage. PR #82 briefly shipped
-    // a workflow-property mirror before distribution-safe restart behavior had a
-    // browser-local binding; accept that non-default mirror once as a migration
-    // source, then initializeStateLibrary() writes the local binding and future
-    // saves scrub the private UUID mirror from workflow JSON.
+    // this browser's private selection from local storage. A default pair in the
+    // workflow is a redaction placeholder, not evidence that the browser chose
+    // the built-in default.
     const local = readLocalSelection(node, serializedNode);
-    if (local) return local;
+    if (local) return { ...local, source: "local", authoritative: true };
+
+    // PR #82 briefly shipped a workflow-property mirror before the browser-local
+    // binding existed. Accept a non-default mirror once as a migration source.
     const legacyMirror = readSelectionMirror(node, serializedNode);
     if (
       legacyMirror
       && !selectionIsDefault(legacyMirror.characterId, legacyMirror.promptId)
     ) {
-      return legacyMirror;
+      return { ...legacyMirror, source: "legacy_mirror", authoritative: true };
     }
-    if (configured) return configured;
-  } else {
-    const mirror = readSelectionMirror(node, serializedNode);
-    // A non-default configured selection is unambiguous. A default configured
-    // selection paired with a non-default mirror is the signature left by the
-    // startup/serialization race that this fallback exists to repair. A genuine
-    // user selection of the built-in default updates the mirror to default too.
+
     if (
       configured
       && !selectionIsDefault(configured.characterId, configured.promptId)
     ) {
-      return configured;
+      return { ...configured, source: "configured", authoritative: true };
+    }
+    if (configured) {
+      return { ...configured, source: "distribution_safe_placeholder", authoritative: false };
+    }
+  } else {
+    const mirror = readSelectionMirror(node, serializedNode);
+    // A non-default configured selection is unambiguous. A default configured
+    // selection paired with a non-default mirror is the signature left by the
+    // old startup/serialization race. A genuine explicit default selection has
+    // a default mirror too, so the configured default remains authoritative.
+    if (
+      configured
+      && !selectionIsDefault(configured.characterId, configured.promptId)
+    ) {
+      return { ...configured, source: "configured", authoritative: true };
     }
     if (mirror && !selectionIsDefault(mirror.characterId, mirror.promptId)) {
-      return mirror;
+      return { ...mirror, source: "mirror", authoritative: true };
     }
-    if (configured) return configured;
-    if (mirror) return mirror;
+    if (configured) return { ...configured, source: "configured", authoritative: true };
+    if (mirror) return { ...mirror, source: "mirror", authoritative: true };
   }
+
   const widgets = getWidgets(node);
-  return normalizeSelectionIdentity(
-    widgetValue(widgets.characterWidget, ""),
-    widgetValue(widgets.promptWidget, ""),
-  );
+  return {
+    ...normalizeSelectionIdentity(
+      widgetValue(widgets.characterWidget, ""),
+      widgetValue(widgets.promptWidget, ""),
+    ),
+    source: "live_fallback",
+    authoritative: false,
+  };
+}
+
+function selectionIdentityForLibraryLoad(node, serializedNode = null) {
+  const resolution = selectionResolutionForLibraryLoad(node, serializedNode);
+  return normalizeSelectionIdentity(resolution.characterId, resolution.promptId);
+}
+
+function authoritativeSelectionIdentity(node) {
+  const value = node?.__dsmAuthoritativeSelection;
+  if (!value || typeof value !== "object") return null;
+  const selection = normalizeSelectionIdentity(value.characterId, value.promptId);
+  if (!selection.characterId && !selection.promptId) return null;
+  return selection;
+}
+
+function rememberAuthoritativeSelection(node, characterId, promptId, { persist = false } = {}) {
+  if (!node) return normalizeSelectionIdentity(characterId, promptId);
+  const selection = normalizeSelectionIdentity(characterId, promptId);
+  node.__dsmAuthoritativeSelection = selection;
+  if (persist) writeSelectionMirror(node, selection.characterId, selection.promptId);
+  return selection;
+}
+
+function applySelectionIdentity(node, selection) {
+  const widgets = getWidgets(node);
+  const normalized = normalizeSelectionIdentity(selection?.characterId, selection?.promptId);
+  setWidgetValue(widgets.characterWidget, normalized.characterId || "default_character");
+  setWidgetValue(widgets.promptWidget, normalized.promptId || "default_prompt");
+  return normalized;
 }
 
 function setWidgetValue(widget, value) {
@@ -1868,10 +1931,11 @@ function updateState(node, state, uiState, opts = {}) {
   setWidgetValue(widgets.uiStateWidget, serializeWorkflowUiState(nextUiState));
   setWidgetValue(widgets.characterWidget, materialized.characterId || character.id);
   setWidgetValue(widgets.promptWidget, materialized.promptId || prompt.id);
-  writeSelectionMirror(
+  rememberAuthoritativeSelection(
     node,
     widgetValue(widgets.characterWidget, ""),
     widgetValue(widgets.promptWidget, ""),
+    { persist: true },
   );
   node.properties = node.properties || {};
   delete node.properties.dora_state_manager;
@@ -4857,8 +4921,9 @@ function initializeNode(node, widget) {
   node.setSize?.([Math.max(oldSize[0], MIN_NODE_WIDTH), Math.max(oldSize[1], MIN_NODE_HEIGHT)]);
 
   stateLibraryClient.nodes.add(node);
-  let initialLoadFrame = 0;
-  const load = async (serializedNode = null) => {
+  let newNodeLoadFrame = 0;
+
+  const load = async (resolution = null) => {
     const token = (node.__dsmLibraryLoadToken || 0) + 1;
     node.__dsmLibraryLoadToken = token;
     const currentWidgets = getWidgets(node);
@@ -4874,13 +4939,22 @@ function initializeNode(node, widget) {
     node.properties = node.properties || {};
     delete node.properties.dora_state_manager;
     delete node.properties.dora_state_manager_backup_node_uid;
-    const selection = selectionIdentityForLibraryLoad(node, serializedNode);
-    const characterId = selection.characterId;
-    const promptId = selection.promptId;
+
+    const selected = resolution || selectionResolutionForLibraryLoad(node);
+    const characterId = selected.characterId;
+    const promptId = selected.promptId;
     try {
-      const loaded = await initializeStateLibrary(node, legacy, characterId, promptId, token);
+      const loaded = await initializeStateLibrary(
+        node,
+        legacy,
+        characterId,
+        promptId,
+        token,
+        { selectionAuthoritative: selected.authoritative === true },
+      );
       if (loaded) {
         delete node.__dsmPendingLegacyState;
+        node.__dsmLibraryHydrated = true;
         schedulePostLoadLoaderSync(node);
       }
     } catch (err) {
@@ -4895,23 +4969,46 @@ function initializeNode(node, widget) {
     }
   };
 
-  // The custom DOM widget can be constructed before ComfyUI has restored this
-  // node's serialized widget values. Starting the persistent-library request
-  // immediately from constructor defaults lets an async response overwrite the
-  // saved preset with default_character/default_prompt. Defer the first load
-  // until the next frame, and let onConfigure cancel/supersede it with the
-  // selection taken directly from the serialized workflow payload.
-  initialLoadFrame = requestAnimationFrame(() => {
-    initialLoadFrame = 0;
-    void load();
-  });
+  node.__dsmScheduleNewNodeLibraryLoad = () => {
+    if (newNodeLoadFrame || node.__dsmLoadedGraphSeen || node.__dsmWorkflowConfigured) return;
+    newNodeLoadFrame = requestAnimationFrame(() => {
+      newNodeLoadFrame = 0;
+      if (node.__dsmLoadedGraphSeen || node.__dsmWorkflowConfigured) return;
+      void load(selectionResolutionForLibraryLoad(node));
+    });
+  };
+
+  node.__dsmLoadConfiguredLibrary = () => {
+    if (newNodeLoadFrame) {
+      cancelAnimationFrame(newNodeLoadFrame);
+      newNodeLoadFrame = 0;
+    }
+    const resolution = node.__dsmStartupSelection || selectionResolutionForLibraryLoad(node);
+    void load(resolution);
+  };
 
   chainNodeCallback(node, "onConfigure", function (serializedNode) {
-    if (initialLoadFrame) {
-      cancelAnimationFrame(initialLoadFrame);
-      initialLoadFrame = 0;
+    node.__dsmWorkflowConfigured = true;
+    if (newNodeLoadFrame) {
+      cancelAnimationFrame(newNodeLoadFrame);
+      newNodeLoadFrame = 0;
     }
-    void Promise.resolve().then(() => load(serializedNode));
+
+    // ComfyUI has restored the hidden widget values before onConfigure. Capture
+    // their provenance synchronously and put the selected UUIDs back on the live
+    // widgets before any async library request or post-load serialization can
+    // observe constructor defaults.
+    const resolution = selectionResolutionForLibraryLoad(node, serializedNode);
+    node.__dsmStartupSelection = resolution;
+    applySelectionIdentity(node, resolution);
+    if (resolution.authoritative) {
+      rememberAuthoritativeSelection(node, resolution.characterId, resolution.promptId);
+      if (resolution.source === "legacy_mirror") {
+        // One-time migration from the early PR #82 workflow mirror to the
+        // browser-local distribution-safe binding.
+        writeSelectionMirror(node, resolution.characterId, resolution.promptId);
+      }
+    }
   });
 
   chainNodeCallback(node, "onResize", function () {
@@ -4931,9 +5028,9 @@ function initializeNode(node, widget) {
       cancelAnimationFrame(ctx.postLoadSyncFrame);
       ctx.postLoadSyncFrame = 0;
     }
-    if (initialLoadFrame) {
-      cancelAnimationFrame(initialLoadFrame);
-      initialLoadFrame = 0;
+    if (newNodeLoadFrame) {
+      cancelAnimationFrame(newNodeLoadFrame);
+      newNodeLoadFrame = 0;
     }
   });
 
@@ -5733,6 +5830,17 @@ app.registerExtension({
     };
   },
 
+  nodeCreated(node) {
+    if (!isStateManagerNode(node)) return;
+    node.__dsmScheduleNewNodeLibraryLoad?.();
+  },
+
+  loadedGraphNode(node) {
+    if (!isStateManagerNode(node)) return;
+    node.__dsmLoadedGraphSeen = true;
+    node.__dsmLoadConfiguredLibrary?.();
+  },
+
   async beforeRegisterNodeDef(nodeType, nodeData) {
     installStateSeedQueuePatch();
     maybeInjectWidgetInput(nodeData);
@@ -5750,22 +5858,35 @@ app.registerExtension({
           ? serializeState(this.__dsmPendingLegacyState)
           : binding;
         const workflowUiState = serializeWorkflowUiState(snapshot.uiState);
-        const selection = normalizeSelectionIdentity(
+        const liveSelection = normalizeSelectionIdentity(
           widgetValue(widgets.characterWidget, ""),
           widgetValue(widgets.promptWidget, ""),
         );
+        const authoritativeSelection = authoritativeSelectionIdentity(this);
+        const selection = authoritativeSelection || liveSelection;
         setWidgetValue(widgets.stateWidget, binding);
         const distributionSafe = distributionSafeSelectionEnabled(this, o);
-        writeSelectionMirror(this, selection.characterId, selection.promptId);
         o.properties = o.properties || {};
         if (distributionSafe) {
+          // Distribution-safe serialization may migrate an already-authoritative
+          // live selection into browser-local storage, but it must never create a
+          // local default binding from unresolved constructor widgets.
+          if (authoritativeSelection) {
+            writeSelectionMirror(
+              this,
+              authoritativeSelection.characterId,
+              authoritativeSelection.promptId,
+            );
+          }
           delete o.properties[SELECTION_MIRROR_PROPERTY];
           const localBinding = this.properties?.[LOCAL_SELECTION_BINDING_PROPERTY];
           if (localBinding) o.properties[LOCAL_SELECTION_BINDING_PROPERTY] = localBinding;
         } else {
-          o.properties[SELECTION_MIRROR_PROPERTY] = structuredCloneCompat(
-            this.properties?.[SELECTION_MIRROR_PROPERTY],
-          );
+          o.properties[SELECTION_MIRROR_PROPERTY] = {
+            version: 1,
+            character_id: selection.characterId || "default_character",
+            prompt_id: selection.promptId || "default_prompt",
+          };
         }
         delete o.properties.dora_state_manager;
         delete o.properties.dora_state_manager_backup_node_uid;
