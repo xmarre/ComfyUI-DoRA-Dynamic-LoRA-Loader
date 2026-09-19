@@ -872,6 +872,49 @@ test("the installed onSerialize hook scrubs private widget and property payloads
 });
 
 
+test("onSerialize never replaces an authoritative workflow selection with transient default widgets", async () => {
+  const helpers = await loadStateManagerHelpers();
+  class StateManagerNode {
+    onSerialize(output) {
+      output.widgets_values = this.widgets.map((widget) => widget.value);
+      output.widgets_values_named = Object.fromEntries(this.widgets.map((widget) => [widget.name, widget.value]));
+      output.properties = { ...this.properties };
+    }
+  }
+  StateManagerNode.comfyClass = "State Manager";
+  await helpers.capturedExtension.beforeRegisterNodeDef(StateManagerNode, {
+    name: "State Manager",
+    input: { required: {} },
+  });
+
+  const node = new StateManagerNode();
+  node.properties = {};
+  node.widgets = [
+    { name: "state_json", value: helpers.serializeBinding() },
+    { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+    { name: "selected_character_id", value: "default_character" },
+    { name: "selected_prompt_id", value: "default_prompt" },
+  ];
+  node.__dsm = { state: helpers.defaultState(), uiState: {} };
+  helpers.rememberAuthoritativeSelection(node, "character-a", "prompt-a");
+
+  const output = {};
+  node.onSerialize(output);
+
+  assert.equal(node.widgets[2].value, "default_character");
+  assert.equal(node.widgets[3].value, "default_prompt");
+  assert.equal(output.widgets_values[2], "character-a");
+  assert.equal(output.widgets_values[3], "prompt-a");
+  assert.equal(output.widgets_values_named.selected_character_id, "character-a");
+  assert.equal(output.widgets_values_named.selected_prompt_id, "prompt-a");
+  assert.deepEqual(output.properties.dora_state_manager_selection_v1, {
+    version: 1,
+    character_id: "character-a",
+    prompt_id: "prompt-a",
+  });
+});
+
+
 test("failed legacy migration remains serialized for a lossless retry", async () => {
   const helpers = await loadStateManagerHelpers();
   class StateManagerNode {
