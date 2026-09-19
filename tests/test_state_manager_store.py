@@ -558,6 +558,8 @@ def test_text_only_mutation_repairs_descriptor_bearing_v1_container(store):
     backup = json.loads(backups[0].read_text(encoding="utf-8"))
     assert backup["version"] == 1
     assert backup["revision"] == 7
+    assert backup["characters"][0]["prompts"][0]["text_boxes"][0]["text"] == "private positive prompt"
+    assert backup["characters"][0]["prompts"][0]["positive"] == "private positive prompt"
     assert backup["characters"][0]["prompts"][0]["text_boxes"][0]["prompt_document"] == character["prompts"][0]["text_boxes"][0]["prompt_document"]
 
 
