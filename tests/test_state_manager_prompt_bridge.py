@@ -145,7 +145,7 @@ def test_state_manager_text_ownership_requires_exact_state_control_output(
         ordering_verified=True,
     )
 
-    assert payload["prompt"]["250"]["inputs"]["text"] == "stale text"
+    assert payload["prompt"]["250"]["inputs"]["text"] == "stale text-box value"
     assert payload["prompt"]["251"]["inputs"]["wildcard_text"] == ["250", 0]
     assert payload["prompt"]["251"]["inputs"]["populated_text"] == "stale populated"
     assert payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"] == ""
