@@ -625,6 +625,14 @@ class StateLibraryStore:
                     "Selected prompt preset is not available locally for this character. Select or create a prompt."
                 )
 
+            # Repair any descriptor-bearing v1 container before mutating its
+            # in-memory document. The backup must be the exact pre-write v1 bytes,
+            # not a copy containing the new text.
+            self._promote_v2_for_prompt_documents_unlocked(
+                document,
+                document["characters"],
+            )
+
             boxes = prompt.get("text_boxes")
             if not isinstance(boxes, list):
                 boxes = []
@@ -656,14 +664,6 @@ class StateLibraryStore:
                 prompt["positive"] = value
             elif role == "negative" and slot == "default":
                 prompt["negative"] = value
-
-            # If an unreleased/partial v2 client already left descriptors in a
-            # v1 container, any subsequent mutation repairs the container before
-            # writing it again and preserves a recoverable v1 backup.
-            self._promote_v2_for_prompt_documents_unlocked(
-                document,
-                document["characters"],
-            )
 
             # Re-run the normal schema normalizer so mirrors, IDs and validation
             # stay identical to every other persistent-library write path.
