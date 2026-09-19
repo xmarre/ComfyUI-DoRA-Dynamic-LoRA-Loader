@@ -658,6 +658,9 @@ class StateLibraryStore:
             if prompt is None:
                 raise StatePresetNotFound("Selected prompt preset is not available locally for this character. Select or create a prompt.")
 
+            migrating = int(document.get("version", self.LEGACY_VERSION)) == self.LEGACY_VERSION
+            backup = self._backup_v1_unlocked(document) if migrating else None
+
             boxes = prompt.get("text_boxes")
             if not isinstance(boxes, list):
                 boxes = []
@@ -685,8 +688,6 @@ class StateLibraryStore:
             elif role == "negative" and slot == "default":
                 prompt["negative"] = value
 
-            migrating = int(document.get("version", self.LEGACY_VERSION)) == self.LEGACY_VERSION
-            backup = self._backup_v1_unlocked(document) if migrating else None
             document["version"] = self.VERSION
             document["characters"] = self._normalize_characters(document["characters"], require_uuids=True)
             document["revision"] += 1
