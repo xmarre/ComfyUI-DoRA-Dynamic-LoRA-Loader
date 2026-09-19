@@ -1,5 +1,6 @@
 import logging
 import json
+import hashlib
 import math
 import random
 import os
@@ -18,8 +19,10 @@ import torch
 
 try:
     from .state_manager_store import InvalidStateLibrary, StatePresetNotFound, get_state_manager_store, state_manager_library_path
+    from .state_manager_prompt_document import normalize_prompt_document
 except ImportError:  # pragma: no cover - direct module loading outside the package
     from state_manager_store import InvalidStateLibrary, StatePresetNotFound, get_state_manager_store, state_manager_library_path
+    from state_manager_prompt_document import normalize_prompt_document
 
 _LOG = logging.getLogger(__name__)
 
@@ -686,12 +689,23 @@ def _normalize_manager_text_box(raw: Any, index: int = 0) -> Optional[Dict[str, 
     src = raw if isinstance(raw, dict) else {"text": raw}
     role = _normalize_manager_text_role(src.get("role", src.get("kind", src.get("type", "generic"))))
     slot = _clean_text_slot(src.get("slot", src.get("id", src.get("name", ""))), f"text_{index + 1}" if role == "generic" else "default")
-    return {
+    result = {
         "role": role,
         "slot": slot,
         "label": str(src.get("label", src.get("name", f"{role} {slot}")) or f"{role} {slot}").strip() or f"{role} {slot}",
         "text": str(src.get("text", src.get("value", src.get("prompt", ""))) or ""),
     }
+    if "prompt_document" in src:
+        try:
+            result["prompt_document"] = normalize_prompt_document(
+                src.get("prompt_document"),
+                preserve_future=True,
+            )
+        except ValueError:
+            # Malformed descriptors are not allowed to poison runtime state, but
+            # future-version objects are preserved losslessly by the helper.
+            pass
+    return result
 
 
 def _normalize_manager_text_boxes(prompt: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1166,12 +1180,12 @@ def _state_manager_is_default_legacy_state(state: Dict[str, Any]) -> bool:
     return _normalize_state_manager_state(state) == _normalize_state_manager_state(_state_manager_default_state())
 
 
-def _resolve_state_manager_selection(
+def _resolve_state_manager_selection_with_revision(
     state_json: Any,
     selected_character_id: Any,
     selected_prompt_id: Any,
     library_user_id: Any = "default",
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[Dict[str, Any], Dict[str, Any], int]:
     character_id = str(selected_character_id or "").strip()
     prompt_id = str(selected_prompt_id or "").strip()
     legacy = _state_manager_legacy_state(state_json)
@@ -1189,7 +1203,45 @@ def _resolve_state_manager_selection(
     elif legacy is not None:
         character_id = character_id or "default_character"
         prompt_id = prompt_id or "default_prompt"
-    return store.resolve(character_id, prompt_id)
+    return store.resolve_with_revision(character_id, prompt_id)
+
+
+def _resolve_state_manager_selection(
+    state_json: Any,
+    selected_character_id: Any,
+    selected_prompt_id: Any,
+    library_user_id: Any = "default",
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    character, prompt, _revision = _resolve_state_manager_selection_with_revision(
+        state_json,
+        selected_character_id,
+        selected_prompt_id,
+        library_user_id,
+    )
+    return character, prompt
+
+
+def _resolve_dora_state_payload_snapshot(
+    state_json: Any,
+    selected_character_id: Any,
+    selected_prompt_id: Any,
+    library_user_id: Any = "default",
+) -> Dict[str, Any]:
+    character, prompt, revision = _resolve_state_manager_selection_with_revision(
+        state_json,
+        selected_character_id,
+        selected_prompt_id,
+        library_user_id,
+    )
+    state = {"version": _DORA_STATE_MANAGER_SCHEMA_VERSION, "characters": [character]}
+    payload = _resolve_dora_state_payload_from_state(state, character.get("id"), prompt.get("id"))
+    return {
+        "version": 1,
+        "library_revision": int(revision),
+        "character_id": str(character.get("id", "")),
+        "prompt_id": str(prompt.get("id", "")),
+        "payload": payload,
+    }
 
 
 def _resolve_dora_state_payload(
@@ -1198,14 +1250,12 @@ def _resolve_dora_state_payload(
     selected_prompt_id: Any,
     library_user_id: Any = "default",
 ) -> Dict[str, Any]:
-    character, prompt = _resolve_state_manager_selection(
+    return _resolve_dora_state_payload_snapshot(
         state_json,
         selected_character_id,
         selected_prompt_id,
         library_user_id,
-    )
-    state = {"version": _DORA_STATE_MANAGER_SCHEMA_VERSION, "characters": [character]}
-    return _resolve_dora_state_payload_from_state(state, character.get("id"), prompt.get("id"))
+    )["payload"]
 
 
 def _build_state_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1218,6 +1268,33 @@ def _build_state_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "prompt": payload.get("prompt") if isinstance(payload.get("prompt"), dict) else {},
         "settings": settings,
         "seed": seed,
+    }
+
+
+_QUEUE_SNAPSHOT_KEY = "__dsm_queue_snapshot_v1"
+
+
+def _queued_state_manager_snapshot(ui_state_json: Any) -> Optional[Dict[str, Any]]:
+    parsed = _safe_json_load(ui_state_json, {})
+    if not isinstance(parsed, dict):
+        return None
+    snapshot = parsed.get(_QUEUE_SNAPSHOT_KEY)
+    if not isinstance(snapshot, dict) or snapshot.get("version") != 1:
+        return None
+    if not isinstance(snapshot.get("payload"), dict):
+        return None
+    try:
+        revision = int(snapshot.get("library_revision"))
+    except (TypeError, ValueError):
+        return None
+    if revision < 0:
+        return None
+    return {
+        "version": 1,
+        "library_revision": revision,
+        "character_id": str(snapshot.get("character_id", "") or ""),
+        "prompt_id": str(snapshot.get("prompt_id", "") or ""),
+        "payload": snapshot["payload"],
     }
 
 
@@ -4748,18 +4825,28 @@ class StateManager:
             "selected_prompt_id": selected_prompt_id,
         }
         library_user_id = _queued_library_user_from_ui_state(ui_state_json)
+        queued_snapshot = _queued_state_manager_snapshot(ui_state_json)
         try:
-            resolved = _resolve_dora_state_payload(
-                state_json,
-                selected_character_id,
-                selected_prompt_id,
-                library_user_id,
-            )
+            if (
+                queued_snapshot is not None
+                and queued_snapshot["character_id"] == str(selected_character_id or "")
+                and queued_snapshot["prompt_id"] == str(selected_prompt_id or "")
+            ):
+                resolved = dict(queued_snapshot["payload"])
+                payload["library_revision"] = queued_snapshot["library_revision"]
+                payload["queue_snapshot"] = True
+            else:
+                resolved_snapshot = _resolve_dora_state_payload_snapshot(
+                    state_json,
+                    selected_character_id,
+                    selected_prompt_id,
+                    library_user_id,
+                )
+                resolved = dict(resolved_snapshot["payload"])
+                payload["library_revision"] = resolved_snapshot["library_revision"]
             queued_seed = _queued_runtime_seed_from_ui_state(ui_state_json)
             if queued_seed is not None:
-                resolved = dict(resolved)
                 resolved["settings"] = _settings_with_runtime_seed(resolved.get("settings", {}), queued_seed)
-            payload["library_revision"] = _get_state_manager_store(library_user_id).revision()
         except (InvalidStateLibrary, StatePresetNotFound, OSError) as exc:
             resolved = {}
             payload["library_error"] = type(exc).__name__
@@ -4776,13 +4863,19 @@ class StateManager:
         selected_prompt_id: Any = "",
     ):
         library_user_id = _queued_library_user_from_ui_state(ui_state_json)
+        queued_snapshot = _queued_state_manager_snapshot(ui_state_json)
         try:
-            _resolve_state_manager_selection(
-                state_json,
-                selected_character_id,
-                selected_prompt_id,
-                library_user_id,
-            )
+            if not (
+                queued_snapshot is not None
+                and queued_snapshot["character_id"] == str(selected_character_id or "")
+                and queued_snapshot["prompt_id"] == str(selected_prompt_id or "")
+            ):
+                _resolve_state_manager_selection(
+                    state_json,
+                    selected_character_id,
+                    selected_prompt_id,
+                    library_user_id,
+                )
         except StatePresetNotFound as exc:
             return f"State Manager: {exc}"
         except Exception as exc:
@@ -4797,14 +4890,24 @@ class StateManager:
         selected_prompt_id: Any = "",
     ):
         library_user_id = _queued_library_user_from_ui_state(ui_state_json)
-        character, prompt = _resolve_state_manager_selection(
-            state_json,
-            selected_character_id,
-            selected_prompt_id,
-            library_user_id,
-        )
-        state = {"version": _DORA_STATE_MANAGER_SCHEMA_VERSION, "characters": [character]}
-        payload = _resolve_dora_state_payload_from_state(state, character.get("id"), prompt.get("id"))
+        queued_snapshot = _queued_state_manager_snapshot(ui_state_json)
+        if (
+            queued_snapshot is not None
+            and queued_snapshot["character_id"] == str(selected_character_id or "")
+            and queued_snapshot["prompt_id"] == str(selected_prompt_id or "")
+        ):
+            payload = dict(queued_snapshot["payload"])
+            character = payload.get("character") if isinstance(payload.get("character"), dict) else {}
+            prompt = payload.get("prompt") if isinstance(payload.get("prompt"), dict) else {}
+        else:
+            character, prompt = _resolve_state_manager_selection(
+                state_json,
+                selected_character_id,
+                selected_prompt_id,
+                library_user_id,
+            )
+            state = {"version": _DORA_STATE_MANAGER_SCHEMA_VERSION, "characters": [character]}
+            payload = _resolve_dora_state_payload_from_state(state, character.get("id"), prompt.get("id"))
         queued_seed = _queued_runtime_seed_from_ui_state(ui_state_json)
         if queued_seed is not None:
             payload = dict(payload)
@@ -4880,9 +4983,20 @@ class StateManagerTextBox:
     def emit(self, role: Any, text: Any = "", state_slot: Any = "default", state_control: Any = None):
         state_payload = _normalize_runtime_dora_state_payload(state_control)
         controlled_text = _state_payload_text_for_box(state_payload, role, state_slot)
-        if controlled_text is not None:
-            return (controlled_text,)
-        return (str(text or ""),)
+        source = "controlled" if controlled_text is not None else "local"
+        effective_text = str(controlled_text if controlled_text is not None else (text or ""))
+        digest = hashlib.sha256(effective_text.encode("utf-8")).hexdigest()
+        timeline = bool(re.search(r"(?m)^\s*\[[0-9]+(?:\.[0-9]+)?-[0-9]+(?:\.[0-9]+)?s\]\s*$", effective_text))
+        _LOG.info(
+            "[State Manager] text-box runtime receipt role=%r slot=%r source=%s chars=%d timeline=%s digest=%s",
+            str(role),
+            str(state_slot),
+            source,
+            len(effective_text),
+            timeline,
+            digest,
+        )
+        return (effective_text,)
 
 
 class StateManagerSeed:

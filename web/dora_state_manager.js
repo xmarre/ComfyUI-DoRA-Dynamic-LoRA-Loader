@@ -77,6 +77,17 @@ const BINDING_KIND = "dora_state_manager_binding";
 const BINDING_VERSION = 1;
 const QUEUE_SESSION_MAX_AGE_MS = 30000;
 
+const PROMPT_DOCUMENT_SCHEMA_VERSION = 1;
+const PROMPT_DOCUMENT_FORMATS = ["inherit", "fixed", "list", "timeline"];
+const PROMPT_DOCUMENT_ROUTINGS = ["logical_chunks", "physical_timeline"];
+
+const promptTransportProviderClient = {
+  loaded: false,
+  loading: null,
+  provider: null,
+  orderingContract: "",
+};
+
 const dsmQueueSession = {
   active: false,
   total: 1,
@@ -92,6 +103,7 @@ const stateLibraryClient = {
   canonical: "[]",
   pending: [],
   writing: false,
+  writePromise: null,
   blocked: false,
   lastAppliedNode: null,
   nodes: new Set(),
@@ -166,6 +178,356 @@ function normalizeTextSlot(value, fallback = "default") {
   return cleanId(value, fallback);
 }
 
+function normalizePromptDocument(raw, { preserveFuture = true } = {}) {
+  if (raw == null) return null;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("prompt_document must be an object");
+  }
+  const schemaVersion = raw.schema_version;
+  if (typeof schemaVersion !== "number" || !Number.isInteger(schemaVersion) || schemaVersion < 1) {
+    throw new Error("prompt_document schema_version is invalid");
+  }
+  if (schemaVersion !== PROMPT_DOCUMENT_SCHEMA_VERSION) {
+    if (preserveFuture) return structuredCloneCompat(raw);
+    throw new Error(`Unsupported prompt_document schema ${schemaVersion}.`);
+  }
+
+  const format = String(raw.format ?? "").trim().toLowerCase();
+  if (!PROMPT_DOCUMENT_FORMATS.includes(format)) {
+    throw new Error("prompt_document format is invalid");
+  }
+  const out = { schema_version: PROMPT_DOCUMENT_SCHEMA_VERSION, format };
+  if (format !== "timeline") {
+    if (raw.routing != null || raw.geometry != null) {
+      throw new Error("Non-Timeline prompt documents cannot carry routing or geometry.");
+    }
+    return out;
+  }
+
+  const routing = String(raw.routing ?? "").trim();
+  if (!PROMPT_DOCUMENT_ROUTINGS.includes(routing)) {
+    throw new Error("Timeline prompt_document routing is invalid.");
+  }
+  out.routing = routing;
+  if (routing === "physical_timeline") {
+    if (raw.geometry != null) {
+      throw new Error("Physical Timeline prompt documents cannot carry logical geometry.");
+    }
+    return out;
+  }
+
+  const geometry = raw.geometry;
+  if (!geometry || typeof geometry !== "object" || Array.isArray(geometry)) {
+    throw new Error("Logical Timeline prompt documents require geometry.");
+  }
+  const chunks = geometry.chunks;
+  if (typeof chunks !== "number" || !Number.isInteger(chunks) || chunks < 1 || chunks > 16) {
+    throw new Error("Logical Timeline chunks must be in 1..16.");
+  }
+  if (typeof geometry.chunk_seconds !== "string") {
+    throw new Error("chunk_seconds must be an unsigned decimal string.");
+  }
+  const secondsText = geometry.chunk_seconds.trim();
+  if (!/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(secondsText)) {
+    throw new Error("chunk_seconds must be an unsigned decimal string.");
+  }
+  const seconds = Number(secondsText);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    throw new Error("chunk_seconds must be positive.");
+  }
+  const normalizedSeconds = secondsText.includes(".")
+    ? secondsText.replace(/0+$/, "").replace(/\.$/, "")
+    : secondsText;
+  out.geometry = { chunks, chunk_seconds: normalizedSeconds };
+  return out;
+}
+
+function inheritedPromptDocument() {
+  return { schema_version: PROMPT_DOCUMENT_SCHEMA_VERSION, format: "inherit" };
+}
+
+async function loadPromptTransportProvider() {
+  if (promptTransportProviderClient.loaded) return promptTransportProviderClient.provider;
+  if (promptTransportProviderClient.loading) return promptTransportProviderClient.loading;
+  promptTransportProviderClient.loading = (async () => {
+    try {
+      const payload = await stateLibraryRequest("/prompt-document-provider");
+      promptTransportProviderClient.provider =
+        payload?.provider && typeof payload.provider === "object"
+          ? structuredCloneCompat(payload.provider)
+          : null;
+      promptTransportProviderClient.orderingContract = String(payload?.ordering_contract || "");
+    } catch {
+      promptTransportProviderClient.provider = null;
+      promptTransportProviderClient.orderingContract = "";
+    } finally {
+      promptTransportProviderClient.loaded = true;
+      promptTransportProviderClient.loading = null;
+      for (const node of stateLibraryClient.nodes) scheduleRender(node);
+    }
+    return promptTransportProviderClient.provider;
+  })();
+  return promptTransportProviderClient.loading;
+}
+
+async function previewPromptTransportText(text) {
+  return stateLibraryRequest("/prompt-document-provider/inspect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: String(text ?? "") }),
+  });
+}
+
+async function requestLogicalTimelineSkeleton(chunks, chunkSeconds) {
+  return stateLibraryRequest("/prompt-document-provider/logical-skeleton", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chunks,
+      chunk_seconds: chunkSeconds,
+    }),
+  });
+}
+
+
+function promptDocumentProviderLimits() {
+  const provider = promptTransportProviderClient.provider;
+  const chunks = provider?.chunks;
+  const seconds = provider?.chunk_seconds;
+  return {
+    chunkMin: Number.isFinite(Number(chunks?.min)) ? Number(chunks.min) : null,
+    chunkMax: Number.isFinite(Number(chunks?.max)) ? Number(chunks.max) : null,
+    secondsMin: Number.isFinite(Number(seconds?.min)) ? Number(seconds.min) : null,
+    secondsMax: Number.isFinite(Number(seconds?.max)) ? Number(seconds.max) : null,
+  };
+}
+
+
+function promptDocumentEditor(node, box) {
+  const panel = document.createElement("div");
+  panel.className = "dsm-stack-box";
+
+  let current = null;
+  let futureSchema = false;
+  let malformedMetadata = false;
+  if (Object.prototype.hasOwnProperty.call(box, "prompt_document")) {
+    try {
+      current = normalizePromptDocument(box.prompt_document, { preserveFuture: true });
+      futureSchema = current?.schema_version !== PROMPT_DOCUMENT_SCHEMA_VERSION;
+    } catch {
+      current = structuredCloneCompat(box.prompt_document);
+      malformedMetadata = true;
+    }
+  }
+  const status = document.createElement("div");
+  status.className = "dsm-muted";
+
+  if (futureSchema || malformedMetadata) {
+    status.textContent = malformedMetadata
+      ? "Prompt interpretation metadata is malformed for the supported schema; it is preserved unchanged until explicitly replaced."
+      : `Prompt interpretation metadata uses unsupported schema ${String(current?.schema_version ?? "unknown")}; it is preserved unchanged.`;
+    panel.append(
+      status,
+      makeButton("Replace metadata with Inherit", async () => {
+        try {
+          await updateManagedPromptDocument(node, null, {
+            text: box.text,
+            prompt_document: inheritedPromptDocument(),
+            role: box.role,
+            slot: box.slot,
+            label: box.label,
+          });
+        } catch (err) {
+          setStatus(node, `Prompt interpretation update failed: ${err?.message || err}`);
+        }
+      }),
+    );
+    return panel;
+  }
+
+  const descriptor = current || inheritedPromptDocument();
+  status.textContent = current
+    ? "Saved prompt interpretation metadata."
+    : "No prompt interpretation metadata is saved; runtime behavior inherits the consumer's existing parsing.";
+
+  const format = makeSelect(
+    [
+      { value: "inherit", label: "Legacy / consumer" },
+      { value: "fixed", label: "Fixed" },
+      { value: "list", label: "List" },
+      { value: "timeline", label: "Timeline" },
+    ],
+    descriptor.format,
+    () => {},
+  );
+  const routing = makeSelect(
+    [
+      { value: "", label: "Choose routing…" },
+      { value: "logical_chunks", label: "Logical chunks" },
+      { value: "physical_timeline", label: "Physical timeline" },
+    ],
+    descriptor.routing || "",
+    () => {},
+  );
+  const chunks = makeInput(
+    descriptor.geometry?.chunks ?? "",
+    () => {},
+    { type: "number", step: "1", min: "1", max: "16" },
+  );
+  const seconds = makeInput(
+    descriptor.geometry?.chunk_seconds ?? "",
+    () => {},
+    { type: "text", inputMode: "decimal", placeholder: "e.g. 7" },
+  );
+
+  const provider = promptTransportProviderClient.provider;
+  const limits = promptDocumentProviderLimits();
+  const providerNote = document.createElement("div");
+  providerNote.className = "dsm-muted";
+  const previewNote = document.createElement("div");
+  previewNote.className = "dsm-muted";
+  const orderingVerified = promptTransportProviderClient.orderingContract === "ordered-impact-v1";
+  providerNote.textContent = provider
+    ? (
+        orderingVerified
+          ? `Detected Continuum provider v${provider.provider_version}; logical chunks ${limits.chunkMin ?? "?"}–${limits.chunkMax ?? "?"}, chunk duration ${limits.secondsMin ?? "?"}–${limits.secondsMax ?? "?"}s. Ordered Impact transport was verified when provider status was loaded; queue-time ordering is revalidated for every request.`
+          : `Detected Continuum provider v${provider.provider_version}, but ordered Impact transport was not verified when provider status was loaded. Interpretation metadata can be saved; queue-time verification remains authoritative.`
+      )
+    : "No compatible Continuum prompt-transport provider is currently advertised; metadata can be saved, but managed sequence verification remains unavailable until a compatible consumer is installed.";
+
+  const preview = makeButton("Preview parsing", async () => {
+    try {
+      const result = await previewPromptTransportText(box.text);
+      if (!result?.available) {
+        previewNote.textContent = "No compatible Continuum prompt parser is currently available.";
+      } else if (format.value === "timeline") {
+        if (result.valid) {
+          const count = Array.isArray(result.structure?.sections)
+            ? result.structure.sections.length
+            : 0;
+          previewNote.textContent =
+            `Continuum parser: valid ${result.classification || "timeline"} structure with ${count} outer section${count === 1 ? "" : "s"}.`;
+        } else {
+          previewNote.textContent =
+            `Continuum parser: Timeline structure is not valid (${result.error || "unrecognized structure"}). Saving the text remains allowed; runtime will use the existing diagnostic fallback policy.`;
+        }
+      } else {
+        previewNote.textContent =
+          `Continuum parser classifies the current text as ${result.classification || "unknown"}; saved ${format.value} intent remains authoritative.`;
+      }
+    } catch (err) {
+      previewNote.textContent = `Prompt preview failed: ${err?.message || err}`;
+    }
+  });
+
+  const insertSkeleton = makeButton("Insert empty Timeline skeleton", async () => {
+    try {
+      if (format.value !== "timeline" || routing.value !== "logical_chunks") {
+        throw new Error("Choose Timeline with Logical chunks before inserting a skeleton.");
+      }
+      if (String(box.text ?? "").trim()) {
+        throw new Error("Skeleton insertion requires an empty text box and will not overwrite existing prompt text.");
+      }
+      const next = normalizePromptDocument({
+        schema_version: PROMPT_DOCUMENT_SCHEMA_VERSION,
+        format: "timeline",
+        routing: "logical_chunks",
+        geometry: {
+          chunks: Number(chunks.value),
+          chunk_seconds: String(seconds.value || "").trim(),
+        },
+      }, { preserveFuture: false });
+      const result = await requestLogicalTimelineSkeleton(
+        next.geometry.chunks,
+        next.geometry.chunk_seconds,
+      );
+      if (!result?.available) {
+        throw new Error("No compatible Continuum prompt provider is currently available.");
+      }
+      if (result.supported !== true) {
+        throw new Error("The installed Continuum provider does not expose logical Timeline skeleton rendering.");
+      }
+      if (result.error) throw new Error(result.error);
+      if (typeof result.text !== "string" || !result.text) {
+        throw new Error("Continuum returned an invalid logical Timeline skeleton.");
+      }
+      await updateManagedPromptDocument(node, null, {
+        text: result.text,
+        prompt_document: next,
+        role: box.role,
+        slot: box.slot,
+        label: box.label,
+      });
+    } catch (err) {
+      setStatus(node, `Timeline skeleton insertion failed: ${err?.message || err}`);
+    }
+  });
+
+  const save = makeButton("Save interpretation", async () => {
+    try {
+      let next;
+      if (format.value !== "timeline") {
+        next = normalizePromptDocument({
+          schema_version: PROMPT_DOCUMENT_SCHEMA_VERSION,
+          format: format.value,
+        }, { preserveFuture: false });
+      } else {
+        if (!routing.value) throw new Error("Choose Timeline routing before saving.");
+        const raw = {
+          schema_version: PROMPT_DOCUMENT_SCHEMA_VERSION,
+          format: "timeline",
+          routing: routing.value,
+        };
+        if (routing.value === "logical_chunks") {
+          raw.geometry = {
+            chunks: Number(chunks.value),
+            chunk_seconds: String(seconds.value || "").trim(),
+          };
+        }
+        next = normalizePromptDocument(raw, { preserveFuture: false });
+        if (routing.value === "logical_chunks" && provider) {
+          const chunkValue = Number(next.geometry.chunks);
+          const secondsValue = Number(next.geometry.chunk_seconds);
+          if (
+            (limits.chunkMin != null && chunkValue < limits.chunkMin)
+            || (limits.chunkMax != null && chunkValue > limits.chunkMax)
+            || (limits.secondsMin != null && secondsValue < limits.secondsMin)
+            || (limits.secondsMax != null && secondsValue > limits.secondsMax)
+          ) {
+            throw new Error(
+              `Logical Timeline geometry is outside the installed consumer limits (${limits.chunkMin}–${limits.chunkMax} chunks, ${limits.secondsMin}–${limits.secondsMax}s).`,
+            );
+          }
+        }
+      }
+      await updateManagedPromptDocument(node, null, {
+        text: box.text,
+        prompt_document: next,
+        role: box.role,
+        slot: box.slot,
+        label: box.label,
+      });
+    } catch (err) {
+      setStatus(node, `Prompt interpretation update failed: ${err?.message || err}`);
+    }
+  });
+
+  panel.append(
+    status,
+    labelledControl("Interpretation", format),
+    labelledControl("Timeline routing", routing),
+    labelledControl("Logical chunks", chunks),
+    labelledControl("Chunk seconds", seconds),
+    providerNote,
+    previewNote,
+    preview,
+    insertSkeleton,
+    save,
+  );
+  return panel;
+}
+
+
 function defaultTextBox(role = "positive", slot = "default", text = "") {
   const normalizedRole = normalizeTextRole(role, "generic");
   const normalizedSlot = normalizeTextSlot(slot, "default");
@@ -187,12 +549,21 @@ function normalizeTextBox(raw, index = 0) {
   const src = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : { text: raw };
   const role = normalizeTextRole(src.role ?? src.kind ?? src.type, "generic");
   const slot = normalizeTextSlot(src.slot ?? src.id ?? src.name, role === "generic" ? `text_${index + 1}` : "default");
-  return {
+  const result = {
     role,
     slot,
     label: String(src.label ?? src.name ?? `${role} ${slot}`).trim() || `${role} ${slot}`,
     text: String(src.text ?? src.value ?? src.prompt ?? ""),
   };
+  if (Object.prototype.hasOwnProperty.call(src, "prompt_document")) {
+    try {
+      result.prompt_document = normalizePromptDocument(src.prompt_document, { preserveFuture: true });
+    } catch {
+      // Never silently erase metadata from a future/stale client snapshot.
+      result.prompt_document = structuredCloneCompat(src.prompt_document);
+    }
+  }
+  return result;
 }
 
 function rawTextBoxesFromPrompt(prompt) {
@@ -932,49 +1303,134 @@ function blockLibraryWrites(status) {
 }
 
 async function writePendingLibrary() {
-  if (stateLibraryClient.writing || stateLibraryClient.blocked) return;
-  stateLibraryClient.writing = true;
-  try {
-    while (stateLibraryClient.pending.length && !stateLibraryClient.blocked) {
-      const pending = stateLibraryClient.pending.shift();
-      const merged = mergeScheduledLibraryUpdate(
-        pending.baseCharacters,
-        pending.desiredCharacters,
-        stateLibraryClient.state.characters,
-        { allowOverwrite: pending.node === stateLibraryClient.lastAppliedNode },
-      );
-      if (merged.conflict) {
-        blockLibraryWrites("Two local State Manager instances edited the same character concurrently. Reload the library; no conflicting write was sent.");
-        break;
-      }
-      if (canonicalJson(merged.characters) === stateLibraryClient.canonical) {
-        stateLibraryClient.lastAppliedNode = pending.node;
-        continue;
-      }
-      try {
-        const snapshot = await stateLibraryRequest("", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            expected_revision: stateLibraryClient.revision,
-            characters: merged.characters,
-          }),
-        });
-        installLibrarySnapshot(snapshot);
-        stateLibraryClient.lastAppliedNode = pending.node;
-        refreshAllNodesFromLibrary({ syncLoaders: true, skipLoaderSyncNode: pending.node });
-      } catch (error) {
-        if (error.status === 409) {
-          blockLibraryWrites("Library changed in another tab or State Manager. Reload the library before editing again; the stale write was rejected.");
+  if (stateLibraryClient.writePromise) return stateLibraryClient.writePromise;
+
+  const run = (async () => {
+    if (stateLibraryClient.blocked) return;
+    stateLibraryClient.writing = true;
+    try {
+      while (stateLibraryClient.pending.length && !stateLibraryClient.blocked) {
+        const pending = stateLibraryClient.pending.shift();
+        const merged = mergeScheduledLibraryUpdate(
+          pending.baseCharacters,
+          pending.desiredCharacters,
+          stateLibraryClient.state.characters,
+          { allowOverwrite: pending.node === stateLibraryClient.lastAppliedNode },
+        );
+        if (merged.conflict) {
+          blockLibraryWrites("Two local State Manager instances edited the same character concurrently. Reload the library; no conflicting write was sent.");
           break;
         }
-        blockLibraryWrites(`Library save failed: ${error?.message || error}`);
-        break;
+        if (canonicalJson(merged.characters) === stateLibraryClient.canonical) {
+          stateLibraryClient.lastAppliedNode = pending.node;
+          continue;
+        }
+        try {
+          const snapshot = await stateLibraryRequest("", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              expected_revision: stateLibraryClient.revision,
+              contract_version: 5,
+              capabilities: ["prompt_document_v1"],
+              characters: merged.characters,
+            }),
+          });
+          installLibrarySnapshot(snapshot);
+          stateLibraryClient.lastAppliedNode = pending.node;
+          refreshAllNodesFromLibrary({ syncLoaders: true, skipLoaderSyncNode: pending.node });
+        } catch (error) {
+          if (error.status === 409) {
+            blockLibraryWrites("Library changed in another tab or State Manager. Reload the library before editing again; the stale write was rejected.");
+            break;
+          }
+          blockLibraryWrites(`Library save failed: ${error?.message || error}`);
+          break;
+        }
+      }
+    } finally {
+      stateLibraryClient.writing = false;
+    }
+  })();
+
+  stateLibraryClient.writePromise = run;
+  try {
+    return await run;
+  } finally {
+    if (stateLibraryClient.writePromise === run) stateLibraryClient.writePromise = null;
+  }
+}
+
+function stateManagerQueueBlocked(message, code = "DSM_STATE_MANAGER_QUEUE_BLOCKED") {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+async function flushPendingLibraryWrites() {
+  while (stateLibraryClient.writePromise || stateLibraryClient.pending.length) {
+    const active = stateLibraryClient.writePromise;
+    if (active) await active;
+    else await writePendingLibrary();
+    if (stateLibraryClient.blocked) {
+      throw stateManagerQueueBlocked(
+        "State Manager queue blocked because a persistent library write failed. Reload the State Manager library before queueing.",
+        "DSM_LIBRARY_WRITE_BLOCKED",
+      );
+    }
+  }
+  if (stateLibraryClient.blocked) {
+    throw stateManagerQueueBlocked(
+      "State Manager queue blocked because persistent library writes are disabled after an earlier failure. Reload the State Manager library before queueing.",
+      "DSM_LIBRARY_WRITE_BLOCKED",
+    );
+  }
+}
+
+function validateManagedQueueTextState() {
+  const graphNodes = app?.graph?._nodes || [];
+  for (const managerNode of graphNodes) {
+    if (!isStateManagerNode(managerNode)) continue;
+    const widgets = getWidgets(managerNode);
+    const { state } = getCurrentState(managerNode);
+    const character = selectedCharacter(
+      state,
+      String(widgetValue(widgets.characterWidget, "") || ""),
+    ) || state.characters?.[0];
+    const prompt = selectedPrompt(
+      character,
+      String(widgetValue(widgets.promptWidget, "") || ""),
+    ) || character?.prompts?.[0];
+    if (!prompt) continue;
+
+    const textNodes = getControlledNodes(managerNode).filter(isStateTextNode);
+    for (const [index, textNode] of textNodes.entries()) {
+      const role = getStateTextRole(textNode);
+      const slot = getStateTextSlot(
+        textNode,
+        role,
+        `${role}_${textNode?.id ?? index + 1}`,
+      );
+      const saved = findPromptTextBox(prompt, role, slot, { allowRoleFallback: false })
+        || findPromptTextBox(prompt, role, slot, { allowRoleFallback: true });
+      if (!saved) continue;
+
+      const persistentText = String(saved.text ?? "");
+      const localText = extractTextFromNode(textNode, role);
+      if (!persistentText && localText) {
+        throw stateManagerQueueBlocked(
+          `State Manager queue blocked: connected ${role}/${slot} Text Box contains unsaved text while the selected persistent preset is empty. Use Save connected (or a managed prompt write) and wait for it to complete before queueing.`,
+          "DSM_UNSAVED_MANAGED_TEXT",
+        );
       }
     }
-  } finally {
-    stateLibraryClient.writing = false;
   }
+}
+
+async function prepareStateManagerQueuePayload(promptPayload, queueIndex, total) {
+  await flushPendingLibraryWrites();
+  validateManagedQueueTextState();
+  return mutatePromptForStateManagers(promptPayload, queueIndex, total);
 }
 
 function scheduleLibraryPersist(node, state) {
@@ -1750,6 +2206,269 @@ function installLoaderStateSyncApi() {
   globalThis.__doraStateManagerSyncApi = {
     loaderStateChanged(loaderNode, details = {}) {
       return syncLoaderStateIntoConnectedManagers(loaderNode, details);
+    },
+  };
+}
+
+async function waitForStateManagerLibraryIdle(timeoutMs = 10000) {
+  const deadline = Date.now() + Math.max(100, Number(timeoutMs) || 10000);
+  while ((stateLibraryClient.writing || stateLibraryClient.pending.length) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  if (stateLibraryClient.writing || stateLibraryClient.pending.length) {
+    throw new Error("Timed out while saving the State Manager prompt.");
+  }
+  if (stateLibraryClient.blocked) {
+    throw new Error("State Manager library writes are blocked; reload the State Manager library before applying the prompt.");
+  }
+}
+
+async function updateManagedStateTextBox(managerNode, textNode, text, { persist = true, render = true } = {}) {
+  if (!isStateManagerNode(managerNode)) {
+    throw new Error("The connected state_control source is not a State Manager node.");
+  }
+  if (!isStateTextNode(textNode)) {
+    throw new Error("The managed Sequence Prompt source is not a State Manager Text Box.");
+  }
+  if (!getControlledNodes(managerNode).includes(textNode)) {
+    throw new Error("The State Manager does not own the connected Text Box through state_control.");
+  }
+
+  const role = getStateTextRole(textNode);
+  const slot = getStateTextSlot(textNode, role, "default");
+  const value = String(text ?? "");
+  const label = stateTextLabel(textNode, role, slot);
+
+  if (persist) {
+    // Drain ordinary State Manager edits first. External integrations then update
+    // exactly one persistent text box through the request-user-scoped backend
+    // store instead of replacing the whole library from browser state.
+    await waitForStateManagerLibraryIdle();
+
+    const current = getRenderableState(managerNode);
+    const nextState = structuredCloneCompat(current.state);
+    const { prompt } = ensureSelection(managerNode, nextState);
+    if (!prompt || prompt.__dsm_ephemeral) {
+      throw new Error("The selected State Manager prompt is not available locally.");
+    }
+
+    const widgets = getWidgets(managerNode);
+    const characterId = String(widgetValue(widgets.characterWidget, "") || "");
+    const promptId = String(widgetValue(widgets.promptWidget, "") || "");
+    const snapshot = await stateLibraryRequest(
+      `/characters/${encodeURIComponent(characterId)}/prompts/${encodeURIComponent(promptId)}/text-box`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          expected_revision: stateLibraryClient.revision,
+          role,
+          slot,
+          label,
+          text: value,
+        }),
+      },
+    );
+
+    if (!installLibrarySnapshot(snapshot)) {
+      throw new Error("State Manager rejected the managed prompt snapshot as stale.");
+    }
+    refreshNodeFromLibrary(managerNode, {
+      status: "Updated managed prompt text from an external integration.",
+    });
+
+    const persistedCharacter = (stateLibraryClient.state?.characters || []).find((item) => item?.id === characterId);
+    const persistedPrompt = persistedCharacter?.prompts?.find((item) => item?.id === promptId);
+    const persistedBox = persistedPrompt
+      ? findPromptTextBox(persistedPrompt, role, slot, { allowRoleFallback: false })
+      : null;
+    if (!persistedBox || String(persistedBox.text ?? "") !== value) {
+      throw new Error(
+        `State Manager prompt write did not persist the selected ${role}/${slot} text exactly; refusing to report success.`
+      );
+    }
+
+    applyTextToNode(textNode, value, role);
+    mirrorStateTextToDownstreamWidgets(textNode, value, role);
+    markDownstreamDirty(textNode);
+    if (render) scheduleRender(managerNode);
+
+    return {
+      status: "updated",
+      role,
+      slot,
+      character_id: characterId,
+      prompt_id: promptId,
+      persistent_verified: true,
+      library_revision: stateLibraryClient.revision,
+      contract_version: 4,
+      write_revision: "backend-write-v1",
+    };
+  }
+
+  const current = getRenderableState(managerNode);
+  const nextState = structuredCloneCompat(current.state);
+  const { prompt } = ensureSelection(managerNode, nextState);
+  if (!prompt || prompt.__dsm_ephemeral) {
+    throw new Error("The selected State Manager prompt is not available locally.");
+  }
+  setPromptTextBox(prompt, role, slot, value, label);
+  updateState(managerNode, nextState, current.uiState, {
+    status: "Updated managed prompt text from an external integration.",
+    persist: false,
+    render,
+  });
+  applyTextToNode(textNode, value, role);
+  mirrorStateTextToDownstreamWidgets(textNode, value, role);
+  markDownstreamDirty(textNode);
+
+  const widgets = getWidgets(managerNode);
+  return {
+    status: "updated",
+    role,
+    slot,
+    character_id: String(widgetValue(widgets.characterWidget, "") || ""),
+    prompt_id: String(widgetValue(widgets.promptWidget, "") || ""),
+    persistent_verified: false,
+  };
+}
+
+async function updateManagedPromptDocument(
+  managerNode,
+  textNode,
+  {
+    text,
+    prompt_document,
+    role: requestedRole = null,
+    slot: requestedSlot = null,
+    label: requestedLabel = "",
+  },
+  { render = true } = {},
+) {
+  if (!isStateManagerNode(managerNode)) {
+    throw new Error("The connected state_control source is not a State Manager node.");
+  }
+  if (textNode != null) {
+    if (!isStateTextNode(textNode)) {
+      throw new Error("The managed Sequence Prompt source is not a State Manager Text Box.");
+    }
+    if (!getControlledNodes(managerNode).includes(textNode)) {
+      throw new Error("The State Manager does not own the connected Text Box through state_control.");
+    }
+  }
+
+  const document = normalizePromptDocument(prompt_document, { preserveFuture: false });
+  if (!document) throw new Error("prompt_document is required.");
+  const role = textNode
+    ? getStateTextRole(textNode)
+    : normalizeTextRole(requestedRole, "generic");
+  const slot = textNode
+    ? getStateTextSlot(textNode, role, "default")
+    : normalizeTextSlot(requestedSlot, "default");
+  const value = String(text ?? "");
+
+  await waitForStateManagerLibraryIdle();
+  const current = getRenderableState(managerNode);
+  const nextState = structuredCloneCompat(current.state);
+  const { prompt } = ensureSelection(managerNode, nextState);
+  if (!prompt || prompt.__dsm_ephemeral) {
+    throw new Error("The selected State Manager prompt is not available locally.");
+  }
+
+  const resolvedRole = role || "generic";
+  const resolvedSlot = slot || "default";
+  const selectedBox = findPromptTextBox(
+    prompt,
+    resolvedRole,
+    resolvedSlot,
+    { allowRoleFallback: false },
+  );
+  const label = String(
+    requestedLabel
+    || selectedBox?.label
+    || (textNode ? stateTextLabel(textNode, resolvedRole, resolvedSlot) : `${resolvedRole} ${resolvedSlot}`)
+  );
+  const widgets = getWidgets(managerNode);
+  const characterId = String(widgetValue(widgets.characterWidget, "") || "");
+  const promptId = String(widgetValue(widgets.promptWidget, "") || "");
+
+  const receipt = await stateLibraryRequest(
+    `/characters/${encodeURIComponent(characterId)}/prompts/${encodeURIComponent(promptId)}/prompt-document`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        expected_revision: stateLibraryClient.revision,
+        role: resolvedRole,
+        slot: resolvedSlot,
+        label,
+        text: value,
+        prompt_document: document,
+      }),
+    },
+  );
+
+  if (
+    receipt?.persistent_verified !== true
+    || receipt?.contract_version !== 5
+    || receipt?.write_revision !== "backend-document-write-v1"
+    || canonicalJson(receipt?.prompt_document) !== canonicalJson(document)
+  ) {
+    throw new Error("State Manager did not return the exact v5 prompt-document persistence receipt.");
+  }
+  if (!installLibrarySnapshot(receipt?.snapshot)) {
+    throw new Error("State Manager rejected the managed prompt-document snapshot as stale.");
+  }
+
+  const persistedCharacter = (stateLibraryClient.state?.characters || []).find(
+    (item) => item?.id === characterId,
+  );
+  const persistedPrompt = persistedCharacter?.prompts?.find((item) => item?.id === promptId);
+  const persistedBox = persistedPrompt
+    ? findPromptTextBox(persistedPrompt, resolvedRole, resolvedSlot, { allowRoleFallback: false })
+    : null;
+  if (
+    !persistedBox
+    || String(persistedBox.text ?? "") !== value
+    || canonicalJson(persistedBox.prompt_document) !== canonicalJson(document)
+  ) {
+    throw new Error(
+      `State Manager prompt-document write did not persist ${resolvedRole}/${resolvedSlot} exactly.`,
+    );
+  }
+
+  refreshNodeFromLibrary(managerNode, {
+    status: "Saved prompt interpretation metadata.",
+  });
+  if (textNode) {
+    applyTextToNode(textNode, value, resolvedRole);
+    mirrorStateTextToDownstreamWidgets(textNode, value, resolvedRole);
+    markDownstreamDirty(textNode);
+  }
+  if (render) scheduleRender(managerNode);
+  return receipt;
+}
+
+
+function installStateManagerPromptIntegrationApi() {
+  globalThis.__doraStateManagerPromptApi = {
+    contract_version: 5,
+    capabilities: Object.freeze([
+      "authoritative_persistent_text_v1",
+      "impact_wildcard_queue_bridge_v1",
+      "backend_impact_prompt_bridge_v1",
+      "backend_persistent_text_write_v1",
+      "prompt_document_v1",
+    ]),
+    async setTextBox(managerNode, textNode, text) {
+      // Exact v4 compatibility: this method and its backend receipt remain v4.
+      return updateManagedStateTextBox(managerNode, textNode, text, { persist: true });
+    },
+    async setPromptDocument(managerNode, textNode, payload) {
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("setPromptDocument requires {text, prompt_document}.");
+      }
+      return updateManagedPromptDocument(managerNode, textNode, payload, { render: true });
     },
   };
 }
@@ -3382,7 +4101,8 @@ function renderPromptPanelContent(section, node, state, uiState, character, prom
         syncPromptTextMirror(prompt);
         updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: `Deleted text box ${box.role}/${box.slot}.` });
       }),
-      labelledControl("Text", text)
+      labelledControl("Text", text),
+      promptDocumentEditor(node, box)
     );
     savedTextBoxes.appendChild(row);
   }
@@ -4117,13 +4837,24 @@ function firstControlledStateSeed(managerNode, promptPayload) {
   return null;
 }
 
-function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, queueIndex, total) {
+function serializeQueuedUiStateIdentity(uiState, characterId, promptId) {
   return JSON.stringify({
     ...safeJsonParse(serializeWorkflowUiState(uiState), {}),
+    // The persistent library is request-user scoped. Prompt handlers do not have
+    // the original HTTP request, so carry the resolved browser/API user only in
+    // the queued payload. serializeWorkflowUiState() intentionally omits it.
     __dsm_library_user_id: stateLibraryClient.userId,
-    ...(runtimeSeed == null ? {} : { __dsm_runtime_seed: runtimeSeed }),
     __dsm_queued_runtime_character_id: String(characterId ?? ""),
     __dsm_queued_runtime_prompt_id: String(promptId ?? ""),
+    __dsm_frontend_prompt_contract_version: 5,
+    __dsm_frontend_prompt_contract_revision: "backend-document-write-v1",
+  }, null, 0);
+}
+
+function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, queueIndex, total) {
+  return JSON.stringify({
+    ...safeJsonParse(serializeQueuedUiStateIdentity(uiState, characterId, promptId), {}),
+    ...(runtimeSeed == null ? {} : { __dsm_runtime_seed: runtimeSeed }),
     __dsm_queued_runtime_queue_index: Math.max(0, Number(queueIndex) || 0),
     __dsm_queued_runtime_queue_total: Math.max(1, Number(total) || 1),
     // The runtime override must differ per queued prompt even if the same prompt
@@ -4346,7 +5077,11 @@ function mutateQueuedStateTextBoxes(promptPayload, managerNode, prompt) {
     const slot = getStateTextSlot(textNode, role, `${role}_${textNode?.id ?? index + 1}`);
     const saved = findPromptTextBox(prompt, role, slot, { allowRoleFallback: false }) || findPromptTextBox(prompt, role, slot, { allowRoleFallback: true });
     if (!saved) continue;
-    changed += setQueuedWidgetInput(promptPayload, textNode, "text", String(saved.text ?? ""));
+    const value = String(saved.text ?? "");
+    // Keep the submitted STRING link intact. The backend prompt bridge resolves
+    // the authoritative persistent value and materializes downstream Impact
+    // wildcard inputs server-side, after ComfyUI has serialized the graph.
+    changed += setQueuedWidgetInput(promptPayload, textNode, "text", value);
   }
   return changed;
 }
@@ -4411,11 +5146,36 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
     if (!isStateManagerNode(node)) continue;
     const widgets = getWidgets(node);
     const { state, uiState } = getCurrentState(node);
-    if (!uiState.queue_prompt_wildcard && !uiState.queue_character_wildcard && !uiState.queue_randomize_saved_seed) continue;
     const currentCharacterId = String(widgetValue(widgets.characterWidget, "") || "");
     const currentPromptId = String(widgetValue(widgets.promptWidget, "") || "");
     const { character, prompt } = selectQueuedCharacterAndPrompt(node, state, uiState, currentCharacterId, currentPromptId, queueIndex, total);
     if (!character || !prompt) continue;
+
+    // State Manager Text Boxes are runtime-owned even in an ordinary queue with
+    // no prompt/character wildcarding. Materialize their selected saved text into
+    // the queued Text Box input while preserving downstream STRING links. The
+    // backend prompt bridge owns final Impact wildcard materialization.
+    changed += mutateQueuedStateTextBoxes(promptPayload, node, prompt);
+
+    const hasQueueOverrides = !!(
+      uiState.queue_prompt_wildcard
+      || uiState.queue_character_wildcard
+      || uiState.queue_randomize_saved_seed
+    );
+    if (!hasQueueOverrides) {
+      // Backend prompt handlers execute outside the originating HTTP request.
+      // Preserve the exact persistent-library tenant and selected preset in the
+      // request-local queue payload even for an ordinary queue.
+      changed += setQueuedInput(
+        promptPayload,
+        node,
+        UI_STATE_WIDGET,
+        serializeQueuedUiStateIdentity(uiState, character.id, prompt.id),
+        { addIfMissing: true, syncWidget: false },
+      );
+      continue;
+    }
+
     let payload = buildQueuedDoraStatePayload(character, prompt);
     let runtimeSeed = null;
     const liveStateSeed = firstControlledStateSeed(node, promptPayload);
@@ -4438,7 +5198,6 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
       total,
     );
     changed += mutateQueuedDoraLoaders(promptPayload, node, character);
-    changed += mutateQueuedStateTextBoxes(promptPayload, node, prompt);
     changed += mutateQueuedLegacyTextTargets(promptPayload, node, prompt);
     changed += mutateQueuedSettingsNodes(promptPayload, node, payload.settings);
   }
@@ -4645,9 +5404,10 @@ function installStateSeedQueuePatch() {
     const total = Math.max(1, dsmQueueSession.total || 1);
     try {
       mutatePromptForStateSeeds(promptPayload);
-      mutatePromptForStateManagers(promptPayload, queueIndex, total);
+      await prepareStateManagerQueuePayload(promptPayload, queueIndex, total);
     } catch (err) {
       console.warn(`[${EXT_NAME}] failed to resolve State Manager queue values before queue`, err);
+      if (String(err?.code || "").startsWith("DSM_")) throw err;
     }
     return originalQueuePrompt.apply(this, [index, promptPayload, ...args]);
   };
@@ -4718,6 +5478,8 @@ function maybeInjectWidgetInput(nodeData) {
 }
 
 installLoaderStateSyncApi();
+installStateManagerPromptIntegrationApi();
+void loadPromptTransportProvider();
 
 app.registerExtension({
   name: EXT_NAME,

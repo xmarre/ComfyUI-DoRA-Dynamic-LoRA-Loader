@@ -172,6 +172,63 @@ def test_revision_conflict_prevents_stale_update_loss(store):
     assert store.snapshot() == current
 
 
+def test_atomic_prompt_text_box_update_preserves_unrelated_library_state(store):
+    selected = make_character("Selected")
+    unrelated = make_character("Unrelated")
+    first = store.replace([selected, unrelated], 0)
+    before_unrelated = first["characters"][1]
+
+    timeline = "Global.\n\n[0-7s]\nOne.\n\n[7-14s]\nTwo."
+    updated = store.update_prompt_text_box(
+        selected["id"],
+        selected["prompts"][0]["id"],
+        "positive",
+        "default",
+        timeline,
+        first["revision"],
+        "Canonical Timeline",
+    )
+
+    assert updated["revision"] == first["revision"] + 1
+    selected_after = updated["characters"][0]
+    prompt_after = selected_after["prompts"][0]
+    box_after = next(
+        box for box in prompt_after["text_boxes"]
+        if box["role"] == "positive" and box["slot"] == "default"
+    )
+    assert box_after["text"] == timeline
+    assert box_after["label"] == "Canonical Timeline"
+    assert prompt_after["positive"] == timeline
+    assert updated["characters"][1] == before_unrelated
+
+    with pytest.raises(StateLibraryRevisionConflict):
+        store.update_prompt_text_box(
+            selected["id"],
+            selected["prompts"][0]["id"],
+            "positive",
+            "default",
+            "stale overwrite",
+            first["revision"],
+        )
+    assert store.snapshot() == updated
+
+
+def test_atomic_prompt_text_box_update_rejects_missing_exact_selection(store):
+    selected = make_character("Selected")
+    first = store.replace([selected], 0)
+
+    with pytest.raises(StatePresetNotFound, match="character preset"):
+        store.update_prompt_text_box(
+            str(uuid.uuid4()),
+            selected["prompts"][0]["id"],
+            "positive",
+            "default",
+            "must not fall back",
+            first["revision"],
+        )
+    assert store.snapshot() == first
+
+
 def test_concurrent_writers_have_one_winner(store):
     barrier = threading.Barrier(2)
     results = []
@@ -289,3 +346,276 @@ def test_store_cache_and_paths_are_isolated_per_comfy_user(tmp_path):
             state_manager_library_path(FolderPaths, "../second")
     finally:
         reset_state_manager_store_for_tests()
+
+
+def test_prompt_document_write_migrates_v1_once_and_preserves_unrelated_state(store):
+    selected = make_character("Selected")
+    unrelated = make_character("Unrelated")
+    first = store.replace([selected, unrelated], 0)
+    assert first["version"] == 1
+    before_unrelated = first["characters"][1]
+    before_selected = json.loads(json.dumps(first["characters"][0]))
+
+    descriptor = {
+        "schema_version": 1,
+        "format": "timeline",
+        "routing": "logical_chunks",
+        "geometry": {"chunks": 3, "chunk_seconds": "5.000"},
+    }
+    text = "Shared\n\n[0-5s]\nONE\n\n[5-10s]\nTWO\n\n[10-15s]\nTHREE"
+    result = store.update_prompt_document(
+        selected["id"],
+        selected["prompts"][0]["id"],
+        "positive",
+        "default",
+        text,
+        descriptor,
+        first["revision"],
+        "Main",
+    )
+
+    assert result["snapshot"]["version"] == 2
+    assert result["library_revision"] == first["revision"] + 1
+    assert result["migrated_container_v2"] is True
+    assert result["prompt_document"] == {
+        "schema_version": 1,
+        "format": "timeline",
+        "routing": "logical_chunks",
+        "geometry": {"chunks": 3, "chunk_seconds": "5"},
+    }
+    backup_path = Path(result["backup_path"])
+    assert backup_path.is_file()
+    backup = json.loads(backup_path.read_text(encoding="utf-8"))
+    # The recoverable backup is the complete on-disk v1 container. The public
+    # snapshot intentionally omits its migration ledger, so compare the public
+    # state fields explicitly and keep the ledger losslessly in the backup.
+    assert backup["version"] == first["version"] == 1
+    assert backup["revision"] == first["revision"]
+    assert backup["characters"] == first["characters"]
+    assert backup.get("migrations", []) == []
+
+    after = result["snapshot"]
+    assert after["characters"][1] == before_unrelated
+    selected_after = after["characters"][0]
+    assert selected_after["id"] == before_selected["id"]
+    assert selected_after["thumbnail"] == before_selected["thumbnail"]
+    assert selected_after["loader_stacks"] == before_selected["loader_stacks"]
+    assert selected_after["prompts"][0]["settings"] == before_selected["prompts"][0]["settings"]
+    box = selected_after["prompts"][0]["text_boxes"][0]
+    assert box["text"] == text
+    assert box["prompt_document"] == result["prompt_document"]
+
+    # v4 text-only editing stays supported and cannot erase the v5 descriptor.
+    text_only = store.update_prompt_text_box(
+        selected["id"],
+        selected["prompts"][0]["id"],
+        "positive",
+        "default",
+        text + " edited",
+        after["revision"],
+    )
+    assert text_only["version"] == 2
+    assert text_only["characters"][0]["prompts"][0]["text_boxes"][0]["prompt_document"] == result["prompt_document"]
+    assert list(Path(store.path).parent.glob("state-library.json.v1-backup-*")) == [backup_path]
+
+
+def test_stale_bulk_replace_cannot_strip_prompt_document(store):
+    character = make_character("Selected")
+    first = store.replace([character], 0)
+    result = store.update_prompt_document(
+        character["id"],
+        character["prompts"][0]["id"],
+        "positive",
+        "default",
+        "Managed timeline",
+        {"schema_version": 1, "format": "fixed"},
+        first["revision"],
+    )
+    stale = json.loads(json.dumps(result["snapshot"]["characters"]))
+    stale[0]["prompts"][0]["text_boxes"][0].pop("prompt_document")
+
+    with pytest.raises(InvalidStateLibrary, match="strip or rewrite"):
+        store.replace(stale, result["library_revision"])
+    assert store.snapshot() == result["snapshot"]
+
+
+def test_prompt_document_write_rejects_stale_revision_without_backup_or_mutation(store):
+    character = make_character("Selected")
+    first = store.replace([character], 0)
+    store.replace([character], first["revision"])
+    before = store.snapshot()
+    parent = Path(store.path).parent
+
+    with pytest.raises(StateLibraryRevisionConflict):
+        store.update_prompt_document(
+            character["id"],
+            character["prompts"][0]["id"],
+            "positive",
+            "default",
+            "stale",
+            {"schema_version": 1, "format": "fixed"},
+            first["revision"],
+        )
+
+    assert store.snapshot() == before
+    assert list(parent.glob("state-library.json.v1-backup-*")) == []
+
+
+def test_descriptor_bearing_bulk_replace_promotes_v1_with_prewrite_backup(store):
+    character = make_character("Descriptor Replace")
+    character["prompts"][0]["text_boxes"][0]["prompt_document"] = {
+        "schema_version": 1,
+        "format": "fixed",
+    }
+
+    with pytest.raises(InvalidStateLibrary, match="contract v5.*prompt_document_v1"):
+        store.replace([character], 0)
+
+    result = store.replace([character], 0, document_capable=True)
+
+    assert result["version"] == 2
+    backups = list(Path(store.path).parent.glob("state-library.json.v1-backup-*"))
+    assert len(backups) == 1
+    backup = json.loads(backups[0].read_text(encoding="utf-8"))
+    assert backup == {
+        "version": 1,
+        "revision": 0,
+        "characters": [],
+        "migrations": [],
+    }
+
+
+def test_descriptor_bearing_character_import_promotes_v1_but_plain_import_does_not(store):
+    plain = make_character("Plain Import")
+    plain_result = store.import_character(plain)
+    assert plain_result["snapshot"]["version"] == 1
+    assert list(Path(store.path).parent.glob("state-library.json.v1-backup-*")) == []
+
+    descriptor = make_character("Descriptor Import")
+    descriptor["prompts"][0]["text_boxes"][0]["prompt_document"] = {
+        "schema_version": 1,
+        "format": "fixed",
+    }
+    imported = store.import_character(descriptor)
+
+    assert imported["snapshot"]["version"] == 2
+    backups = list(Path(store.path).parent.glob("state-library.json.v1-backup-*"))
+    assert len(backups) == 1
+    backup = json.loads(backups[0].read_text(encoding="utf-8"))
+    assert backup["version"] == 1
+    assert backup["revision"] == plain_result["snapshot"]["revision"]
+    assert [item["name"] for item in backup["characters"]] == ["Plain Import"]
+
+
+def test_descriptor_bearing_library_merge_promotes_v1_before_import(store):
+    descriptor = make_character("Descriptor Library Import")
+    descriptor["prompts"][0]["text_boxes"][0]["prompt_document"] = {
+        "schema_version": 1,
+        "format": "timeline",
+        "routing": "logical_chunks",
+        "geometry": {"chunks": 1, "chunk_seconds": "5"},
+    }
+
+    imported = store.merge_library([descriptor])
+
+    assert imported["snapshot"]["version"] == 2
+    assert imported["snapshot"]["characters"][0]["prompts"][0]["text_boxes"][0]["prompt_document"]["format"] == "timeline"
+    backups = list(Path(store.path).parent.glob("state-library.json.v1-backup-*"))
+    assert len(backups) == 1
+    assert json.loads(backups[0].read_text(encoding="utf-8"))["characters"] == []
+
+
+def test_text_only_mutation_repairs_descriptor_bearing_v1_container(store):
+    character = make_character("Partial V2")
+    character["prompts"][0]["text_boxes"][0]["prompt_document"] = {
+        "schema_version": 99,
+        "future_mode": "opaque",
+        "future_data": {"keep": True},
+    }
+    path = Path(store.path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = {
+        "version": 1,
+        "revision": 7,
+        "characters": [character],
+        "migrations": [],
+    }
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    result = store.update_prompt_text_box(
+        character["id"],
+        character["prompts"][0]["id"],
+        "positive",
+        "default",
+        "edited",
+        7,
+    )
+
+    assert result["version"] == 2
+    assert result["characters"][0]["prompts"][0]["text_boxes"][0]["prompt_document"] == character["prompts"][0]["text_boxes"][0]["prompt_document"]
+    backups = list(path.parent.glob("state-library.json.v1-backup-*"))
+    assert len(backups) == 1
+    backup = json.loads(backups[0].read_text(encoding="utf-8"))
+    assert backup["version"] == 1
+    assert backup["revision"] == 7
+    assert backup["characters"][0]["prompts"][0]["text_boxes"][0]["text"] == "private positive prompt"
+    assert backup["characters"][0]["prompts"][0]["positive"] == "private positive prompt"
+    assert backup["characters"][0]["prompts"][0]["text_boxes"][0]["prompt_document"] == character["prompts"][0]["text_boxes"][0]["prompt_document"]
+
+
+def test_descriptor_aware_export_advertises_support_and_preserves_future_schema(store):
+    character = make_character("Selected")
+    character["prompts"][0]["text_boxes"][0]["prompt_document"] = {
+        "schema_version": 99,
+        "future_mode": "opaque",
+        "future_data": {"keep": [1, 2, 3]},
+    }
+    # Simulate an already descriptor-aware persisted container without routing
+    # unknown future data through the explicit schema-v1 authoring method.
+    path = Path(store.path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "version": 2,
+        "revision": 7,
+        "characters": [character],
+        "migrations": [],
+    }), encoding="utf-8")
+
+    snapshot = store.snapshot()
+    saved = snapshot["characters"][0]["prompts"][0]["text_boxes"][0]["prompt_document"]
+    assert saved == character["prompts"][0]["text_boxes"][0]["prompt_document"]
+
+    exported_character = store.export_character(character["id"])
+    exported_library = store.export_library()
+    assert exported_character["version"] == 2
+    assert exported_character["capabilities"] == ["prompt_document_v1"]
+    assert exported_character["character"]["prompts"][0]["text_boxes"][0]["prompt_document"] == saved
+    assert exported_library["version"] == 2
+    assert exported_library["capabilities"] == ["prompt_document_v1"]
+    assert exported_library["characters"][0]["prompts"][0]["text_boxes"][0]["prompt_document"] == saved
+
+
+@pytest.mark.parametrize(
+    "descriptor",
+    [
+        None,
+        "timeline",
+        {"schema_version": 1, "format": "timeline", "routing": "logical_chunks", "geometry": {"chunks": 0, "chunk_seconds": "5"}},
+        {"schema_version": 1, "format": "timeline", "routing": "logical_chunks", "geometry": {"chunks": 3, "chunk_seconds": "5e0"}},
+    ],
+)
+def test_prompt_document_write_rejects_invalid_descriptor_without_migrating(store, descriptor):
+    character = make_character("Selected")
+    first = store.replace([character], 0)
+    with pytest.raises((InvalidStateLibrary, ValueError)):
+        store.update_prompt_document(
+            character["id"],
+            character["prompts"][0]["id"],
+            "positive",
+            "default",
+            "text",
+            descriptor,
+            first["revision"],
+        )
+    assert store.snapshot() == first
+    assert list(Path(store.path).parent.glob("state-library.json.v1-backup-*")) == []
