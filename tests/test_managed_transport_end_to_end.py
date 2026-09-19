@@ -399,7 +399,7 @@ def test_direct_state_manager_real_impact_to_continuum_sequence_contract(reviewe
 
 
 def test_real_impact_header_injection_cannot_become_verified_schedule(reviewed_stack):
-    _nodes, _bridge, prompts, _impact_handler, _processor, _feedback = reviewed_stack
+    _nodes, _bridge, prompts, _impact_handler, _processor, _feedback, *_continuum = reviewed_stack
     raw = (
         "SHARED_ENV_SENTINEL\n\n"
         "[0-5s]\nONE_RED_CUBE_SENTINEL\n\n"
@@ -432,7 +432,7 @@ def test_real_impact_header_injection_cannot_become_verified_schedule(reviewed_s
 
 
 def test_explicit_fixed_document_stays_fixed_through_real_impact(reviewed_stack):
-    _nodes, _bridge, prompts, _impact_handler, _processor, _feedback = reviewed_stack
+    _nodes, _bridge, prompts, _impact_handler, _processor, _feedback, *_continuum = reviewed_stack
     raw = "[0-5s]\nLiteral header-looking prose __managed/one__"
     character = _character(raw)
     descriptor = {"schema_version": 1, "format": "fixed"}
