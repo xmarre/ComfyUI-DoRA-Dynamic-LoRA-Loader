@@ -9,6 +9,8 @@ from typing import Any, Callable, Dict, Optional
 _LOG = logging.getLogger(__name__)
 
 _PROMPT_BRIDGE_ORDERING_VERIFIED = False
+_PROMPT_BRIDGE_SERVER: Any = None
+_PROMPT_BRIDGE_HANDLER: Any = None
 
 _MANAGER_CLASSES = {"State Manager", "DoRA State Manager", "StateManager"}
 _TEXT_BOX_CLASSES = {"State Manager Text Box", "StateManagerTextBox"}
@@ -296,8 +298,23 @@ def _continuum_provider(class_type: Any) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _prompt_bridge_ordering_is_verified(
+    server: Any = None,
+    handler: Any = None,
+) -> bool:
+    active_server = _PROMPT_BRIDGE_SERVER if server is None else server
+    active_handler = _PROMPT_BRIDGE_HANDLER if handler is None else handler
+    handlers = getattr(active_server, "on_prompt_handlers", None)
+    return bool(
+        _PROMPT_BRIDGE_ORDERING_VERIFIED
+        and isinstance(handlers, list)
+        and handlers
+        and handlers[0] is active_handler
+    )
+
+
 def prompt_transport_ordering_contract() -> Optional[str]:
-    return "ordered-impact-v1" if _PROMPT_BRIDGE_ORDERING_VERIFIED else None
+    return "ordered-impact-v1" if _prompt_bridge_ordering_is_verified() else None
 
 
 def prompt_transport_provider_capabilities() -> Optional[Dict[str, Any]]:
@@ -699,8 +716,10 @@ def register_prompt_bridge(
     text_for_box: Callable[[Optional[Dict[str, Any]], Any, Any], Optional[str]],
     resolve_snapshot: Optional[Callable[[Any, Any, Any, Any], Dict[str, Any]]] = None,
 ) -> None:
-    global _PROMPT_BRIDGE_ORDERING_VERIFIED
+    global _PROMPT_BRIDGE_ORDERING_VERIFIED, _PROMPT_BRIDGE_SERVER, _PROMPT_BRIDGE_HANDLER
     _PROMPT_BRIDGE_ORDERING_VERIFIED = False
+    _PROMPT_BRIDGE_SERVER = None
+    _PROMPT_BRIDGE_HANDLER = None
 
     server = getattr(PromptServer, "instance", None)
     if server is None or not hasattr(server, "add_on_prompt_handler"):
@@ -717,13 +736,24 @@ def register_prompt_bridge(
         # failure cannot leave only part of a fan-out materialized.
         try:
             working = copy.deepcopy(json_data)
+            request_ordering_verified = (
+                ordering_verified
+                and isinstance(getattr(server, "on_prompt_handlers", None), list)
+                and bool(server.on_prompt_handlers)
+                and server.on_prompt_handlers[0] is on_prompt
+            )
+            if ordering_verified and not request_ordering_verified:
+                _LOG.warning(
+                    "[State Manager] ordered Impact transport disabled for this request: "
+                    "the owned prompt materializer is no longer first in on_prompt_handlers."
+                )
             materialize_state_manager_impact_prompts(
                 working,
                 resolve_payload=resolve_payload,
                 library_user_from_ui_state=library_user_from_ui_state,
                 text_for_box=text_for_box,
                 resolve_snapshot=resolve_snapshot,
-                ordering_verified=ordering_verified,
+                ordering_verified=request_ordering_verified,
             )
             return working
         except Exception:
@@ -744,6 +774,9 @@ def register_prompt_bridge(
         if not callable(previous):
             server.add_on_prompt_handler(on_prompt)
             setattr(server, marker, on_prompt)
+    _PROMPT_BRIDGE_SERVER = server
+    _PROMPT_BRIDGE_HANDLER = getattr(server, marker, None)
+
     handler_order = (
         _handler_order_receipt(handlers)
         if ordering_verified
