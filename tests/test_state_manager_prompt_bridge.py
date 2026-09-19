@@ -492,6 +492,21 @@ def test_unknown_transform_never_receives_or_forwards_managed_provenance(
     assert payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"] == ""
 
 
+def test_handler_order_receipt_is_bounded_and_names_handlers(bridge):
+    handlers = []
+    for index in range(40):
+        def handler(value, _index=index):
+            return value
+        handler.__name__ = f"handler_{index}"
+        handlers.append(handler)
+
+    receipt = bridge._handler_order_receipt(handlers)
+    assert receipt["count"] == 40
+    assert len(receipt["shown"]) == 32
+    assert receipt["truncated"] is True
+    assert receipt["shown"][0]["name"].endswith("handler")
+
+
 def test_handler_registration_prepends_without_reordering_other_handlers(bridge):
     calls = []
 
