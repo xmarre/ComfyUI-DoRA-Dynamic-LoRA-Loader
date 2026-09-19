@@ -1,3 +1,35 @@
+# DoRA Dynamic LoRA Loader v1.0.47
+
+This release fixes State Manager character/preset selection persistence across a real ComfyUI restart. A saved non-default selection now restores as the same persistent character/preset before any State Manager interaction, so its reference set and managed prompt routing remain attached to the intended preset after startup.
+
+## Restart selection persistence
+
+- Treats the hidden selection widgets that ComfyUI already restored before `onConfigure()` as the startup authority instead of independently preferring a potentially stale `widgets_values_named` shadow.
+- Uses the normal workflow selection mirror only to recover the old stale-default signature; an explicit non-default configured selection remains authoritative.
+- Prevents constructor `default_character/default_prompt` placeholders from becoming persistent authority merely because an asynchronous library load finishes first.
+- Starts loaded-workflow library hydration from the `loadedGraphNode` lifecycle barrier while keeping a separate deferred path for newly created unsaved nodes.
+- Preserves an established authoritative selection during serialization even if transient widget state briefly contains constructor defaults.
+
+## Workflow persistence and distribution-safe mode
+
+- Captures State Manager DOM selection changes with a bounded ComfyUI change transaction when workflow-serialized state actually changes. This closes the event-ordering gap where the global `mouseup` snapshot could occur before the tile `click` updated the selected UUIDs.
+- Does not force whole-graph snapshots for backend-only library edits such as prompt text changes.
+- Distribution-safe workflows continue to serialize `default_character/default_prompt` and omit the private workflow UUID mirror.
+- In distribution-safe mode, only the selected character/prompt UUID pair is kept browser-locally behind an opaque binding for same-browser restart recovery; character data, prompts, settings, LoRAs, images, references, and library contents remain excluded.
+
+## Compatibility and invariants
+
+- The backend-authoritative State Manager library format and revision semantics are unchanged.
+- Managed prompt-document v5 transport, queue snapshot semantics, request-user scoping, queue-write drain, and `DSM_UNSAVED_MANAGED_TEXT` protection are unchanged.
+- Missing UUIDs still do not silently select an unrelated local character.
+- Existing normal workflows require no library migration.
+
+## Validation
+
+- PR #82 remains a single implementation/release commit over v1.0.46.
+- The full package/frontend, Impact wildcard, ComfyUI compatibility/runtime, and managed State Manager → Impact → Continuum test matrix is green for the implementation.
+- Real ComfyUI process-restart acceptance passed: the intended non-default character/preset restored without State Manager interaction, with the complete seven-reference state and associated prompt routing intact.
+
 # DoRA Dynamic LoRA Loader v1.0.46
 
 This release hardens State Manager prompt persistence and queue transport, and adds the managed prompt-document contract used by H3 Continuum and other verified STRING consumers.
