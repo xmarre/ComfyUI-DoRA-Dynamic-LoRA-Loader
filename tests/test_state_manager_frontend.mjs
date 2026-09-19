@@ -10,7 +10,7 @@ async function loadStateManagerHelpers() {
     .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
     .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi(...args) { if (typeof globalThis.__dsmTestFetchApi === 'function') return globalThis.__dsmTestFetchApi(...args); throw new Error('not used'); }, apiURL(value) { return value; } };")
     .replace('import "../../scripts/domWidget.js";', "");
-  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary };\n`;
+  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary };\n`;
   const encoded = Buffer.from(source, "utf8").toString("base64");
   return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
 }
@@ -1674,6 +1674,63 @@ test("ordinary bulk library writes advertise the v5 prompt-document capability",
   assert.equal(request.contract_version, 5);
   assert.deepEqual(request.capabilities, ["prompt_document_v1"]);
   assert.equal(request.characters[0].prompts[0].positive, "new");
+});
+
+
+test("frontend prompt tools delegate parser and skeleton work to the backend provider", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const calls = [];
+  globalThis.__dsmTestFetchApi = async (path, options = {}) => {
+    calls.push({ path, options });
+    const request = JSON.parse(options.body);
+    if (path.endsWith("/inspect")) {
+      assert.equal(request.text, "[0-5s]\nONE");
+      return {
+        ok: true,
+        async json() {
+          return {
+            contract_version: 5,
+            available: true,
+            valid: true,
+            classification: "timeline",
+            structure: { sections: [{ kind: "time" }] },
+          };
+        },
+      };
+    }
+    assert.ok(path.endsWith("/logical-skeleton"));
+    assert.deepEqual(request, { chunks: 2, chunk_seconds: "5" });
+    return {
+      ok: true,
+      async json() {
+        return {
+          contract_version: 5,
+          available: true,
+          supported: true,
+          text: "[0-5s]\n\n[5-10s]\n",
+        };
+      },
+    };
+  };
+
+  try {
+    const preview = await helpers.previewPromptTransportText("[0-5s]\nONE");
+    assert.equal(preview.valid, true);
+    assert.equal(preview.classification, "timeline");
+    const skeleton = await helpers.requestLogicalTimelineSkeleton(2, "5");
+    assert.equal(skeleton.text, "[0-5s]\n\n[5-10s]\n");
+  } finally {
+    delete globalThis.__dsmTestFetchApi;
+  }
+
+  assert.equal(
+    calls[0].path,
+    "/dora_dynamic_lora/state-library/prompt-document-provider/inspect",
+  );
+  assert.equal(
+    calls[1].path,
+    "/dora_dynamic_lora/state-library/prompt-document-provider/logical-skeleton",
+  );
 });
 
 
