@@ -394,7 +394,13 @@ def _install_fake_continuum_provider(monkeypatch):
         "chunks": {"min": 1, "max": 16},
         "chunk_seconds": {"min": 4.0, "max": 15.0},
         "classify": lambda text: "timeline" if "[0-" in text else "fixed",
-        "inspect": lambda text: {"text": text},
+        "inspect": lambda text: {
+            "preamble_present": False,
+            "sections": [{"kind": "time"}] if "[0-" in text else [],
+        },
+        "logical_skeleton": lambda *, chunks, chunk_seconds: (
+            f"fake-skeleton:{chunks}:{chunk_seconds}"
+        ),
     }
 
     class FakeContinuum:
@@ -427,6 +433,49 @@ def _add_descriptor(nodes, character, text, descriptor):
         "Positive",
     )
     return result
+
+
+def test_provider_preview_and_skeleton_delegate_without_private_error_text(
+    bridge, monkeypatch
+):
+    provider = _install_fake_continuum_provider(monkeypatch)
+
+    capabilities = bridge.prompt_transport_provider_capabilities()
+    assert capabilities["provider_version"] == 1
+    assert "classify" not in capabilities
+    assert "inspect" not in capabilities
+    assert "logical_skeleton" not in capabilities
+
+    preview = bridge.prompt_transport_provider_preview("[0-5s]\nONE")
+    assert preview == {
+        "available": True,
+        "valid": True,
+        "classification": "timeline",
+        "structure": {
+            "preamble_present": False,
+            "sections": [{"kind": "time"}],
+        },
+    }
+
+    def invalid_inspect(_text):
+        raise ValueError(
+            "H3C-P001 line 1: invalid timeline header\n"
+            "Source: PRIVATE_PROMPT_TEXT"
+        )
+
+    provider["inspect"] = invalid_inspect
+    invalid = bridge.prompt_transport_provider_preview("PRIVATE_PROMPT_TEXT")
+    assert invalid["available"] is True
+    assert invalid["valid"] is False
+    assert invalid["classification"] == "fixed"
+    assert invalid["error"] == "H3C-P001 line 1: invalid timeline header"
+    assert "PRIVATE_PROMPT_TEXT" not in invalid["error"]
+
+    assert bridge.prompt_transport_logical_skeleton(3, "5") == {
+        "available": True,
+        "supported": True,
+        "text": "fake-skeleton:3:5",
+    }
 
 
 def test_queue_snapshot_and_direct_continuum_sidecar_share_one_revision(
