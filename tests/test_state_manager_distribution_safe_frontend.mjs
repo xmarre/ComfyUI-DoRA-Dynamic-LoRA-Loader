@@ -38,7 +38,20 @@ function makeNode(StateManagerNode, enabled) {
   };
   node.widgets = [
     { name: "state_json", value: '{"version":1,"kind":"dora_state_manager_binding"}' },
-    { name: "ui_state_json", value: '{"version":2}' },
+    {
+      name: "ui_state_json",
+      value: JSON.stringify({
+        version: 2,
+        panel: "prompt",
+        __dsm_queue_snapshot_v1: {
+          version: 1,
+          library_revision: 42,
+          character_id: "private-character-uuid",
+          prompt_id: "private-prompt-uuid",
+          payload: { private_prompt: "must not serialize" },
+        },
+      }),
+    },
     { name: "selected_character_id", value: "private-character-uuid" },
     { name: "selected_prompt_id", value: "private-prompt-uuid" },
   ];
@@ -60,11 +73,17 @@ test("distribution-safe mode scrubs only serialized selection bindings", async (
 
   assert.equal(output.widgets_values[2], "default_character");
   assert.equal(output.widgets_values[3], "default_prompt");
+  const serializedUiState = JSON.parse(output.widgets_values_named.ui_state_json);
+  assert.equal(serializedUiState.version, 2);
+  assert.equal(serializedUiState.panel, "prompt");
+  assert.equal(Object.prototype.hasOwnProperty.call(serializedUiState, "__dsm_queue_snapshot_v1"), false);
   assert.equal(output.widgets_values_named.selected_character_id, "default_character");
   assert.equal(output.widgets_values_named.selected_prompt_id, "default_prompt");
   assert.equal(output.properties.dora_state_manager_distribution_safe_serialization, true);
 
   // The live widgets remain on the real local selection, so queue/generation state is unchanged.
+  const liveUiState = JSON.parse(node.widgets[1].value);
+  assert.equal(liveUiState.__dsm_queue_snapshot_v1.library_revision, 42);
   assert.equal(node.widgets[2].value, "private-character-uuid");
   assert.equal(node.widgets[3].value, "private-prompt-uuid");
 });
@@ -82,6 +101,8 @@ test("normal mode preserves selected local UUID bindings", async () => {
   const output = {};
   node.onSerialize(output);
 
+  const normalUiState = JSON.parse(output.widgets_values_named.ui_state_json);
+  assert.equal(normalUiState.__dsm_queue_snapshot_v1.library_revision, 42);
   assert.equal(output.widgets_values[2], "private-character-uuid");
   assert.equal(output.widgets_values[3], "private-prompt-uuid");
   assert.equal(output.widgets_values_named.selected_character_id, "private-character-uuid");

@@ -3,6 +3,7 @@ import { app } from "../../scripts/app.js";
 const EXT_NAME = "comfyui_dora_dynamic_lora.state_manager_distribution_safe";
 const NODE_CLASSES = new Set(["State Manager", "DoRA State Manager"]);
 const PROPERTY = "dora_state_manager_distribution_safe_serialization";
+const UI_STATE_WIDGET = "ui_state_json";
 const SELECTED_CHARACTER_WIDGET = "selected_character_id";
 const SELECTED_PROMPT_WIDGET = "selected_prompt_id";
 const DEFAULT_CHARACTER_ID = "default_character";
@@ -51,8 +52,32 @@ function setSerializedWidget(output, node, widgetName, value) {
   return changed;
 }
 
+function scrubReservedQueueSnapshot(value) {
+  if (typeof value !== "string" || !value.trim()) return value;
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return value;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return value;
+  if (!Object.prototype.hasOwnProperty.call(parsed, "__dsm_queue_snapshot_v1")) return value;
+  delete parsed.__dsm_queue_snapshot_v1;
+  return JSON.stringify(parsed);
+}
+
 function applyDistributionSafeSerialization(output, node) {
   if (!isDistributionSafe(node)) return false;
+  const uiStateWidget = (Array.isArray(node.widgets) ? node.widgets : [])
+    .find((widget) => widget?.name === UI_STATE_WIDGET);
+  const uiStateChanged = uiStateWidget
+    ? setSerializedWidget(
+        output,
+        node,
+        UI_STATE_WIDGET,
+        scrubReservedQueueSnapshot(uiStateWidget.value),
+      )
+    : false;
   const characterChanged = setSerializedWidget(
     output,
     node,
@@ -65,7 +90,7 @@ function applyDistributionSafeSerialization(output, node) {
     SELECTED_PROMPT_WIDGET,
     DEFAULT_PROMPT_ID,
   );
-  return characterChanged || promptChanged;
+  return uiStateChanged || characterChanged || promptChanged;
 }
 
 function findSettingsTabs(root) {

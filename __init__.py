@@ -8,12 +8,19 @@ from .nodes import (
     _normalize_state_manager_state,
     _state_manager_default_state,
     _resolve_dora_state_payload,
+    _resolve_dora_state_payload_snapshot,
     _queued_library_user_from_ui_state,
     _state_payload_text_for_box,
 )
 from .runtime_bypass import RuntimeBypassDoraPowerLoraLoader
 from .state_manager_api import register_routes as register_state_manager_routes
-from .state_manager_prompt_bridge import register_prompt_bridge
+from .state_manager_prompt_bridge import (
+    prompt_transport_logical_skeleton,
+    prompt_transport_ordering_contract,
+    prompt_transport_provider_capabilities,
+    prompt_transport_provider_preview,
+    register_prompt_bridge,
+)
 
 # Backend API for frontend LoRA dropdown (avoids relying on /object_info variants).
 import folder_paths
@@ -35,6 +42,10 @@ try:
         web,
         _normalize_state_manager_state,
         _state_manager_default_state,
+        prompt_transport_provider=prompt_transport_provider_capabilities,
+        prompt_transport_ordering_contract=prompt_transport_ordering_contract,
+        prompt_transport_preview=prompt_transport_provider_preview,
+        prompt_transport_logical_skeleton=prompt_transport_logical_skeleton,
     )
 except Exception:
     logging.getLogger(__name__).exception(
@@ -45,6 +56,7 @@ try:
     register_prompt_bridge(
         PromptServer,
         resolve_payload=_resolve_dora_state_payload,
+        resolve_snapshot=_resolve_dora_state_payload_snapshot,
         library_user_from_ui_state=_queued_library_user_from_ui_state,
         text_for_box=_state_payload_text_for_box,
     )
