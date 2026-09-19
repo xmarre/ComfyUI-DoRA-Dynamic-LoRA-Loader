@@ -10,7 +10,7 @@ async function loadStateManagerHelpers() {
     .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
     .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi(...args) { if (typeof globalThis.__dsmTestFetchApi === 'function') return globalThis.__dsmTestFetchApi(...args); throw new Error('not used'); }, apiURL(value) { return value; } };")
     .replace('import "../../scripts/domWidget.js";', "");
-  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary };\n`;
+  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary, flushPendingLibraryWrites, validateManagedQueueTextState, prepareStateManagerQueuePayload };\n`;
   const encoded = Buffer.from(source, "utf8").toString("base64");
   return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
 }
@@ -1795,4 +1795,247 @@ test("frontend text normalization preserves unknown future prompt-document schem
   const view = helpers.stateViewForSelection("character-a", "prompt-a");
   const box = view.characters[0].prompts[0].text_boxes[0];
   assert.deepEqual(box.prompt_document, future);
+});
+
+
+test("queue preparation waits for an in-flight State Manager library write", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const timeline = "Global.\n\n[0-7s]\nOne.\n\n[7-14s]\nTwo.";
+  const emptyState = {
+    version: 3,
+    characters: [{
+      id: "character-a",
+      name: "Character A",
+      prompts: [{
+        id: "prompt-a",
+        name: "Prompt A",
+        positive: "",
+        negative: "",
+        text_boxes: [
+          { role: "positive", slot: "default", label: "Default positive", text: "" },
+          { role: "negative", slot: "default", label: "Default negative", text: "" },
+        ],
+        settings: {},
+      }],
+    }],
+  };
+  const desiredState = structuredClone(emptyState);
+  desiredState.characters[0].prompts[0].positive = timeline;
+  desiredState.characters[0].prompts[0].text_boxes[0].text = timeline;
+
+  const manager = {
+    id: 1,
+    type: "State Manager",
+    comfyClass: "State Manager",
+    outputs: [{ name: "state_control", type: "STATE_MANAGER_CONTROL", links: [12] }],
+    widgets: [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: "character-a" },
+      { name: "selected_prompt_id", value: "prompt-a" },
+    ],
+    properties: {},
+    __dsm: { state: structuredClone(desiredState), uiState: {}, renderFrame: 0 },
+  };
+  const textNode = {
+    id: 2,
+    type: "State Manager Text Box",
+    comfyClass: "State Manager Text Box",
+    inputs: [{ name: "state_control", type: "STATE_MANAGER_CONTROL", link: 12 }],
+    outputs: [{ name: "text", type: "STRING", links: [] }],
+    widgets: [
+      { name: "role", value: "positive" },
+      { name: "text", value: timeline },
+      { name: "state_slot", value: "default" },
+    ],
+  };
+  const nodes = [manager, textNode];
+  const graph = {
+    _nodes: nodes,
+    links: {
+      12: { origin_id: 1, origin_slot: 0, target_id: 2, target_slot: 0 },
+    },
+    getNodeById(id) { return nodes.find((node) => node.id === id) || null; },
+    change() {},
+  };
+  nodes.forEach((node) => { node.graph = graph; });
+  helpers.app.graph = graph;
+
+  helpers.stateLibraryClient.state = structuredClone(emptyState);
+  helpers.stateLibraryClient.revision = 7;
+  helpers.stateLibraryClient.canonical = "__force_write__";
+  helpers.stateLibraryClient.pending = [{
+    node: manager,
+    baseCharacters: structuredClone(emptyState.characters),
+    desiredCharacters: structuredClone(desiredState.characters),
+  }];
+  helpers.stateLibraryClient.writing = false;
+  helpers.stateLibraryClient.writePromise = null;
+  helpers.stateLibraryClient.blocked = false;
+  helpers.stateLibraryClient.lastAppliedNode = null;
+  helpers.stateLibraryClient.nodes.add(manager);
+
+  let releaseWrite;
+  const gate = new Promise((resolve) => { releaseWrite = resolve; });
+  const previousRaf = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = () => 1;
+  globalThis.__dsmTestFetchApi = async (_path, options = {}) => {
+    await gate;
+    const request = JSON.parse(options.body);
+    return {
+      ok: true,
+      async json() {
+        return {
+          version: 2,
+          revision: 8,
+          characters: structuredClone(request.characters),
+          user_id: "default",
+        };
+      },
+    };
+  };
+
+  const promptPayload = {
+    output: {
+      "1": {
+        class_type: "StateManager",
+        inputs: {
+          state_json: helpers.serializeBinding(),
+          ui_state_json: helpers.serializeWorkflowUiState({}),
+          selected_character_id: "character-a",
+          selected_prompt_id: "prompt-a",
+        },
+      },
+      "2": {
+        class_type: "StateManagerTextBox",
+        inputs: {
+          role: "positive",
+          text: timeline,
+          state_slot: "default",
+          state_control: ["1", 7],
+        },
+      },
+    },
+    workflow: { nodes: [] },
+  };
+
+  try {
+    const write = helpers.writePendingLibrary();
+    let prepared = false;
+    const preparing = helpers.prepareStateManagerQueuePayload(promptPayload, 0, 1)
+      .then((value) => { prepared = true; return value; });
+    await Promise.resolve();
+    assert.equal(prepared, false);
+    releaseWrite();
+    await write;
+    await preparing;
+
+    assert.equal(helpers.stateLibraryClient.revision, 8);
+    assert.equal(
+      helpers.stateLibraryClient.state.characters[0].prompts[0].text_boxes[0].text,
+      timeline,
+    );
+    assert.equal(promptPayload.output["2"].inputs.text, timeline);
+  } finally {
+    delete globalThis.__dsmTestFetchApi;
+    helpers.stateLibraryClient.nodes.delete(manager);
+    if (previousRaf === undefined) delete globalThis.requestAnimationFrame;
+    else globalThis.requestAnimationFrame = previousRaf;
+  }
+});
+
+
+test("queue preparation blocks a nonempty managed Text Box when persistent text is empty", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const timeline = "Global.\n\n[0-7s]\nOne.\n\n[7-14s]\nTwo.";
+  const state = {
+    version: 3,
+    characters: [{
+      id: "character-a",
+      name: "Character A",
+      prompts: [{
+        id: "prompt-a",
+        name: "Prompt A",
+        positive: "",
+        negative: "",
+        text_boxes: [
+          { role: "positive", slot: "default", label: "Default positive", text: "" },
+          { role: "negative", slot: "default", label: "Default negative", text: "" },
+        ],
+        settings: {},
+      }],
+    }],
+  };
+  const manager = {
+    id: 1,
+    type: "State Manager",
+    comfyClass: "State Manager",
+    outputs: [{ name: "state_control", type: "STATE_MANAGER_CONTROL", links: [12] }],
+    widgets: [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: "character-a" },
+      { name: "selected_prompt_id", value: "prompt-a" },
+    ],
+    __dsm: { state: structuredClone(state), uiState: {} },
+  };
+  const textNode = {
+    id: 2,
+    type: "State Manager Text Box",
+    comfyClass: "State Manager Text Box",
+    inputs: [{ name: "state_control", type: "STATE_MANAGER_CONTROL", link: 12 }],
+    outputs: [{ name: "text", type: "STRING", links: [] }],
+    widgets: [
+      { name: "role", value: "positive" },
+      { name: "text", value: timeline },
+      { name: "state_slot", value: "default" },
+    ],
+  };
+  const nodes = [manager, textNode];
+  const graph = {
+    _nodes: nodes,
+    links: { 12: { origin_id: 1, origin_slot: 0, target_id: 2, target_slot: 0 } },
+    getNodeById(id) { return nodes.find((node) => node.id === id) || null; },
+    change() {},
+  };
+  nodes.forEach((node) => { node.graph = graph; });
+  helpers.app.graph = graph;
+  helpers.stateLibraryClient.pending = [];
+  helpers.stateLibraryClient.writing = false;
+  helpers.stateLibraryClient.writePromise = null;
+  helpers.stateLibraryClient.blocked = false;
+
+  const promptPayload = {
+    output: {
+      "1": {
+        class_type: "StateManager",
+        inputs: {
+          state_json: helpers.serializeBinding(),
+          ui_state_json: helpers.serializeWorkflowUiState({}),
+          selected_character_id: "character-a",
+          selected_prompt_id: "prompt-a",
+        },
+      },
+      "2": {
+        class_type: "StateManagerTextBox",
+        inputs: {
+          role: "positive",
+          text: timeline,
+          state_slot: "default",
+          state_control: ["1", 7],
+        },
+      },
+    },
+    workflow: { nodes: [] },
+  };
+
+  await assert.rejects(
+    helpers.prepareStateManagerQueuePayload(promptPayload, 0, 1),
+    (error) => {
+      assert.equal(error.code, "DSM_UNSAVED_MANAGED_TEXT");
+      assert.match(error.message, /persistent preset is empty/i);
+      return true;
+    },
+  );
+  assert.equal(promptPayload.output["2"].inputs.text, timeline);
 });

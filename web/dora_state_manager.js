@@ -103,6 +103,7 @@ const stateLibraryClient = {
   canonical: "[]",
   pending: [],
   writing: false,
+  writePromise: null,
   blocked: false,
   lastAppliedNode: null,
   nodes: new Set(),
@@ -1302,51 +1303,134 @@ function blockLibraryWrites(status) {
 }
 
 async function writePendingLibrary() {
-  if (stateLibraryClient.writing || stateLibraryClient.blocked) return;
-  stateLibraryClient.writing = true;
-  try {
-    while (stateLibraryClient.pending.length && !stateLibraryClient.blocked) {
-      const pending = stateLibraryClient.pending.shift();
-      const merged = mergeScheduledLibraryUpdate(
-        pending.baseCharacters,
-        pending.desiredCharacters,
-        stateLibraryClient.state.characters,
-        { allowOverwrite: pending.node === stateLibraryClient.lastAppliedNode },
-      );
-      if (merged.conflict) {
-        blockLibraryWrites("Two local State Manager instances edited the same character concurrently. Reload the library; no conflicting write was sent.");
-        break;
-      }
-      if (canonicalJson(merged.characters) === stateLibraryClient.canonical) {
-        stateLibraryClient.lastAppliedNode = pending.node;
-        continue;
-      }
-      try {
-        const snapshot = await stateLibraryRequest("", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            expected_revision: stateLibraryClient.revision,
-            contract_version: 5,
-            capabilities: ["prompt_document_v1"],
-            characters: merged.characters,
-          }),
-        });
-        installLibrarySnapshot(snapshot);
-        stateLibraryClient.lastAppliedNode = pending.node;
-        refreshAllNodesFromLibrary({ syncLoaders: true, skipLoaderSyncNode: pending.node });
-      } catch (error) {
-        if (error.status === 409) {
-          blockLibraryWrites("Library changed in another tab or State Manager. Reload the library before editing again; the stale write was rejected.");
+  if (stateLibraryClient.writePromise) return stateLibraryClient.writePromise;
+
+  const run = (async () => {
+    if (stateLibraryClient.blocked) return;
+    stateLibraryClient.writing = true;
+    try {
+      while (stateLibraryClient.pending.length && !stateLibraryClient.blocked) {
+        const pending = stateLibraryClient.pending.shift();
+        const merged = mergeScheduledLibraryUpdate(
+          pending.baseCharacters,
+          pending.desiredCharacters,
+          stateLibraryClient.state.characters,
+          { allowOverwrite: pending.node === stateLibraryClient.lastAppliedNode },
+        );
+        if (merged.conflict) {
+          blockLibraryWrites("Two local State Manager instances edited the same character concurrently. Reload the library; no conflicting write was sent.");
           break;
         }
-        blockLibraryWrites(`Library save failed: ${error?.message || error}`);
-        break;
+        if (canonicalJson(merged.characters) === stateLibraryClient.canonical) {
+          stateLibraryClient.lastAppliedNode = pending.node;
+          continue;
+        }
+        try {
+          const snapshot = await stateLibraryRequest("", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              expected_revision: stateLibraryClient.revision,
+              contract_version: 5,
+              capabilities: ["prompt_document_v1"],
+              characters: merged.characters,
+            }),
+          });
+          installLibrarySnapshot(snapshot);
+          stateLibraryClient.lastAppliedNode = pending.node;
+          refreshAllNodesFromLibrary({ syncLoaders: true, skipLoaderSyncNode: pending.node });
+        } catch (error) {
+          if (error.status === 409) {
+            blockLibraryWrites("Library changed in another tab or State Manager. Reload the library before editing again; the stale write was rejected.");
+            break;
+          }
+          blockLibraryWrites(`Library save failed: ${error?.message || error}`);
+          break;
+        }
+      }
+    } finally {
+      stateLibraryClient.writing = false;
+    }
+  })();
+
+  stateLibraryClient.writePromise = run;
+  try {
+    return await run;
+  } finally {
+    if (stateLibraryClient.writePromise === run) stateLibraryClient.writePromise = null;
+  }
+}
+
+function stateManagerQueueBlocked(message, code = "DSM_STATE_MANAGER_QUEUE_BLOCKED") {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+async function flushPendingLibraryWrites() {
+  while (stateLibraryClient.writePromise || stateLibraryClient.pending.length) {
+    const active = stateLibraryClient.writePromise;
+    if (active) await active;
+    else await writePendingLibrary();
+    if (stateLibraryClient.blocked) {
+      throw stateManagerQueueBlocked(
+        "State Manager queue blocked because a persistent library write failed. Reload the State Manager library before queueing.",
+        "DSM_LIBRARY_WRITE_BLOCKED",
+      );
+    }
+  }
+  if (stateLibraryClient.blocked) {
+    throw stateManagerQueueBlocked(
+      "State Manager queue blocked because persistent library writes are disabled after an earlier failure. Reload the State Manager library before queueing.",
+      "DSM_LIBRARY_WRITE_BLOCKED",
+    );
+  }
+}
+
+function validateManagedQueueTextState() {
+  const graphNodes = app?.graph?._nodes || [];
+  for (const managerNode of graphNodes) {
+    if (!isStateManagerNode(managerNode)) continue;
+    const widgets = getWidgets(managerNode);
+    const { state } = getCurrentState(managerNode);
+    const character = selectedCharacter(
+      state,
+      String(widgetValue(widgets.characterWidget, "") || ""),
+    ) || state.characters?.[0];
+    const prompt = selectedPrompt(
+      character,
+      String(widgetValue(widgets.promptWidget, "") || ""),
+    ) || character?.prompts?.[0];
+    if (!prompt) continue;
+
+    const textNodes = getControlledNodes(managerNode).filter(isStateTextNode);
+    for (const [index, textNode] of textNodes.entries()) {
+      const role = getStateTextRole(textNode);
+      const slot = getStateTextSlot(
+        textNode,
+        role,
+        `${role}_${textNode?.id ?? index + 1}`,
+      );
+      const saved = findPromptTextBox(prompt, role, slot, { allowRoleFallback: false })
+        || findPromptTextBox(prompt, role, slot, { allowRoleFallback: true });
+      if (!saved) continue;
+
+      const persistentText = String(saved.text ?? "");
+      const localText = extractTextFromNode(textNode, role);
+      if (!persistentText && localText) {
+        throw stateManagerQueueBlocked(
+          `State Manager queue blocked: connected ${role}/${slot} Text Box contains unsaved text while the selected persistent preset is empty. Use Save connected (or a managed prompt write) and wait for it to complete before queueing.`,
+          "DSM_UNSAVED_MANAGED_TEXT",
+        );
       }
     }
-  } finally {
-    stateLibraryClient.writing = false;
   }
+}
+
+async function prepareStateManagerQueuePayload(promptPayload, queueIndex, total) {
+  await flushPendingLibraryWrites();
+  validateManagedQueueTextState();
+  return mutatePromptForStateManagers(promptPayload, queueIndex, total);
 }
 
 function scheduleLibraryPersist(node, state) {
@@ -5320,9 +5404,10 @@ function installStateSeedQueuePatch() {
     const total = Math.max(1, dsmQueueSession.total || 1);
     try {
       mutatePromptForStateSeeds(promptPayload);
-      mutatePromptForStateManagers(promptPayload, queueIndex, total);
+      await prepareStateManagerQueuePayload(promptPayload, queueIndex, total);
     } catch (err) {
       console.warn(`[${EXT_NAME}] failed to resolve State Manager queue values before queue`, err);
+      if (String(err?.code || "").startsWith("DSM_")) throw err;
     }
     return originalQueuePrompt.apply(this, [index, promptPayload, ...args]);
   };
