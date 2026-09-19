@@ -19,6 +19,11 @@ _TEXT_BOX_CLASSES = {"State Manager Text Box", "StateManagerTextBox"}
 _IMPACT_CLASSES = {"ImpactWildcardProcessor", "ImpactWildcardEncode"}
 _IMPACT_PROCESSOR_CLASSES = {"ImpactWildcardProcessor"}
 _TIMELINE_HEADER = re.compile(r"(?m)^\s*\[[0-9]+(?:\.[0-9]+)?-[0-9]+(?:\.[0-9]+)?s\]\s*$")
+_LEGACY_INTERVAL_TOKEN = re.compile(
+    r"\[\s*\d+(?:\.\d+)?\s*(?:s|sec|seconds)?\s*[-–—]\s*"
+    r"\d+(?:\.\d+)?\s*(?:s|sec|seconds)?\s*\]",
+    re.IGNORECASE,
+)
 
 
 def _prompt_nodes(json_data: Any) -> Dict[str, Dict[str, Any]]:
@@ -99,6 +104,10 @@ def _text_fingerprint(value: Any) -> tuple[int, bool, str]:
         bool(_TIMELINE_HEADER.search(text)),
         hashlib.sha256(text.encode("utf-8")).hexdigest(),
     )
+
+
+def _legacy_interval_token_count(value: Any) -> int:
+    return len(_LEGACY_INTERVAL_TOKEN.findall(str(value or "")))
 
 
 def _literal_text_sha256(value: Any) -> Optional[str]:
@@ -633,7 +642,7 @@ def materialize_state_manager_impact_prompts(
             "[State Manager] managed prompt queue receipt transport=v1 contract=v5 "
             "frontend_contract=%d frontend_revision=%r manager=%s text_node=%s "
             "role=%r slot=%r selection_source=%s snapshot_revision=%d "
-            "format=%r routing=%r ordering_verified=%s queued_match=%s raw_sha256=%s",
+            "format=%r routing=%r ordering_verified=%s queued_match=%s legacy_interval_tokens=%d raw_sha256=%s",
             frontend_contract_version,
             frontend_contract_revision,
             manager_id,
@@ -646,6 +655,7 @@ def materialize_state_manager_impact_prompts(
             document_routing,
             bool(ordering_verified),
             queued_matches_persistent,
+            _legacy_interval_token_count(effective_text),
             raw_digest,
         )
 
@@ -697,7 +707,7 @@ def materialize_state_manager_impact_prompts(
             "frontend_contract=%d frontend_revision=%r text_node=%s manager=%s impact_node=%s "
             "impact_class=%s mode=%r seed_provenance=%s expansion_state=%s role=%r slot=%r "
             "selection_source=%s snapshot_revision=%d format=%r routing=%r "
-            "ordering_verified=%s chars=%d timeline=%s template_sha256=%s "
+            "ordering_verified=%s chars=%d timeline=%s legacy_interval_tokens=%d template_sha256=%s "
             "submitted_populated_sha256=%s changed=%s",
             frontend_contract_version,
             frontend_contract_revision,
@@ -717,6 +727,7 @@ def materialize_state_manager_impact_prompts(
             bool(ordering_verified),
             chars,
             timeline,
+            _legacy_interval_token_count(effective_text),
             digest,
             submitted_populated_sha256,
             impact_changed,
