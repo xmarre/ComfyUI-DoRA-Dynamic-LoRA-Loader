@@ -8,6 +8,8 @@ from typing import Any, Callable, Dict, Optional
 
 _LOG = logging.getLogger(__name__)
 
+_PROMPT_BRIDGE_ORDERING_VERIFIED = False
+
 _MANAGER_CLASSES = {"State Manager", "DoRA State Manager", "StateManager"}
 _TEXT_BOX_CLASSES = {"State Manager Text Box", "StateManagerTextBox"}
 _IMPACT_CLASSES = {"ImpactWildcardProcessor", "ImpactWildcardEncode"}
@@ -253,6 +255,10 @@ def _continuum_provider(class_type: Any) -> Optional[Dict[str, Any]]:
         return provider
     except Exception:
         return None
+
+
+def prompt_transport_ordering_contract() -> Optional[str]:
+    return "ordered-impact-v1" if _PROMPT_BRIDGE_ORDERING_VERIFIED else None
 
 
 def prompt_transport_provider_capabilities() -> Optional[Dict[str, Any]]:
@@ -593,9 +599,12 @@ def register_prompt_bridge(
     if server is None or not hasattr(server, "add_on_prompt_handler"):
         raise RuntimeError("ComfyUI PromptServer does not expose add_on_prompt_handler")
 
+    global _PROMPT_BRIDGE_ORDERING_VERIFIED
+
     marker = "_dora_state_manager_backend_prompt_bridge_callback_v2"
     handlers = getattr(server, "on_prompt_handlers", None)
     ordering_verified = isinstance(handlers, list)
+    _PROMPT_BRIDGE_ORDERING_VERIFIED = ordering_verified
 
     def on_prompt(json_data: Any):
         # PromptServer JSON is request-local plain data. Stage every manager,
