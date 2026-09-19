@@ -10,7 +10,7 @@ async function loadStateManagerHelpers() {
     .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
     .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi(...args) { if (typeof globalThis.__dsmTestFetchApi === 'function') return globalThis.__dsmTestFetchApi(...args); throw new Error('not used'); }, apiURL(value) { return value; } };")
     .replace('import "../../scripts/domWidget.js";', "");
-  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, normalizeSelectionIdentity, readSelectionMirror, writeSelectionMirror, configuredSelectionIdentity, selectionIdentityForLibraryLoad, initializeNode, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary, flushPendingLibraryWrites, validateManagedQueueTextState, prepareStateManagerQueuePayload };\n`;
+  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, normalizeSelectionIdentity, readSelectionMirror, readLocalSelection, writeLocalSelection, writeSelectionMirror, configuredSelectionIdentity, selectionIdentityForLibraryLoad, initializeNode, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary, flushPendingLibraryWrites, validateManagedQueueTextState, prepareStateManagerQueuePayload };\n`;
   const encoded = Buffer.from(source, "utf8").toString("base64");
   return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
 }
@@ -84,7 +84,7 @@ test("startup selection mirror rescues a configured preset when live widgets are
 });
 
 
-test("an explicit serialized default selection beats an older nondefault mirror", async () => {
+test("nondefault mirror repairs serialized defaults left by the startup race", async () => {
   const helpers = await loadStateManagerHelpers();
   const node = {
     widgets: [
@@ -111,8 +111,63 @@ test("an explicit serialized default selection beats an older nondefault mirror"
 
   assert.deepEqual(
     helpers.selectionIdentityForLibraryLoad(node, serialized),
-    { characterId: "default_character", promptId: "default_prompt" },
+    { characterId: "character-a", promptId: "prompt-a" },
   );
+});
+
+test("distribution-safe startup restores only this browser's local selection", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const previousStorage = globalThis.localStorage;
+  const storage = new Map();
+  globalThis.localStorage = {
+    getItem(key) { return storage.has(key) ? storage.get(key) : null; },
+    setItem(key, value) { storage.set(key, String(value)); },
+    removeItem(key) { storage.delete(key); },
+  };
+  const node = {
+    id: 42,
+    widgets: [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: "character-a" },
+      { name: "selected_prompt_id", value: "prompt-a" },
+    ],
+    properties: {
+      dora_state_manager_distribution_safe_serialization: true,
+      dora_state_manager_local_selection_binding_v1: "opaque-binding",
+    },
+  };
+
+  try {
+    helpers.writeSelectionMirror(node, "character-a", "prompt-a");
+    assert.equal(node.properties.dora_state_manager_selection_v1, undefined);
+    assert.deepEqual(
+      helpers.readLocalSelection(node),
+      { characterId: "character-a", promptId: "prompt-a" },
+    );
+
+    const serialized = {
+      id: 42,
+      widgets_values_named: {
+        selected_character_id: "default_character",
+        selected_prompt_id: "default_prompt",
+      },
+      properties: structuredClone(node.properties),
+    };
+    assert.deepEqual(
+      helpers.selectionIdentityForLibraryLoad(node, serialized),
+      { characterId: "character-a", promptId: "prompt-a" },
+    );
+
+    storage.clear();
+    assert.deepEqual(
+      helpers.selectionIdentityForLibraryLoad(node, serialized),
+      { characterId: "default_character", promptId: "default_prompt" },
+    );
+  } finally {
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+  }
 });
 
 
