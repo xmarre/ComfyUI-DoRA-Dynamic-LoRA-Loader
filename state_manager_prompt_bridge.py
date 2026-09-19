@@ -444,10 +444,33 @@ def _document_supported_by_provider(document: Any, provider: Dict[str, Any]) -> 
         return False
 
 
+def _transport_document_for_provider(
+    document: Any,
+    provider: Dict[str, Any],
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Return the request-local transport document and its provenance.
+
+    Existing State Manager libraries predate prompt_document metadata. Absence is
+    therefore represented request-locally as an explicit inherit document so
+    Continuum can apply its own parser to the authoritative text. This does not
+    persist or infer a Timeline descriptor and does not override explicit
+    Fixed/List/Timeline metadata.
+    """
+    if document is None:
+        legacy = {"schema_version": 1, "format": "inherit"}
+        if _document_supported_by_provider(legacy, provider):
+            return legacy, "legacy_absent"
+        return None, None
+    if _document_supported_by_provider(document, provider):
+        return dict(document), "persistent"
+    return None, None
+
+
 def _sidecar(
     *,
     text: str,
     prompt_document: Dict[str, Any],
+    prompt_document_origin: str,
     snapshot: Dict[str, Any],
     manager_id: str,
     text_id: str,
@@ -461,6 +484,7 @@ def _sidecar(
             "schema_version": 1,
             "text": text,
             "prompt_document": prompt_document,
+            "prompt_document_origin": str(prompt_document_origin),
             "raw_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             "library_revision": int(snapshot["library_revision"]),
             "binding": {
@@ -733,8 +757,12 @@ def materialize_state_manager_impact_prompts(
         else:
             continue
 
-        document = info.get("prompt_document")
-        if not _document_supported_by_provider(document, provider):
+        stored_document = info.get("prompt_document")
+        document, document_origin = _transport_document_for_provider(
+            stored_document,
+            provider,
+        )
+        if document is None or document_origin is None:
             _LOG.warning(
                 "[State Manager] managed prompt sidecar skipped consumer=%s source=%s reason=unsupported_descriptor",
                 consumer_id,
@@ -747,6 +775,7 @@ def materialize_state_manager_impact_prompts(
         sidecar = _sidecar(
             text=info["text"],
             prompt_document=document,
+            prompt_document_origin=document_origin,
             snapshot=snapshot,
             manager_id=info["manager_id"],
             text_id=str(text_id),
@@ -760,7 +789,7 @@ def materialize_state_manager_impact_prompts(
         _LOG.info(
             "[State Manager] managed consumer sidecar receipt transport=v1 consumer=%s source=%s "
             "manager=%s text_node=%s impact_node=%s snapshot_revision=%d format=%r routing=%r "
-            "ordering_verified=true queue_contract=ordered-impact-v1 raw_sha256=%s",
+            "document_origin=%s ordering_verified=true queue_contract=ordered-impact-v1 raw_sha256=%s",
             consumer_id,
             source_id,
             info["manager_id"],
@@ -769,6 +798,7 @@ def materialize_state_manager_impact_prompts(
             int(snapshot["library_revision"]),
             _receipt_document_field(document, "format"),
             _receipt_document_field(document, "routing"),
+            document_origin,
             hashlib.sha256(info["text"].encode("utf-8")).hexdigest(),
         )
 
