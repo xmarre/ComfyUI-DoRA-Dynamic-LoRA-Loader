@@ -1709,11 +1709,20 @@ function selectionIdentityForLibraryLoad(node, serializedNode = null) {
   const configured = configuredSelectionIdentity(node, serializedNode);
   if (distributionSafeSelectionEnabled(node, serializedNode)) {
     // Distribution-safe workflow JSON deliberately carries default IDs. Restore
-    // this browser's private selection from local storage instead; if the local
-    // binding is absent (for example on another machine), the serialized defaults
-    // remain authoritative without leaking local preset UUIDs into the workflow.
+    // this browser's private selection from local storage. PR #82 briefly shipped
+    // a workflow-property mirror before distribution-safe restart behavior had a
+    // browser-local binding; accept that non-default mirror once as a migration
+    // source, then initializeStateLibrary() writes the local binding and future
+    // saves scrub the private UUID mirror from workflow JSON.
     const local = readLocalSelection(node, serializedNode);
     if (local) return local;
+    const legacyMirror = readSelectionMirror(node, serializedNode);
+    if (
+      legacyMirror
+      && !selectionIsDefault(legacyMirror.characterId, legacyMirror.promptId)
+    ) {
+      return legacyMirror;
+    }
     if (configured) return configured;
   } else {
     const mirror = readSelectionMirror(node, serializedNode);
