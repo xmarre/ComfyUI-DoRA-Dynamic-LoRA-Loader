@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import logging
@@ -597,18 +598,23 @@ def register_prompt_bridge(
     ordering_verified = isinstance(handlers, list)
 
     def on_prompt(json_data: Any):
+        # PromptServer JSON is request-local plain data. Stage every manager,
+        # Impact and consumer mutation on a detached copy so a late resolution
+        # failure cannot leave only part of a fan-out materialized.
         try:
+            working = copy.deepcopy(json_data)
             materialize_state_manager_impact_prompts(
-                json_data,
+                working,
                 resolve_payload=resolve_payload,
                 library_user_from_ui_state=library_user_from_ui_state,
                 text_for_box=text_for_box,
                 resolve_snapshot=resolve_snapshot,
                 ordering_verified=ordering_verified,
             )
+            return working
         except Exception:
             _LOG.exception("[State Manager] backend prompt bridge failed; leaving submitted prompt unchanged.")
-        return json_data
+            return json_data
 
     previous = getattr(server, marker, None)
     if ordering_verified:
