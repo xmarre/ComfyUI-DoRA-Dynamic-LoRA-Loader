@@ -329,13 +329,10 @@ def _first_registered_continuum_provider() -> Optional[Dict[str, Any]]:
     try:
         import nodes as comfy_nodes
 
-        for cls in getattr(comfy_nodes, "NODE_CLASS_MAPPINGS", {}).values():
-            provider = getattr(cls, "H3_CONTINUUM_PROMPT_TRANSPORT_PROVIDER_V1", None)
-            if not isinstance(provider, dict) or provider.get("provider_version") != 1:
-                continue
-            if not callable(provider.get("classify")) or not callable(provider.get("inspect")):
-                continue
-            return provider
+        for class_type in getattr(comfy_nodes, "NODE_CLASS_MAPPINGS", {}):
+            provider = _continuum_provider(class_type)
+            if provider is not None:
+                return provider
     except Exception:
         return None
     return None
