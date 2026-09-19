@@ -468,7 +468,10 @@ def test_descriptor_bearing_bulk_replace_promotes_v1_with_prewrite_backup(store)
         "format": "fixed",
     }
 
-    result = store.replace([character], 0)
+    with pytest.raises(InvalidStateLibrary, match="contract v5.*prompt_document_v1"):
+        store.replace([character], 0)
+
+    result = store.replace([character], 0, document_capable=True)
 
     assert result["version"] == 2
     backups = list(Path(store.path).parent.glob("state-library.json.v1-backup-*"))
