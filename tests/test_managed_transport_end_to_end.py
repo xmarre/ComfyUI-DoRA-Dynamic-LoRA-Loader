@@ -405,6 +405,58 @@ def test_direct_state_manager_real_impact_to_continuum_sequence_contract(reviewe
     assert "THREE_BLUE_PYRAMID_SENTINEL" not in clip.prompt
 
 
+def test_legacy_state_manager_interval_separators_route_without_prompt_document(reviewed_stack):
+    nodes, bridge, prompts, impact_handler, processor_cls, _feedback, *_continuum = reviewed_stack
+    raw = (
+        "__managed/shared__ [0-7s] __managed/one__ "
+        "[7-14s] __managed/two__"
+    )
+    character = _character(raw)
+    persisted = nodes._get_state_manager_store().replace([character], 0)
+    payload = _queue(nodes, character, mode="populate")
+
+    bridge.materialize_state_manager_impact_prompts(
+        payload,
+        resolve_payload=nodes._resolve_dora_state_payload,
+        resolve_snapshot=nodes._resolve_dora_state_payload_snapshot,
+        library_user_from_ui_state=nodes._queued_library_user_from_ui_state,
+        text_for_box=nodes._state_payload_text_for_box,
+        ordering_verified=True,
+    )
+
+    sidecar = json.loads(payload["prompt"]["260"]["inputs"]["managed_prompt_source_json"])
+    assert sidecar["library_revision"] == persisted["revision"]
+    assert sidecar["prompt_document"] == {"schema_version": 1, "format": "inherit"}
+    assert sidecar["prompt_document_origin"] == "legacy_absent"
+
+    impact_handler(payload)
+    impact_inputs = payload["prompt"]["251"]["inputs"]
+    assert impact_inputs["mode"] == "reproduce"
+    expanded = processor_cls().doit(**impact_inputs)[0]
+    assert "__managed/" not in expanded
+
+    plan = prompts.build_sampler_prompt_plan(
+        prompt_mode="Auto",
+        prompt_script="legacy",
+        sequence_prompt=expanded,
+        prompt_plan=None,
+        chunks=2,
+        chunk_seconds=7.0,
+        managed_prompt_source_json=json.dumps(sidecar),
+    )
+    receipt = plan["managed_prompt_transport"]
+    assert receipt["status"] == "verified_legacy_sequence"
+    assert receipt["document_origin"] == "legacy_absent"
+    assert receipt["legacy_separator_normalized"] is True
+    assert receipt["geometry_match"] is True
+    assert receipt["skeleton_match"] is True
+    assert receipt["sequence_verified"] is True
+    assert plan["prompts"] == [
+        "SHARED_ENV_SENTINEL\n\nONE_RED_CUBE_SENTINEL",
+        "SHARED_ENV_SENTINEL\n\nTWO_GREEN_SPHERE_SENTINEL",
+    ]
+
+
 def test_real_impact_wrapper_has_identical_output_for_both_extension_import_orders(reviewed_stack):
     nodes, bridge, prompts, impact_handler, processor_cls, _feedback, *_continuum = reviewed_stack
     raw = (
