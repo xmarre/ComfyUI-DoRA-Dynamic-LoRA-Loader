@@ -596,11 +596,15 @@ def register_prompt_bridge(
         if callable(previous) and previous in handlers:
             handlers.remove(previous)
         handlers.insert(0, on_prompt)
+        setattr(server, marker, on_prompt)
     else:
         # Compatibility fallback retains v4 materialization but cannot advertise
-        # ordered-impact-v1 or attach managed sequence sidecars.
-        server.add_on_prompt_handler(on_prompt)
-    setattr(server, marker, on_prompt)
+        # ordered-impact-v1 or attach managed sequence sidecars. Without access to
+        # the handler list we cannot safely remove a previous callback, so keep
+        # the already-registered owned callback rather than double-registering.
+        if not callable(previous):
+            server.add_on_prompt_handler(on_prompt)
+            setattr(server, marker, on_prompt)
     _LOG.info(
         "[State Manager] backend prompt bridge registered revision=identity-v2 contract=v5 "
         "backend_write=backend-document-write-v1 ordering_verified=%s",
