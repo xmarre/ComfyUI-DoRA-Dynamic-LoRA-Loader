@@ -158,7 +158,7 @@ def test_is_changed_returns_stable_marker_for_library_io_error(configured_nodes,
     def fail_resolve(*_args, **_kwargs):
         raise OSError("sharing violation")
 
-    monkeypatch.setattr(store, "resolve", fail_resolve)
+    monkeypatch.setattr(store, "resolve_with_revision", fail_resolve)
     marker = json.loads(nodes.StateManager.IS_CHANGED(
         json.dumps(nodes._state_manager_default_binding()),
         "",
@@ -205,3 +205,63 @@ def test_explicit_library_import_kind_wins_over_stray_character_field(dora_modul
     })
     assert calls == [("library", characters)]
     assert result["characters"] == characters
+
+
+def test_request_local_queue_snapshot_prevents_mid_execution_library_mixing(configured_nodes):
+    nodes = configured_nodes
+    character = persistent_character()
+    store = nodes._get_state_manager_store()
+    first = store.replace([character], 0)
+    frozen = nodes._resolve_dora_state_payload_snapshot(
+        json.dumps(nodes._state_manager_default_binding()),
+        character["id"],
+        character["prompts"][0]["id"],
+    )
+    assert frozen["library_revision"] == first["revision"]
+    assert frozen["payload"]["positive_prompt"] == "runtime positive"
+    assert frozen["payload"]["settings"]["seed"] == 42
+
+    store.update_prompt_text_box(
+        character["id"],
+        character["prompts"][0]["id"],
+        "positive",
+        "default",
+        "new persistent prompt",
+        first["revision"],
+    )
+    ui_state = json.dumps({
+        "__dsm_queue_snapshot_v1": frozen,
+        "__dsm_queued_runtime_nonce": "request-1",
+    })
+    result = nodes.StateManager().resolve_state(
+        json.dumps(nodes._state_manager_default_binding()),
+        ui_state,
+        character["id"],
+        character["prompts"][0]["id"],
+    )
+    assert result[0]["positive_prompt"] == "runtime positive"
+    assert result[6] == 42
+
+    marker = json.loads(nodes.StateManager.IS_CHANGED(
+        json.dumps(nodes._state_manager_default_binding()),
+        ui_state,
+        character["id"],
+        character["prompts"][0]["id"],
+    ))
+    assert marker["library_revision"] == first["revision"]
+    assert marker["queue_snapshot"] is True
+
+
+def test_v2_import_requires_prompt_document_capability_before_mutation(dora_modules):
+    import dora_loader_testpkg.state_manager_api as api
+
+    class Store:
+        def merge_library(self, _characters):
+            raise AssertionError("must not mutate before capability validation")
+
+    with pytest.raises(Exception, match="prompt_document_v1"):
+        api._import_payload(Store(), {
+            "version": 2,
+            "kind": "dora_state_manager_library_export",
+            "characters": [persistent_character()],
+        })
