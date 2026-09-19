@@ -386,7 +386,13 @@ def test_prompt_document_write_migrates_v1_once_and_preserves_unrelated_state(st
     backup_path = Path(result["backup_path"])
     assert backup_path.is_file()
     backup = json.loads(backup_path.read_text(encoding="utf-8"))
-    assert backup == first
+    # The recoverable backup is the complete on-disk v1 container. The public
+    # snapshot intentionally omits its migration ledger, so compare the public
+    # state fields explicitly and keep the ledger losslessly in the backup.
+    assert backup["version"] == first["version"] == 1
+    assert backup["revision"] == first["revision"]
+    assert backup["characters"] == first["characters"]
+    assert backup.get("migrations", []) == []
 
     after = result["snapshot"]
     assert after["characters"][1] == before_unrelated
