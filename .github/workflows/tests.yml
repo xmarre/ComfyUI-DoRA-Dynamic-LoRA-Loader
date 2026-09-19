@@ -40,7 +40,7 @@ jobs:
           done < <(find web -type f -name '*.js' -print0)
 
       - name: Run frontend regression tests
-        run: node --test tests/test_frontend_state_persistence.mjs tests/test_frontend_widget_compatibility.mjs tests/test_state_manager_frontend.mjs
+        run: node --test tests/test_frontend_state_persistence.mjs tests/test_frontend_widget_compatibility.mjs tests/test_state_manager_frontend.mjs tests/test_state_manager_distribution_safe_frontend.mjs
 
       - name: Build package wheel
         run: |
