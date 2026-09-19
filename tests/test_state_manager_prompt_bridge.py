@@ -499,6 +499,7 @@ def test_registered_handler_rolls_back_all_staged_mutations_on_late_failure(
 
     nodes = configured_nodes
     character = _persistent_character("[0-5s]\nONE")
+    nodes._get_state_manager_store().replace([character], 0)
     payload = _prompt(nodes, character)
     before = copy.deepcopy(payload)
 
