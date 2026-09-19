@@ -389,8 +389,8 @@ function promptDocumentEditor(node, box) {
   providerNote.textContent = provider
     ? (
         orderingVerified
-          ? `Detected Continuum provider v${provider.provider_version}; logical chunks ${limits.chunkMin ?? "?"}–${limits.chunkMax ?? "?"}, chunk duration ${limits.secondsMin ?? "?"}–${limits.secondsMax ?? "?"}s. Ordered Impact transport is verified.`
-          : `Detected Continuum provider v${provider.provider_version}, but ordered Impact transport is not verified in this runtime. Interpretation metadata can be saved; managed sequence verification will remain disabled.`
+          ? `Detected Continuum provider v${provider.provider_version}; logical chunks ${limits.chunkMin ?? "?"}–${limits.chunkMax ?? "?"}, chunk duration ${limits.secondsMin ?? "?"}–${limits.secondsMax ?? "?"}s. Ordered Impact transport was verified when provider status was loaded; queue-time ordering is revalidated for every request.`
+          : `Detected Continuum provider v${provider.provider_version}, but ordered Impact transport was not verified when provider status was loaded. Interpretation metadata can be saved; queue-time verification remains authoritative.`
       )
     : "No compatible Continuum prompt-transport provider is currently advertised; metadata can be saved, but managed sequence verification remains unavailable until a compatible consumer is installed.";
 
