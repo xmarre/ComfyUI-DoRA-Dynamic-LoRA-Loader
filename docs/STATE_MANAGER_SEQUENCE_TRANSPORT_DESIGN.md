@@ -70,6 +70,24 @@ ac8719110887b2e53d9a0462f8d81f92a7d46f26.
 **U:** installed Impact/server file bytes and handler registration order were not
 available. Matching package versions does not establish installed-source parity.
 
+Additional open-layer audit: Continuum #22 remains a draft at
+4bb57cb32eb442b0dce9bb5c8afcc27114e1b02e, based on #20. It is the older physical
+transport/research layer and includes Timeline Video changes excluded from #23's
+production scope. Do not stack #22 together with #23 or substitute it for #23.
+Continuum #25 is a draft at 321c6224eecb46d848f482c816dd96ab1ba80d7f, based on
+#24, adding only tests/test_keyless_compatibility.py and
+docs/KEYLESS_H3_COMPATIBILITY.md. It changes no runtime Python; preserve it if
+present in the user's overlays. Both additional heads have green returned checks,
+no submitted/inline reviews and only review-skipped bot discussion. Unrelated
+DoRA #74 remains out of scope and must not be modified.
+
+The historical docs/PATCHER_ACTIVATION.md on #22 documents synthetic merge
+commits: installed HEAD need not equal any PR head. Validate effective content,
+overlay membership and activation receipts, never raw local SHA equality alone.
+The historical docs/PHYSICAL_TIMELINE_PROMPT_TRANSPORT_00418.md establishes the
+strict inner grammar and protected-window provenance; it is not the failing
+1023-character preset. Current #23 contracts take precedence over the old draft.
+
 Continuum AGENTS.md requires malformed/unknown prompt syntax to pass through as
 diagnostic Fixed fallback, prohibits new prompt-content execution stops and
 preserves compact V3.4 UI. No AGENTS.md was found in audited DoRA/Writer trees.
@@ -295,6 +313,9 @@ New Writer uses the v5 method; old Writer remains usable.
 Version-2 bulk replace/import requires a document-capable request. Reject a stale
 client that would strip descriptors rather than accepting destructive persistence.
 Targeted v4 text edits remain supported. Revision/user-selection protections remain.
+Version-2 library/character exports must advertise descriptor support; import
+validates the document version before normalization. Preserve raw future-version
+documents on disk, and never send them through a lossy legacy export normalizer.
 
 ### Queue sidecar and Continuum public contract
 
@@ -391,6 +412,9 @@ do not silently claim all possible extensions are ordered correctly.
    document format; inherit uses native Auto. Conflicting explicit sampler mode
    is diagnosed and executed as requested, never called verified sequence success.
    Writer's Sync settings & apply remains the explicit settings-edit action.
+   A conflict with explicit Fixed/List bypasses sequence structural validation:
+   execute that mode normally and emit the conflict receipt. Do not accidentally
+   override a deliberate List choice with a later Timeline-fallback branch.
 3. For logical Timeline inspect original text with native parser: one outer signal
    per configured logical chunk, exact timed interval or [Chunk N]; reject
    missing/duplicate/mixed/extra routing in the *validation result*. Stored geometry
@@ -453,6 +477,11 @@ document it and choose the smallest explicit change; do not silently replace Imp
 | Explicit sampler conflict | execute explicit sampler mode; diagnose conflict |
 
 No migration based on role, number of boxes, filenames, prose or text length.
+For a known old Continuum consumer with a native prompt_mode input, the backend
+may map an explicit Fixed/List descriptor to that mode request-locally only when
+the submitted mode is Auto. Preserve an explicitly chosen sampler mode. This
+keeps explicit Fixed text opaque during a mixed-version transition; it does not
+claim post-Impact structure verification. No persistent widget edits are implied.
 Rollback after v2 requires deliberate recovery from the v1 backup, never automatic
 field erasure. Plain v1 users migrate only when they create explicit documents.
 
@@ -709,6 +738,8 @@ Final document commit is provided by the implementation handoff.
    distinct; #24 stays based on #23 with its audio-only delta. Apply new adapter
    delta after existing layers in Patcher and test the combination. Any necessary
    topology adjustment needs evidence and a remote checkpoint.
+   Preserve optional #25 after #24; its current delta is tests/documentation only.
+   Do not include the alternative research #22 overlay in the production stack.
 3. New DoRA implementation mirror/PR based on #79. Preserve #79's focused,
    one-commit implementation. Do not implement on the design branch.
 4. New Writer producer mirror/PR based on #20, itself on #19. Preserve #20's
