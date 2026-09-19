@@ -115,10 +115,21 @@ def register_routes(
             payload = await request.json()
             if not isinstance(payload, dict):
                 raise InvalidStateLibrary("The State Manager library request is malformed.")
+            try:
+                contract_version = int(payload.get("contract_version", 0) or 0)
+            except (TypeError, ValueError):
+                contract_version = 0
+            capabilities = payload.get("capabilities")
+            document_capable = (
+                contract_version >= 5
+                and isinstance(capabilities, list)
+                and "prompt_document_v1" in capabilities
+            )
             snapshot = await asyncio.to_thread(
                 store.replace,
                 payload.get("characters"),
                 payload.get("expected_revision"),
+                document_capable,
             )
             return web.json_response(with_user_id(snapshot, user_id))
         except Exception as exc:
