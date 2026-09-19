@@ -149,7 +149,7 @@ jobs:
         with:
           persist-credentials: false
           repository: xmarre/ComfyUI-H3-Continuum-Plus
-          ref: 78364186ebfa63d3124850b5b370d0a86fad365a
+          ref: 17ba3e074a11cc914bfab33f5c8fe4c98cd7fad6
           path: H3Continuum
 
       - name: Set up Python
