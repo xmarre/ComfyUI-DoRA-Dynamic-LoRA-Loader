@@ -259,6 +259,7 @@ async function loadPromptTransportProvider() {
     } finally {
       promptTransportProviderClient.loaded = true;
       promptTransportProviderClient.loading = null;
+      for (const node of stateLibraryClient.nodes) scheduleRender(node);
     }
     return promptTransportProviderClient.provider;
   })();
@@ -4656,8 +4657,8 @@ function serializeQueuedUiStateIdentity(uiState, characterId, promptId) {
     __dsm_library_user_id: stateLibraryClient.userId,
     __dsm_queued_runtime_character_id: String(characterId ?? ""),
     __dsm_queued_runtime_prompt_id: String(promptId ?? ""),
-    __dsm_frontend_prompt_contract_version: 4,
-    __dsm_frontend_prompt_contract_revision: "backend-write-v1",
+    __dsm_frontend_prompt_contract_version: 5,
+    __dsm_frontend_prompt_contract_revision: "backend-document-write-v1",
   }, null, 0);
 }
 
