@@ -1613,29 +1613,32 @@ function ensureLocalSelectionBinding(node) {
   return binding;
 }
 
-function localSelectionStorageKey(node, serializedNode = null, { create = false } = {}) {
+function localSelectionStorageKeys(node, serializedNode = null, { create = false } = {}) {
   const serializedBinding = String(
     serializedNode?.properties?.[LOCAL_SELECTION_BINDING_PROPERTY] || "",
   ).trim();
   const binding = serializedBinding || String(
     node?.properties?.[LOCAL_SELECTION_BINDING_PROPERTY] || "",
   ).trim() || (create ? ensureLocalSelectionBinding(node) : "");
-  if (!binding) return "";
+  if (!binding) return [];
+  const base = `${LOCAL_SELECTION_STORAGE_PREFIX}:${binding}`;
   const nodeId = String(serializedNode?.id ?? node?.id ?? "").trim();
-  return `${LOCAL_SELECTION_STORAGE_PREFIX}:${binding}:${nodeId || "unassigned"}`;
+  return nodeId ? [`${base}:${nodeId}`, base] : [base];
 }
 
 function readLocalSelection(node, serializedNode = null) {
-  const key = localSelectionStorageKey(node, serializedNode);
-  if (!key) return null;
+  const storage = globalThis.localStorage;
+  if (!storage || typeof storage.getItem !== "function") return null;
   try {
-    const raw = globalThis.localStorage?.getItem?.(key);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    const selection = normalizeSelectionIdentity(parsed.character_id, parsed.prompt_id);
-    if (!selection.characterId && !selection.promptId) return null;
-    return selection;
+    for (const key of localSelectionStorageKeys(node, serializedNode)) {
+      const raw = storage.getItem(key);
+      if (!raw) continue;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      const selection = normalizeSelectionIdentity(parsed.character_id, parsed.prompt_id);
+      if (selection.characterId || selection.promptId) return selection;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -1643,15 +1646,24 @@ function readLocalSelection(node, serializedNode = null) {
 
 function writeLocalSelection(node, characterId, promptId) {
   if (!node) return false;
-  const key = localSelectionStorageKey(node, null, { create: true });
-  if (!key) return false;
+  const storage = globalThis.localStorage;
+  if (!storage || typeof storage.setItem !== "function") return false;
+  const keys = localSelectionStorageKeys(node, null, { create: true });
+  if (!keys.length) return false;
   const selection = normalizeSelectionIdentity(characterId, promptId);
+  const payload = JSON.stringify({
+    version: 1,
+    character_id: selection.characterId || "default_character",
+    prompt_id: selection.promptId || "default_prompt",
+  });
   try {
-    globalThis.localStorage?.setItem?.(key, JSON.stringify({
-      version: 1,
-      character_id: selection.characterId || "default_character",
-      prompt_id: selection.promptId || "default_prompt",
-    }));
+    storage.setItem(keys[0], payload);
+    // If selection was written before ComfyUI assigned a stable node id, the
+    // binding-only key remains a valid fallback. Once an id is available, keep
+    // the exact key authoritative and retire that construction-time fallback.
+    if (keys.length > 1 && typeof storage.removeItem === "function") {
+      storage.removeItem(keys[1]);
+    }
     return true;
   } catch {
     return false;
