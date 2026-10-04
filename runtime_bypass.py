@@ -25,6 +25,7 @@ import comfy.utils
 import folder_paths
 
 from . import nodes as _base
+from .runtime_audit import RuntimeAudit
 
 
 _LOG = logging.getLogger(__name__)
@@ -257,6 +258,7 @@ def _runtime_adapter_for_bypass(adapter: Any, lora_name: str, raw_key: Any) -> A
 def _make_stacked_injection(
     root: Any,
     adapters: Iterable[Dict[str, Any]],
+    audit=None,
 ) -> Tuple[List[Any], int]:
     """Build one injection whose same-module hooks unwind in strict reverse order."""
     grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -273,9 +275,11 @@ def _make_stacked_injection(
         for item in items:
             hook = comfy.weight_adapter.BypassForwardHook(
                 module,
-                item["adapter"],
+                copy.copy(item["adapter"]) if audit is not None else item["adapter"],
                 multiplier=float(item["strength"]),
             )
+            if audit is not None:
+                audit.attach(hook, item)
             hooks.append(hook)
 
     active_hooks: List[Any] = []
@@ -289,6 +293,8 @@ def _make_stacked_injection(
             for hook in hooks:
                 hook.inject()
                 active_hooks.append(hook)
+            if audit is not None:
+                audit.manifest()
         except Exception:
             while active_hooks:
                 hook = active_hooks.pop()
@@ -373,6 +379,7 @@ class RuntimeBypassDoraPowerLoraLoader(_base.DoraPowerLoraLoader):
             {
                 "base": base_key,
                 _RUNTIME_INPUT: _as_bool(kwargs.get(_RUNTIME_INPUT, False)),
+                "runtime_audit": _as_bool(os.environ.get("DORA_RUNTIME_AUDIT", False)),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -602,8 +609,13 @@ class RuntimeBypassDoraPowerLoraLoader(_base.DoraPowerLoraLoader):
 
             model_adapters = self._runtime_bypass_capture["model"]
             if new_model is not None and model_adapters:
-                injections, model_count = _make_stacked_injection(new_model.model, model_adapters)
+                audit = RuntimeAudit(injection_key) if _as_bool(os.environ.get("DORA_RUNTIME_AUDIT", False)) else None
+                injections, model_count = _make_stacked_injection(new_model.model, model_adapters, audit=audit)
                 new_model.set_injections(injection_key, injections)
+                if audit is not None:
+                    new_model.add_wrapper_with_key(
+                        comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, injection_key, audit.wrapper
+                    )
 
             clip_adapters = self._runtime_bypass_capture["clip"]
             if new_clip is not None and clip_adapters:

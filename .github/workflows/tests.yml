@@ -29,7 +29,7 @@ jobs:
           node-version: "22"
 
       - name: Compile Python sources
-        run: python -m py_compile __init__.py nodes.py runtime_bypass.py state_manager_api.py state_manager_store.py
+        run: python -m py_compile __init__.py nodes.py runtime_bypass.py runtime_audit.py state_manager_api.py state_manager_store.py
 
       - name: Check frontend JavaScript syntax
         shell: bash
