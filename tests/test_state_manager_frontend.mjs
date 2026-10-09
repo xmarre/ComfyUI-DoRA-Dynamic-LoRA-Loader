@@ -2665,3 +2665,59 @@ test("library HTTP 409 safely rebases disjoint character edits", async () => {
     else globalThis.__dsmTestFetchApi = oldFetch;
   }
 });
+
+test("library HTTP 409 refuses same-character overwrite and reports original cause", async () => {
+  const h = await loadStateManagerHelpers();
+  const base = [privateCharacter("character-a", "A", "A0")];
+  h.installLibrarySnapshot({ revision: 2, characters: base }, { force: true, clearBlocked: true });
+  const desired = structuredClone(base);
+  desired[0].prompts[0].positive = "local edit";
+  const remote = structuredClone(base);
+  remote[0].prompts[0].positive = "remote edit";
+  h.stateLibraryClient.pending.push({ node: { id: 1 }, baseCharacters: base, desiredCharacters: desired });
+  const oldFetch = globalThis.__dsmTestFetchApi;
+  let requests = 0;
+  globalThis.__dsmTestFetchApi = async () => {
+    requests++;
+    return mockLibraryResponse(409, { code: "revision_conflict", snapshot: { revision: 3, characters: remote } });
+  };
+  try {
+    await h.writePendingLibrary();
+    assert.equal(requests, 1);
+    assert.equal(h.stateLibraryClient.blocked, true);
+    assert.equal(h.stateLibraryClient.state.characters[0].prompts[0].positive, "remote edit");
+    await assert.rejects(
+      h.flushPendingLibraryWrites(),
+      (err) => err.code === "DSM_LIBRARY_WRITE_BLOCKED"
+        && /character-a was edited concurrently/.test(err.message)
+        && /Reload library/.test(err.message),
+    );
+  } finally {
+    if (oldFetch === undefined) delete globalThis.__dsmTestFetchApi;
+    else globalThis.__dsmTestFetchApi = oldFetch;
+  }
+});
+
+test("failed library reload keeps queue blocked until verified successful GET", async () => {
+  const h = await loadStateManagerHelpers();
+  h.installLibrarySnapshot({ revision: 2, characters: [] }, { force: true, clearBlocked: true });
+  h.stateLibraryClient.blocked = true;
+  h.stateLibraryClient.blockedReason = "Library save failed: storage unavailable";
+  h.installLibrarySnapshot({ revision: 3, characters: [] });
+  assert.equal(h.stateLibraryClient.blocked, true, "unrelated hydration must not clear the latch");
+  const oldFetch = globalThis.__dsmTestFetchApi;
+  globalThis.__dsmTestFetchApi = async () => mockLibraryResponse(500, { error: "still unavailable" });
+  try {
+    await assert.rejects(h.reloadStateLibrary(null), /still unavailable/);
+    assert.equal(h.stateLibraryClient.blocked, true);
+    await assert.rejects(h.flushPendingLibraryWrites(), /storage unavailable/);
+    globalThis.__dsmTestFetchApi = async () => mockLibraryResponse(200, { revision: 4, characters: [] });
+    await h.reloadStateLibrary(null);
+    assert.equal(h.stateLibraryClient.blocked, false);
+    assert.equal(h.stateLibraryClient.blockedReason, "");
+    await h.flushPendingLibraryWrites();
+  } finally {
+    if (oldFetch === undefined) delete globalThis.__dsmTestFetchApi;
+    else globalThis.__dsmTestFetchApi = oldFetch;
+  }
+});
