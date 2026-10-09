@@ -1187,7 +1187,7 @@ async function stateLibraryRequest(path = "", options = {}) {
   return payload;
 }
 
-function installLibrarySnapshot(snapshot, { force = false } = {}) {
+function installLibrarySnapshot(snapshot, { force = false, clearBlocked = false } = {}) {
   const characters = Array.isArray(snapshot?.characters) ? snapshot.characters : [];
   const revision = Math.max(0, Number(snapshot?.revision) || 0);
   if (!force && revision < stateLibraryClient.revision) return false;
@@ -1195,8 +1195,10 @@ function installLibrarySnapshot(snapshot, { force = false } = {}) {
   stateLibraryClient.revision = revision;
   stateLibraryClient.state = { version: STATE_SCHEMA_VERSION, characters: structuredCloneCompat(characters) };
   stateLibraryClient.canonical = canonicalJson(characters);
-  stateLibraryClient.blocked = false;
-  stateLibraryClient.blockedReason = "";
+  if (clearBlocked) {
+    stateLibraryClient.blocked = false;
+    stateLibraryClient.blockedReason = "";
+  }
   return true;
 }
 
@@ -1498,13 +1500,20 @@ function scheduleLibraryPersist(node, state) {
 async function reloadStateLibrary(node, { status = "Reloaded State Manager library." } = {}) {
   // Do not clear the safety latch on a failed GET or race a still-running PUT.
   if (stateLibraryClient.writePromise) await stateLibraryClient.writePromise;
-  if (!stateLibraryClient.blocked) await flushPendingLibraryWrites();
+  if (!stateLibraryClient.blocked) {
+    try {
+      await flushPendingLibraryWrites();
+    } catch (error) {
+      // Reload is the explicit recovery operation for a newly failed pending write.
+      if (error?.code !== "DSM_LIBRARY_WRITE_BLOCKED") throw error;
+    }
+  }
   const snapshot = await stateLibraryRequest();
   if (!Array.isArray(snapshot?.characters) || !Number.isSafeInteger(Number(snapshot?.revision))) {
     throw new Error("The State Manager library reload returned an invalid snapshot.");
   }
   // A successful explicit reload may acknowledge server-side recovery/reset.
-  installLibrarySnapshot(snapshot, { force: stateLibraryClient.blocked });
+  installLibrarySnapshot(snapshot, { force: stateLibraryClient.blocked, clearBlocked: true });
   stateLibraryClient.pending = [];
   stateLibraryClient.lastAppliedNode = null;
   refreshAllNodesFromLibrary({ syncLoaders: true });
