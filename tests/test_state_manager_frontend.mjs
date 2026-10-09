@@ -2721,3 +2721,34 @@ test("failed library reload keeps queue blocked until verified successful GET", 
     else globalThis.__dsmTestFetchApi = oldFetch;
   }
 });
+
+test("repeated external revision conflicts stop after one safe retry", async () => {
+  const h = await loadStateManagerHelpers();
+  const base = [
+    privateCharacter("character-a", "A", "A0"),
+    privateCharacter("character-b", "B", "B0"),
+  ];
+  h.installLibrarySnapshot({ revision: 1, characters: base }, { force: true, clearBlocked: true });
+  const desired = structuredClone(base);
+  desired[1].prompts[0].positive = "local";
+  h.stateLibraryClient.pending.push({ node: { id: 1 }, baseCharacters: base, desiredCharacters: desired });
+  const oldFetch = globalThis.__dsmTestFetchApi;
+  let calls = 0;
+  globalThis.__dsmTestFetchApi = async () => {
+    calls++;
+    const remote = structuredClone(base);
+    remote[0].prompts[0].positive = "remote " + calls;
+    return mockLibraryResponse(409, { snapshot: { revision: calls + 1, characters: remote } });
+  };
+  try {
+    await h.writePendingLibrary();
+    assert.equal(calls, 2);
+    assert.equal(h.stateLibraryClient.blocked, true);
+    assert.equal(h.stateLibraryClient.revision, 3);
+    assert.equal(h.stateLibraryClient.state.characters[0].prompts[0].positive, "remote 2");
+    await assert.rejects(h.flushPendingLibraryWrites(), /changed again during a safe rebase/);
+  } finally {
+    if (oldFetch === undefined) delete globalThis.__dsmTestFetchApi;
+    else globalThis.__dsmTestFetchApi = oldFetch;
+  }
+});
