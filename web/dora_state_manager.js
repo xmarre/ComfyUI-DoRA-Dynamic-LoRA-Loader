@@ -109,6 +109,7 @@ const stateLibraryClient = {
   writing: false,
   writePromise: null,
   blocked: false,
+  blockedReason: "",
   lastAppliedNode: null,
   nodes: new Set(),
 };
@@ -1186,7 +1187,7 @@ async function stateLibraryRequest(path = "", options = {}) {
   return payload;
 }
 
-function installLibrarySnapshot(snapshot, { force = false } = {}) {
+function installLibrarySnapshot(snapshot, { force = false, clearBlocked = false } = {}) {
   const characters = Array.isArray(snapshot?.characters) ? snapshot.characters : [];
   const revision = Math.max(0, Number(snapshot?.revision) || 0);
   if (!force && revision < stateLibraryClient.revision) return false;
@@ -1194,7 +1195,10 @@ function installLibrarySnapshot(snapshot, { force = false } = {}) {
   stateLibraryClient.revision = revision;
   stateLibraryClient.state = { version: STATE_SCHEMA_VERSION, characters: structuredCloneCompat(characters) };
   stateLibraryClient.canonical = canonicalJson(characters);
-  stateLibraryClient.blocked = false;
+  if (clearBlocked) {
+    stateLibraryClient.blocked = false;
+    stateLibraryClient.blockedReason = "";
+  }
   return true;
 }
 
@@ -1300,9 +1304,10 @@ function mergeScheduledLibraryUpdate(baseCharacters, desiredCharacters, currentC
 
 function blockLibraryWrites(status) {
   stateLibraryClient.blocked = true;
+  stateLibraryClient.blockedReason = String(status || "The last library save did not complete.");
   stateLibraryClient.pending = [];
   for (const node of stateLibraryClient.nodes) {
-    restoreNodeAndConnectedLoadersFromLibrary(node, { status });
+    restoreNodeAndConnectedLoadersFromLibrary(node, { status: stateLibraryClient.blockedReason });
   }
 }
 
@@ -1315,7 +1320,7 @@ async function writePendingLibrary() {
     try {
       while (stateLibraryClient.pending.length && !stateLibraryClient.blocked) {
         const pending = stateLibraryClient.pending.shift();
-        const merged = mergeScheduledLibraryUpdate(
+        let merged = mergeScheduledLibraryUpdate(
           pending.baseCharacters,
           pending.desiredCharacters,
           stateLibraryClient.state.characters,
@@ -1325,31 +1330,67 @@ async function writePendingLibrary() {
           blockLibraryWrites("Two local State Manager instances edited the same character concurrently. Reload the library; no conflicting write was sent.");
           break;
         }
-        if (canonicalJson(merged.characters) === stateLibraryClient.canonical) {
-          stateLibraryClient.lastAppliedNode = pending.node;
-          continue;
-        }
-        try {
-          const snapshot = await stateLibraryRequest("", {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              expected_revision: stateLibraryClient.revision,
-              contract_version: 5,
-              capabilities: ["prompt_document_v1"],
-              characters: merged.characters,
-            }),
-          });
-          installLibrarySnapshot(snapshot);
-          stateLibraryClient.lastAppliedNode = pending.node;
-          refreshAllNodesFromLibrary({ syncLoaders: true, skipLoaderSyncNode: pending.node });
-        } catch (error) {
-          if (error.status === 409) {
-            blockLibraryWrites("Library changed in another tab or State Manager. Reload the library before editing again; the stale write was rejected.");
+
+        // One unrelated writer may advance the backend revision between reads.
+        // Rebase only disjoint edits; never overwrite a concurrently edited character.
+        let retriedRevisionConflict = false;
+        while (!stateLibraryClient.blocked) {
+          if (canonicalJson(merged.characters) === stateLibraryClient.canonical) {
+            stateLibraryClient.lastAppliedNode = pending.node;
             break;
           }
-          blockLibraryWrites(`Library save failed: ${error?.message || error}`);
-          break;
+          try {
+            const snapshot = await stateLibraryRequest("", {
+              method: "PUT",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                expected_revision: stateLibraryClient.revision,
+                contract_version: 5,
+                capabilities: ["prompt_document_v1"],
+                characters: merged.characters,
+              }),
+            });
+            if (!installLibrarySnapshot(snapshot)) {
+              throw new Error("The library save returned an older revision than the active snapshot.");
+            }
+            stateLibraryClient.lastAppliedNode = pending.node;
+            refreshAllNodesFromLibrary({ syncLoaders: true, skipLoaderSyncNode: pending.node });
+            break;
+          } catch (error) {
+            if (error.status === 409) {
+              const latest = error.payload?.snapshot;
+              const latestRevision = Number(latest?.revision);
+              if (
+                !Array.isArray(latest?.characters)
+                || !Number.isSafeInteger(latestRevision)
+                || latestRevision <= stateLibraryClient.revision
+              ) {
+                blockLibraryWrites("State Manager received an invalid or stale library revision-conflict response. Reload the library before editing again.");
+                break;
+              }
+              const rebased = mergeScheduledLibraryUpdate(
+                pending.baseCharacters,
+                pending.desiredCharacters,
+                latest.characters,
+                { allowOverwrite: false },
+              );
+              // Reflect committed external changes even if the local edit conflicts.
+              installLibrarySnapshot(latest);
+              if (rebased.conflict) {
+                blockLibraryWrites(`State Manager character ${rebased.conflict} was edited concurrently. The local change was not saved. Reload the library before editing or queueing.`);
+                break;
+              }
+              if (retriedRevisionConflict) {
+                blockLibraryWrites("State Manager library changed again during a safe rebase. Reload the library before editing or queueing.");
+                break;
+              }
+              merged = rebased;
+              retriedRevisionConflict = true;
+              continue;
+            }
+            blockLibraryWrites(`Library save failed: ${error?.message || error}`);
+            break;
+          }
         }
       }
     } finally {
@@ -1371,24 +1412,22 @@ function stateManagerQueueBlocked(message, code = "DSM_STATE_MANAGER_QUEUE_BLOCK
   return error;
 }
 
+function libraryWriteBlockedError() {
+  const reason = stateLibraryClient.blockedReason || "The previous persistent library write did not complete.";
+  return stateManagerQueueBlocked(
+    `State Manager queue blocked: ${reason} Use Reload library in the State Manager to re-read persisted presets before queueing.`,
+    "DSM_LIBRARY_WRITE_BLOCKED",
+  );
+}
+
 async function flushPendingLibraryWrites() {
   while (stateLibraryClient.writePromise || stateLibraryClient.pending.length) {
     const active = stateLibraryClient.writePromise;
     if (active) await active;
     else await writePendingLibrary();
-    if (stateLibraryClient.blocked) {
-      throw stateManagerQueueBlocked(
-        "State Manager queue blocked because a persistent library write failed. Reload the State Manager library before queueing.",
-        "DSM_LIBRARY_WRITE_BLOCKED",
-      );
-    }
+    if (stateLibraryClient.blocked) throw libraryWriteBlockedError();
   }
-  if (stateLibraryClient.blocked) {
-    throw stateManagerQueueBlocked(
-      "State Manager queue blocked because persistent library writes are disabled after an earlier failure. Reload the State Manager library before queueing.",
-      "DSM_LIBRARY_WRITE_BLOCKED",
-    );
-  }
+  if (stateLibraryClient.blocked) throw libraryWriteBlockedError();
 }
 
 function validateManagedQueueTextState() {
@@ -1459,11 +1498,24 @@ function scheduleLibraryPersist(node, state) {
 }
 
 async function reloadStateLibrary(node, { status = "Reloaded State Manager library." } = {}) {
-  stateLibraryClient.blocked = false;
+  // Do not clear the safety latch on a failed GET or race a still-running PUT.
+  if (stateLibraryClient.writePromise) await stateLibraryClient.writePromise;
+  if (!stateLibraryClient.blocked) {
+    try {
+      await flushPendingLibraryWrites();
+    } catch (error) {
+      // Reload is the explicit recovery operation for a newly failed pending write.
+      if (error?.code !== "DSM_LIBRARY_WRITE_BLOCKED") throw error;
+    }
+  }
+  const snapshot = await stateLibraryRequest();
+  if (!Array.isArray(snapshot?.characters) || !Number.isSafeInteger(Number(snapshot?.revision))) {
+    throw new Error("The State Manager library reload returned an invalid snapshot.");
+  }
+  // A successful explicit reload may acknowledge server-side recovery/reset.
+  installLibrarySnapshot(snapshot, { force: stateLibraryClient.blocked, clearBlocked: true });
   stateLibraryClient.pending = [];
   stateLibraryClient.lastAppliedNode = null;
-  const snapshot = await stateLibraryRequest();
-  installLibrarySnapshot(snapshot, { force: true });
   refreshAllNodesFromLibrary({ syncLoaders: true });
   refreshNodeFromLibrary(node, { status });
 }
@@ -3833,7 +3885,7 @@ function renderHeader(node, state, uiState, character, prompt) {
       try {
         await reloadStateLibrary(node);
       } catch (err) {
-        setStatus(node, `Library reload failed: ${err?.message || err}`);
+        refreshNodeFromLibrary(node, { status: `Library reload failed: ${err?.message || err}` });
       }
     }, "Discard unsaved stale edits and reload persistent storage")
   );

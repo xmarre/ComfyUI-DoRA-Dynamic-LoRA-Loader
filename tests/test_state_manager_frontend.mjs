@@ -10,7 +10,7 @@ async function loadStateManagerHelpers() {
     .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
     .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi(...args) { if (typeof globalThis.__dsmTestFetchApi === 'function') return globalThis.__dsmTestFetchApi(...args); throw new Error('not used'); }, apiURL(value) { return value; } };")
     .replace('import "../../scripts/domWidget.js";', "");
-  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, normalizeSelectionIdentity, readSelectionMirror, readLocalSelection, writeLocalSelection, writeSelectionMirror, configuredSelectionIdentity, selectionResolutionForLibraryLoad, selectionIdentityForLibraryLoad, authoritativeSelectionIdentity, rememberAuthoritativeSelection, captureStateManagerWorkflowState, updateState, initializeNode, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary, flushPendingLibraryWrites, validateManagedQueueTextState, prepareStateManagerQueuePayload };\n`;
+  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, normalizeSelectionIdentity, readSelectionMirror, readLocalSelection, writeLocalSelection, writeSelectionMirror, configuredSelectionIdentity, selectionResolutionForLibraryLoad, selectionIdentityForLibraryLoad, authoritativeSelectionIdentity, rememberAuthoritativeSelection, captureStateManagerWorkflowState, updateState, initializeNode, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, installLibrarySnapshot, reloadStateLibrary, writePendingLibrary, flushPendingLibraryWrites, validateManagedQueueTextState, prepareStateManagerQueuePayload };\n`;
   const encoded = Buffer.from(source, "utf8").toString("base64");
   return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
 }
@@ -2624,4 +2624,131 @@ test("queue preparation blocks a nonempty managed Text Box when persistent text 
     },
   );
   assert.equal(promptPayload.output["2"].inputs.text, timeline);
+});
+
+function mockLibraryResponse(status, payload) {
+  return { ok: status >= 200 && status < 300, status, async json() { return payload; } };
+}
+
+test("library HTTP 409 safely rebases disjoint character edits", async () => {
+  const h = await loadStateManagerHelpers();
+  const base = [
+    privateCharacter("character-a", "A", "A0"),
+    privateCharacter("character-b", "B", "B0"),
+  ];
+  h.installLibrarySnapshot({ revision: 2, characters: base }, { force: true, clearBlocked: true });
+  const desired = structuredClone(base);
+  desired[1].prompts[0].positive = "B1";
+  const remote = structuredClone(base);
+  remote[0].prompts[0].positive = "A remote";
+  h.stateLibraryClient.pending.push({ node: { id: 1 }, baseCharacters: base, desiredCharacters: desired });
+  const oldFetch = globalThis.__dsmTestFetchApi;
+  const writes = [];
+  globalThis.__dsmTestFetchApi = async (_url, opts) => {
+    const body = JSON.parse(opts.body);
+    writes.push(body);
+    if (writes.length === 1) {
+      return mockLibraryResponse(409, { code: "revision_conflict", snapshot: { revision: 3, characters: remote } });
+    }
+    return mockLibraryResponse(200, { revision: 4, characters: body.characters });
+  };
+  try {
+    await h.writePendingLibrary();
+    assert.deepEqual(writes.map((item) => item.expected_revision), [2, 3]);
+    assert.equal(writes[1].characters[0].prompts[0].positive, "A remote");
+    assert.equal(writes[1].characters[1].prompts[0].positive, "B1");
+    assert.equal(h.stateLibraryClient.blocked, false);
+    assert.equal(h.stateLibraryClient.revision, 4);
+    await h.flushPendingLibraryWrites();
+  } finally {
+    if (oldFetch === undefined) delete globalThis.__dsmTestFetchApi;
+    else globalThis.__dsmTestFetchApi = oldFetch;
+  }
+});
+
+test("library HTTP 409 refuses same-character overwrite and reports original cause", async () => {
+  const h = await loadStateManagerHelpers();
+  const base = [privateCharacter("character-a", "A", "A0")];
+  h.installLibrarySnapshot({ revision: 2, characters: base }, { force: true, clearBlocked: true });
+  const desired = structuredClone(base);
+  desired[0].prompts[0].positive = "local edit";
+  const remote = structuredClone(base);
+  remote[0].prompts[0].positive = "remote edit";
+  h.stateLibraryClient.pending.push({ node: { id: 1 }, baseCharacters: base, desiredCharacters: desired });
+  const oldFetch = globalThis.__dsmTestFetchApi;
+  let requests = 0;
+  globalThis.__dsmTestFetchApi = async () => {
+    requests++;
+    return mockLibraryResponse(409, { code: "revision_conflict", snapshot: { revision: 3, characters: remote } });
+  };
+  try {
+    await h.writePendingLibrary();
+    assert.equal(requests, 1);
+    assert.equal(h.stateLibraryClient.blocked, true);
+    assert.equal(h.stateLibraryClient.state.characters[0].prompts[0].positive, "remote edit");
+    await assert.rejects(
+      h.flushPendingLibraryWrites(),
+      (err) => err.code === "DSM_LIBRARY_WRITE_BLOCKED"
+        && /character-a was edited concurrently/.test(err.message)
+        && /Reload library/.test(err.message),
+    );
+  } finally {
+    if (oldFetch === undefined) delete globalThis.__dsmTestFetchApi;
+    else globalThis.__dsmTestFetchApi = oldFetch;
+  }
+});
+
+test("failed library reload keeps queue blocked until verified successful GET", async () => {
+  const h = await loadStateManagerHelpers();
+  h.installLibrarySnapshot({ revision: 2, characters: [] }, { force: true, clearBlocked: true });
+  h.stateLibraryClient.blocked = true;
+  h.stateLibraryClient.blockedReason = "Library save failed: storage unavailable";
+  h.installLibrarySnapshot({ revision: 3, characters: [] });
+  assert.equal(h.stateLibraryClient.blocked, true, "unrelated hydration must not clear the latch");
+  const oldFetch = globalThis.__dsmTestFetchApi;
+  globalThis.__dsmTestFetchApi = async () => mockLibraryResponse(500, { error: "still unavailable" });
+  try {
+    await assert.rejects(h.reloadStateLibrary(null), /still unavailable/);
+    assert.equal(h.stateLibraryClient.blocked, true);
+    await assert.rejects(h.flushPendingLibraryWrites(), /storage unavailable/);
+    globalThis.__dsmTestFetchApi = async () => mockLibraryResponse(200, { revision: 4, characters: [] });
+    await h.reloadStateLibrary(null);
+    assert.equal(h.stateLibraryClient.blocked, false);
+    assert.equal(h.stateLibraryClient.blockedReason, "");
+    await h.flushPendingLibraryWrites();
+  } finally {
+    if (oldFetch === undefined) delete globalThis.__dsmTestFetchApi;
+    else globalThis.__dsmTestFetchApi = oldFetch;
+  }
+});
+
+test("repeated external revision conflicts stop after one safe retry", async () => {
+  const h = await loadStateManagerHelpers();
+  const base = [
+    privateCharacter("character-a", "A", "A0"),
+    privateCharacter("character-b", "B", "B0"),
+  ];
+  h.installLibrarySnapshot({ revision: 1, characters: base }, { force: true, clearBlocked: true });
+  const desired = structuredClone(base);
+  desired[1].prompts[0].positive = "local";
+  h.stateLibraryClient.pending.push({ node: { id: 1 }, baseCharacters: base, desiredCharacters: desired });
+  const oldFetch = globalThis.__dsmTestFetchApi;
+  let calls = 0;
+  globalThis.__dsmTestFetchApi = async () => {
+    calls++;
+    const remote = structuredClone(base);
+    remote[0].prompts[0].positive = "remote " + calls;
+    return mockLibraryResponse(409, { snapshot: { revision: calls + 1, characters: remote } });
+  };
+  try {
+    await h.writePendingLibrary();
+    assert.equal(calls, 2);
+    assert.equal(h.stateLibraryClient.blocked, true);
+    assert.equal(h.stateLibraryClient.revision, 3);
+    assert.equal(h.stateLibraryClient.state.characters[0].prompts[0].positive, "remote 2");
+    await assert.rejects(h.flushPendingLibraryWrites(), /changed again during a safe rebase/);
+  } finally {
+    if (oldFetch === undefined) delete globalThis.__dsmTestFetchApi;
+    else globalThis.__dsmTestFetchApi = oldFetch;
+  }
 });
