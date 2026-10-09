@@ -2625,3 +2625,43 @@ test("queue preparation blocks a nonempty managed Text Box when persistent text 
   );
   assert.equal(promptPayload.output["2"].inputs.text, timeline);
 });
+
+function mockLibraryResponse(status, payload) {
+  return { ok: status >= 200 && status < 300, status, async json() { return payload; } };
+}
+
+test("library HTTP 409 safely rebases disjoint character edits", async () => {
+  const h = await loadStateManagerHelpers();
+  const base = [
+    privateCharacter("character-a", "A", "A0"),
+    privateCharacter("character-b", "B", "B0"),
+  ];
+  h.installLibrarySnapshot({ revision: 2, characters: base }, { force: true, clearBlocked: true });
+  const desired = structuredClone(base);
+  desired[1].prompts[0].positive = "B1";
+  const remote = structuredClone(base);
+  remote[0].prompts[0].positive = "A remote";
+  h.stateLibraryClient.pending.push({ node: { id: 1 }, baseCharacters: base, desiredCharacters: desired });
+  const oldFetch = globalThis.__dsmTestFetchApi;
+  const writes = [];
+  globalThis.__dsmTestFetchApi = async (_url, opts) => {
+    const body = JSON.parse(opts.body);
+    writes.push(body);
+    if (writes.length === 1) {
+      return mockLibraryResponse(409, { code: "revision_conflict", snapshot: { revision: 3, characters: remote } });
+    }
+    return mockLibraryResponse(200, { revision: 4, characters: body.characters });
+  };
+  try {
+    await h.writePendingLibrary();
+    assert.deepEqual(writes.map((item) => item.expected_revision), [2, 3]);
+    assert.equal(writes[1].characters[0].prompts[0].positive, "A remote");
+    assert.equal(writes[1].characters[1].prompts[0].positive, "B1");
+    assert.equal(h.stateLibraryClient.blocked, false);
+    assert.equal(h.stateLibraryClient.revision, 4);
+    await h.flushPendingLibraryWrites();
+  } finally {
+    if (oldFetch === undefined) delete globalThis.__dsmTestFetchApi;
+    else globalThis.__dsmTestFetchApi = oldFetch;
+  }
+});
