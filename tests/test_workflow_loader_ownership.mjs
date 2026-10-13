@@ -786,3 +786,62 @@ test("after a rejected rename save, applying another preset or renaming back let
     harness.leave(tab);
   }
 });
+
+test("an explicit apply made while an earlier save is in flight keeps its binding when that save commits", async () => {
+  const extensions = await loadExtensions();
+  const { manager } = extensions;
+  const harness = makeHarness(extensions, { revision: 1, characters: [presetCharacter(), otherCharacter(["face"])], putOutcomes: [] });
+  const tab = await harness.open(WORKFLOW_A);
+
+  let release;
+  harness.library.putOutcomes.push({ deferred: new Promise((resolve) => { release = resolve; }) });
+  const saveIntoA = saveConnectedLoaders(manager, tab, "character-a");
+  selectPreset(manager, tab, "character-b", "prompt-b");
+  const characterB = tab.managerNode.__dsm.state.characters.find((item) => item.id === "character-b");
+  assert.equal(manager.syncCharacterLoaderStacksToConnectedNodes(tab.managerNode, characterB), 1);
+  release();
+  await saveIntoA;
+
+  assert.deepEqual(tab.loader.properties.dora_state_binding, { characterId: "character-b", slot: "face" }, "the newer apply wins");
+  assert.deepEqual(tab.loader.properties.dora_power_lora.rows.map((row) => row.name), ["b-face.safetensors"]);
+  assert.deepEqual(rowNames(savedStack(harness.library.characters, "face")), ["face.safetensors", "style.safetensors"], "A holds the save");
+  harness.leave(tab);
+});
+
+test("a confirmed save into another preset after renaming back binds that preset and settles the old rename", async () => {
+  for (const firstWrite of ["rejected", "pending"]) {
+    const extensions = await loadExtensions();
+    const { manager } = extensions;
+    const harness = makeHarness(extensions, { revision: 1, characters: [presetCharacter(), otherCharacter(["face"])], putOutcomes: [] });
+    const tab = await harness.open(WORKFLOW_A);
+
+    renameSlot(tab.loader, "hair");
+    let release = () => {};
+    let saveIntoA;
+    if (firstWrite === "rejected") {
+      harness.library.putOutcomes.push("conflict");
+      await saveConnectedLoaders(manager, tab, "character-a");
+      await manager.reloadStateLibrary(tab.managerNode);
+    } else {
+      harness.library.putOutcomes.push({ deferred: new Promise((resolve) => { release = resolve; }) });
+      saveIntoA = startSaveConnectedLoaders(manager, tab, "character-a").written;
+    }
+    assert.equal(renameOf(tab.loader)?.savedToIn, "character-a", firstWrite);
+    renameSlot(tab.loader, "face");
+
+    selectPreset(manager, tab, "character-b", "prompt-b");
+    const intoB = startSaveConnectedLoaders(manager, tab, "character-b");
+    assert.equal(intoB.result.saved, 1, firstWrite);
+    if (firstWrite === "pending") {
+      assert.equal(renameOf(tab.loader)?.savedToIn, "character-a", "A's pending write still has its rename");
+      release();
+      await saveIntoA;
+      assert.deepEqual(savedSlots(harness.library.characters), ["hair"], "A's pending move committed");
+    }
+    await intoB.written;
+    assert.equal(savedStack(harness.library.characters, "face", "character-b").loras[0].name, "face.safetensors", `${firstWrite}: B holds the loader's rows`);
+    assert.deepEqual(tab.loader.properties.dora_state_binding, { characterId: "character-b", slot: "face" }, firstWrite);
+    assert.equal(renameOf(tab.loader), undefined, `${firstWrite}: no stale A provenance remains`);
+    harness.leave(tab);
+  }
+});

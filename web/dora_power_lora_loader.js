@@ -562,6 +562,20 @@ function setStateSlot(node, value) {
 // loader into a preset. Selecting a preset does not bind the loader.
 //   { characterId, slot }
 const BINDING_PROPERTY = "dora_state_binding";
+// Incremented by every explicit change to which saved stack the loader holds
+// (preset application, State slot changes, renames). A save acknowledgment
+// only binds the loader when no such change happened after that save.
+const SAVE_EPOCH_PROPERTY = "dora_state_epoch";
+
+function getSaveEpoch(node) {
+  const value = node?.properties?.[SAVE_EPOCH_PROPERTY];
+  return Number.isInteger(value) && value > 0 ? value : 0;
+}
+
+function bumpSaveEpoch(node) {
+  node.properties = node.properties || {};
+  node.properties[SAVE_EPOCH_PROPERTY] = getSaveEpoch(node) + 1;
+}
 
 // A user State slot rename is tracked in the workflow until a State Manager
 // save of it is confirmed by the library, or a preset is applied:
@@ -635,6 +649,7 @@ function renameStateSlot(node, value) {
   const current = getStateSlot(node);
   const slot = setStateSlot(node, value);
   if (slot === current) return slot;
+  bumpSaveEpoch(node);
   const rename = getSlotRename(node);
   if (!rename) {
     const binding = getBinding(node);
@@ -661,11 +676,16 @@ function recordSlotRenameSave(node, slot, characterId) {
 }
 
 // A save of this loader into characterId at slot is now held by the library.
-function commitLoaderSave(node, { id, seq, slot, characterId }) {
+// A save that did not track a rename binds the loader only if nothing changed
+// its held stack since (epoch), and settles a leftover rename unless that
+// rename's own save is still pending.
+function commitLoaderSave(node, { id, seq, slot, characterId, epoch }) {
   const committed = normalizeStateSlot(slot, "default");
   const rename = getSlotRename(node);
   if (!id) {
-    if (!rename && getStateSlot(node) === committed) setBinding(node, characterId, committed);
+    if (epoch !== getSaveEpoch(node) || getStateSlot(node) !== committed) return;
+    if (rename && !hasPendingSlotRenameSave(rename)) clearSlotRename(node);
+    setBinding(node, characterId, committed);
     return;
   }
   if (!rename || rename.id !== id) return;
@@ -813,6 +833,7 @@ function installGlobalStateApi() {
       if (externalState && Object.prototype.hasOwnProperty.call(externalState, "slot")) {
         setStateSlot(node, externalState.slot);
       }
+      bumpSaveEpoch(node);
       settleSlotRenameOnApply(node, options?.characterId);
       setBinding(node, options?.characterId, getStateSlot(node));
       setState(node, next);
@@ -837,6 +858,9 @@ function installGlobalStateApi() {
     recordSlotRenameSave(node, slot, characterId) {
       return recordSlotRenameSave(node, slot, characterId);
     },
+    getSaveEpoch(node) {
+      return getSaveEpoch(node);
+    },
     commitLoaderSave(node, commit) {
       commitLoaderSave(node, commit);
     },
@@ -844,6 +868,7 @@ function installGlobalStateApi() {
     // dropping rename tracking that a pending save still depends on.
     restoreSlot(node, value) {
       const slot = setStateSlot(node, value);
+      bumpSaveEpoch(node);
       try { rebuild(node); } catch (_) {}
       node?.setDirtyCanvas?.(true, true);
       node?.graph?.change?.();
@@ -851,6 +876,7 @@ function installGlobalStateApi() {
     },
     setSlot(node, value) {
       const slot = setStateSlot(node, value);
+      bumpSaveEpoch(node);
       settleSlotRenameOnApply(node);
       try { rebuild(node); } catch (_) {}
       node?.setDirtyCanvas?.(true, true);

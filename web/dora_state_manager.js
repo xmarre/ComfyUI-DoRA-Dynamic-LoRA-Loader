@@ -2510,7 +2510,8 @@ function recordDoraLoaderSaves(loaderSaves, materializedCharacterIds) {
       const record = doraLoaderApiFor(loader)?.recordSlotRenameSave?.(loader, slot, finalCharacterId);
       if (record) commits.push({ loader, ...record, slot, characterId: finalCharacterId });
     } else {
-      commits.push({ loader, slot, characterId: finalCharacterId });
+      const epoch = doraLoaderApiFor(loader)?.getSaveEpoch?.(loader) ?? 0;
+      commits.push({ loader, slot, characterId: finalCharacterId, epoch });
     }
   }
   return commits;
