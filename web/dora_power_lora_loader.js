@@ -557,14 +557,14 @@ function setStateSlot(node, value) {
   return slot;
 }
 
-// A user State slot rename is tracked as { from, id } until a State Manager
-// library write that saved it commits, or a preset is applied to the loader.
-// Presets use `from` to move the saved stack instead of duplicating it.
+// A user State slot rename is tracked in the workflow until a State Manager
+// save of it is confirmed by the library, or a preset is applied:
+//   from    - the slot the library last confirmed for this loader's stack
+//   savedTo - where the latest save put the stack (pending or committed)
+//   seq     - counter of saves made under this rename
+// Presets resolve the loader's own saved stack from savedTo, then from, so a
+// save still pending, rejected, or committed before a reload is found again.
 const SLOT_RENAME_PROPERTY = "dora_state_slot_rename";
-// Rename ids whose save committed, mapped to the slot the library now holds.
-// Workflow tabs reopened from JSON serialized before the commit still carry
-// the rename; configure() settles it against this map.
-const committedSlotRenames = new Map();
 
 function makeSlotRenameId() {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
@@ -575,19 +575,19 @@ function getSlotRename(node) {
   if (!value || typeof value !== "object") return null;
   const from = normalizeStateSlot(value.from, "");
   const id = typeof value.id === "string" ? value.id : "";
-  return from && id ? { from, id } : null;
+  if (!from || !id) return null;
+  const savedTo = value.savedTo == null ? "" : normalizeStateSlot(value.savedTo, "");
+  const seq = Number.isInteger(value.seq) && value.seq > 0 ? value.seq : 0;
+  return { from, id, savedTo, seq };
+}
+
+function setSlotRename(node, rename) {
+  node.properties = node.properties || {};
+  node.properties[SLOT_RENAME_PROPERTY] = { ...rename };
 }
 
 function clearSlotRename(node) {
   if (node?.properties) delete node.properties[SLOT_RENAME_PROPERTY];
-}
-
-function settleCommittedSlotRename(node) {
-  const rename = getSlotRename(node);
-  if (!rename || !committedSlotRenames.has(rename.id)) return;
-  const committedSlot = committedSlotRenames.get(rename.id);
-  if (committedSlot === getStateSlot(node)) clearSlotRename(node);
-  else node.properties[SLOT_RENAME_PROPERTY] = { from: committedSlot, id: makeSlotRenameId() };
 }
 
 function renameStateSlot(node, value) {
@@ -595,9 +595,28 @@ function renameStateSlot(node, value) {
   const slot = setStateSlot(node, value);
   if (slot === current) return slot;
   const rename = getSlotRename(node);
-  if (rename?.from === slot) clearSlotRename(node);
-  else if (!rename) node.properties[SLOT_RENAME_PROPERTY] = { from: current, id: makeSlotRenameId() };
+  if (!rename) setSlotRename(node, { from: current, id: makeSlotRenameId(), savedTo: "", seq: 0 });
+  else if (rename.from === slot && !rename.savedTo) clearSlotRename(node);
   return slot;
+}
+
+function recordSlotRenameSave(node, slot) {
+  const rename = getSlotRename(node);
+  if (!rename) return null;
+  const next = { ...rename, savedTo: normalizeStateSlot(slot, "default"), seq: rename.seq + 1 };
+  setSlotRename(node, next);
+  return { id: next.id, seq: next.seq };
+}
+
+function commitSlotRenameSave(node, id, seq, slot) {
+  const rename = getSlotRename(node);
+  if (!rename || rename.id !== id) return;
+  const committed = normalizeStateSlot(slot, "default");
+  if (rename.seq === seq && rename.savedTo === committed && getStateSlot(node) === committed) {
+    clearSlotRename(node);
+    return;
+  }
+  if (seq <= rename.seq) setSlotRename(node, { ...rename, from: committed });
 }
 
 function defaultState() {
@@ -755,9 +774,20 @@ function installGlobalStateApi() {
     getSlotRename(node) {
       return getSlotRename(node);
     },
-    commitSlotRename(node, id, committedSlot) {
-      committedSlotRenames.set(id, normalizeStateSlot(committedSlot, "default"));
-      settleCommittedSlotRename(node);
+    recordSlotRenameSave(node, slot) {
+      return recordSlotRenameSave(node, slot);
+    },
+    commitSlotRenameSave(node, id, seq, slot) {
+      commitSlotRenameSave(node, id, seq, slot);
+    },
+    // Moves the loader back onto the slot its saved stack occupies without
+    // dropping rename tracking that a pending save still depends on.
+    restoreSlot(node, value) {
+      const slot = setStateSlot(node, value);
+      try { rebuild(node); } catch (_) {}
+      node?.setDirtyCanvas?.(true, true);
+      node?.graph?.change?.();
+      return slot;
     },
     setSlot(node, value) {
       const slot = setStateSlot(node, value);
@@ -1927,7 +1957,6 @@ app.registerExtension({
             origConfigure.call(this, safeInfo);
           } catch (_) {}
         }
-        settleCommittedSlotRename(this);
 
         rebuild(this);
       } catch (e) {

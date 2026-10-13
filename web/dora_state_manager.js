@@ -107,6 +107,7 @@ const stateLibraryClient = {
   state: { version: STATE_SCHEMA_VERSION, characters: [] },
   canonical: "[]",
   pending: [],
+  inFlight: null,
   writing: false,
   writePromise: null,
   blocked: false,
@@ -1300,6 +1301,7 @@ async function writePendingLibrary() {
     try {
       while (stateLibraryClient.pending.length && !stateLibraryClient.blocked) {
         const pending = stateLibraryClient.pending.shift();
+        stateLibraryClient.inFlight = pending;
         const merged = mergeScheduledLibraryUpdate(
           pending.baseCharacters,
           pending.desiredCharacters,
@@ -1340,6 +1342,7 @@ async function writePendingLibrary() {
         }
       }
     } finally {
+      stateLibraryClient.inFlight = null;
       stateLibraryClient.writing = false;
     }
   })();
@@ -1437,13 +1440,17 @@ function scheduleLibraryPersist(node, state, renameCommits = []) {
     return;
   }
   const last = stateLibraryClient.pending[stateLibraryClient.pending.length - 1];
-  if (canonical === stateLibraryClient.canonical && last?.node !== node) {
+  // This node's view already includes its own in-flight write, so that write's
+  // result, not the last confirmed library state, is the base of this edit.
+  const ownInFlight = stateLibraryClient.inFlight?.node === node ? stateLibraryClient.inFlight : null;
+  const expectedCharacters = ownInFlight ? ownInFlight.desiredCharacters : stateLibraryClient.state.characters;
+  if (last?.node !== node && !stateLibraryClient.inFlight && canonical === stateLibraryClient.canonical) {
     commitDoraLoaderSlotRenames(renameCommits);
     return;
   }
   const scheduled = {
     node,
-    baseCharacters: structuredCloneCompat(last?.node === node ? last.baseCharacters : stateLibraryClient.state.characters),
+    baseCharacters: structuredCloneCompat(last?.node === node ? last.baseCharacters : expectedCharacters),
     desiredCharacters: structuredCloneCompat(desiredCharacters),
     renameCommits: [...(last?.node === node ? last.renameCommits || [] : []), ...renameCommits],
   };
@@ -2379,16 +2386,15 @@ function saveLoaderStackIntoCharacter(character, stack, index = 0) {
   return setCharacterLoaderStack(character, incoming);
 }
 
-function getDoraLoaderSlotRename(loader) {
+function doraLoaderApiFor(loader) {
   const loaderApi = globalThis.__doraPowerLoraLoaderApi;
-  if (!loaderApi?.getSlotRename || !isDoraLoaderNode(loader)) return null;
-  return loaderApi.getSlotRename(loader);
+  return loaderApi && isDoraLoaderNode(loader) ? loaderApi : null;
 }
 
-function setDoraLoaderSlotFromPreset(loader, slot) {
-  const loaderApi = globalThis.__doraPowerLoraLoaderApi;
-  if (loaderApi?.setSlot && isDoraLoaderNode(loader)) {
-    loaderApi.setSlot(loader, slot);
+function restoreDoraLoaderSlot(loader, slot) {
+  const loaderApi = doraLoaderApiFor(loader);
+  if (loaderApi?.restoreSlot) {
+    loaderApi.restoreSlot(loader, slot);
     return;
   }
   loader.properties = loader.properties || {};
@@ -2396,8 +2402,9 @@ function setDoraLoaderSlotFromPreset(loader, slot) {
 }
 
 function commitDoraLoaderSlotRenames(renameCommits) {
-  const loaderApi = globalThis.__doraPowerLoraLoaderApi;
-  for (const { loader, id, slot } of renameCommits || []) loaderApi?.commitSlotRename?.(loader, id, slot);
+  for (const { loader, id, seq, slot } of renameCommits || []) {
+    doraLoaderApiFor(loader)?.commitSlotRenameSave?.(loader, id, seq, slot);
+  }
 }
 
 function sameLoaderStackContent(a, b) {
@@ -2408,11 +2415,18 @@ function sameLoaderStackContent(a, b) {
   return content(a) === content(b);
 }
 
-// Explicit Save of connected/selected loaders into a preset. A loader whose
-// State slot was renamed since its last committed save or preset application
-// moves its saved stack to the new slot. A renamed loader never overwrites a
-// different stack already saved under its new slot. The rename stays pending
-// until the library write that saved it commits (see renameCommits).
+// Explicit Save of connected/selected loaders into a preset.
+//
+// A loader whose State slot was renamed carries rename tracking (see the
+// loader's SLOT_RENAME_PROPERTY). Its own saved stack is the preset's stack at
+// the slot its latest save wrote (savedTo) or, failing that, at the slot the
+// library last confirmed (from). Saving moves that stack to the loader's
+// current slot. A renamed loader never overwrites a different stack saved
+// under its new slot: it returns to its own stack's slot when the preset holds
+// one, and is otherwise not saved. Each save records where it wrote; the
+// record is acknowledged only after the library write that holds it commits
+// (renameCommits), so pending, rejected, and reloaded saves resolve the same
+// way from the preset contents.
 function saveLoadersIntoCharacter(character, loaders) {
   let saved = 0;
   const notes = [];
@@ -2420,30 +2434,41 @@ function saveLoadersIntoCharacter(character, loaders) {
   loaders.forEach((loader, index) => {
     const stack = extractLoraStackFromNode(loader, index);
     if (!stack) return;
-    const incoming = normalizeLoaderStack(stack, index);
-    const rename = getDoraLoaderSlotRename(loader);
-    const renamedFrom = rename && rename.from !== incoming.slot ? rename.from : "";
+    const loaderApi = doraLoaderApiFor(loader);
+    const rename = loaderApi?.getSlotRename?.(loader) ?? null;
+    let incoming = normalizeLoaderStack(stack, index);
     const stacks = getCharacterLoaderStacks(character);
-    const slotIndex = (slot) => stacks.findIndex((item) => normalizeLoaderSlot(item?.slot, "default") === slot);
-    const fromIndex = renamedFrom ? slotIndex(renamedFrom) : -1;
-    const targetIndex = slotIndex(incoming.slot);
+    const slotIndex = (slot) => (slot ? stacks.findIndex((item) => normalizeLoaderSlot(item?.slot, "default") === slot) : -1);
 
-    if (renamedFrom && targetIndex >= 0 && !sameLoaderStackContent(stacks[targetIndex], incoming)) {
-      if (fromIndex < 0) {
-        notes.push(`Not saved: the loader was renamed from "${renamedFrom}" to "${incoming.slot}", which already holds a different saved stack in this preset.`);
+    if (rename) {
+      const savedToIndex = slotIndex(rename.savedTo);
+      const ownIndex = savedToIndex >= 0 ? savedToIndex : slotIndex(rename.from);
+      const ownSlot = ownIndex >= 0 ? normalizeLoaderSlot(stacks[ownIndex].slot, "default") : "";
+      const targetIndex = slotIndex(incoming.slot);
+
+      if (ownIndex >= 0 && ownSlot !== incoming.slot && targetIndex >= 0) {
+        if (sameLoaderStackContent(stacks[targetIndex], incoming)) {
+          stacks.splice(ownIndex, 1);
+        } else {
+          notes.push(`State slot "${incoming.slot}" already holds another saved stack; kept the loader on "${ownSlot}".`);
+          restoreDoraLoaderSlot(loader, ownSlot);
+          incoming = { ...incoming, slot: ownSlot, label: stacks[ownIndex]?.label || ownSlot };
+          stacks[ownIndex] = incoming;
+        }
+      } else if (ownIndex >= 0) {
+        stacks[ownIndex] = incoming;
+      } else if (targetIndex >= 0 && !sameLoaderStackContent(stacks[targetIndex], incoming)) {
+        notes.push(`Not saved: the loader was renamed from "${rename.from}" to "${incoming.slot}", which already holds a different saved stack in this preset.`);
         return;
+      } else {
+        saveLoaderStackIntoCharacter(character, incoming, index);
       }
-      notes.push(`State slot "${incoming.slot}" already holds another saved stack; kept the loader on "${renamedFrom}".`);
-      setDoraLoaderSlotFromPreset(loader, renamedFrom);
-      stacks[fromIndex] = { ...incoming, slot: renamedFrom, label: stacks[fromIndex]?.label || renamedFrom };
       syncLegacyLoaderMirror(character);
-    } else if (fromIndex >= 0 && targetIndex < 0) {
-      stacks[fromIndex] = incoming;
-      syncLegacyLoaderMirror(character);
+      const record = loaderApi.recordSlotRenameSave?.(loader, incoming.slot);
+      if (record) renameCommits.push({ loader, ...record, slot: incoming.slot });
     } else {
       saveLoaderStackIntoCharacter(character, incoming, index);
     }
-    if (rename && getDoraLoaderSlotRename(loader)) renameCommits.push({ loader, id: rename.id, slot: incoming.slot });
     saved += 1;
   });
   return { saved, notes, renameCommits };
