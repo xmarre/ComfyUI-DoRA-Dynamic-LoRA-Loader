@@ -31,8 +31,10 @@ def _analyze(
     ratio_floor=0.1,
     ratio_ceiling=10.0,
     residual_beta=0.0,
+    depth_trend=None,
     logical_groups=None,
 ):
+    extra = {} if depth_trend is None else {"depth_trend": depth_trend}
     return nodes._auto_strength_analyze_base_targets(
         lora_sd=lora_sd,
         lora_bases=sorted(nodes._extract_lora_bases(lora_sd)),
@@ -47,6 +49,7 @@ def _analyze(
         ratio_ceiling=ratio_ceiling,
         residual_beta=residual_beta,
         logical_groups=logical_groups,
+        **extra,
     )
 
 
@@ -237,7 +240,7 @@ def test_analyzer_default_residual_beta_is_half(dora_modules):
     assert report["linear_depth_redistribution_policy"]["residual_beta"] == pytest.approx(0.5)
 
 
-def test_h3_like_weak_fc2_depth_region_recovers_large_boosts(dora_modules):
+def test_h3_like_weak_fc2_depth_region_recovers_large_boosts_when_flattening_depth_trend(dora_modules):
     nodes, _ = dora_modules
     lora_sd = {}
     key_map = {}
@@ -262,7 +265,7 @@ def test_h3_like_weak_fc2_depth_region_recovers_large_boosts(dora_modules):
             fc2_magnitude,
         )
 
-    targets, report = _analyze(nodes, lora_sd, key_map, model_state)
+    targets, report = _analyze(nodes, lora_sd, key_map, model_state, depth_trend=1.0)
 
     # Helper updates are 2x2: reported scores carry a sqrt(2) output-gain factor.
     family_reference = report["family_references"]["model/linear"] / math.sqrt(2.0)
@@ -436,7 +439,7 @@ def test_bimodal_depth_regime_receives_coherent_local_gains(dora_modules):
             magnitude,
         )
 
-    targets, report = _analyze(nodes, lora_sd, key_map, model_state)
+    targets, report = _analyze(nodes, lora_sd, key_map, model_state, depth_trend=1.0)
 
     family_reference = _geomean([0.5] * 25 + [1.0] * 25)
     assert all(targets[f"block_{block}"] == pytest.approx(family_reference / 0.5) for block in range(25))
@@ -467,7 +470,7 @@ def test_smooth_depth_profile_uses_smooth_local_baseline(dora_modules):
             magnitude,
         )
 
-    targets, report = _analyze(nodes, lora_sd, key_map, model_state)
+    targets, report = _analyze(nodes, lora_sd, key_map, model_state, depth_trend=1.0)
 
     local_references = [magnitudes[min(max(block, 3), 46)] for block in range(50)]
     family_reference = _family_reference(local_references, magnitudes, 0.0)
@@ -497,7 +500,7 @@ def test_populous_tail_is_redistributed_as_a_coherent_depth_regime(dora_modules)
             magnitude,
         )
 
-    targets, report = _analyze(nodes, lora_sd, key_map, model_state)
+    targets, report = _analyze(nodes, lora_sd, key_map, model_state, depth_trend=1.0)
 
     family_reference = _geomean([0.5] * 20 + [1.0] * 30)
     assert all(targets[f"block_{block}"] == pytest.approx(family_reference / 0.5) for block in range(20))
@@ -1192,3 +1195,110 @@ def test_updates_that_cannot_patch_their_destination_do_not_shift_references(dor
         assert item["fallback_to_global"] is True
         assert item["fallback_reason"] == "destination_shape_mismatch"
     assert report["shape_mismatch_bases"] == sorted(f"adaln_{block}" for block in range(5))
+
+
+def _late_heavy_two_role_lora():
+    # Mirrors the profile observed on real MiniMax-H3 LoRAs: every role's update
+    # grows smoothly with depth, plus one mildly off-trend layer.
+    lora_sd = {}
+    key_map = {}
+    model_state = {}
+    profile = {}
+    for block in range(30):
+        trend = math.exp(math.log(4.0) * block / 29.0)
+        for role, level in (("attn.qkv_proj", 1.0), ("mlp.fc2", 0.5)):
+            magnitude = level * trend * (1.3 if (role == "mlp.fc2" and block == 12) else 1.0)
+            base = f"b{block}_{role.replace('.', '_')}"
+            profile[base] = magnitude
+            _add_linear(
+                lora_sd,
+                key_map,
+                model_state,
+                base,
+                f"diffusion_model.blocks.{block}.{role}.weight",
+                magnitude,
+            )
+    return lora_sd, key_map, model_state, profile
+
+
+def test_default_depth_trend_keeps_the_adapter_depth_profile(dora_modules):
+    nodes, _ = dora_modules
+    lora_sd, key_map, model_state, _ = _late_heavy_two_role_lora()
+
+    targets, report = nodes._auto_strength_analyze_base_targets(
+        lora_sd=lora_sd,
+        lora_bases=sorted(nodes._extract_lora_bases(lora_sd)),
+        key_map=key_map,
+        model_state_dict=model_state,
+        clip_state_dict=None,
+        analysis_device_mode="cpu",
+        analysis_load_device=None,
+        strength_model=1.0,
+        strength_clip=1.0,
+        ratio_floor=0.0,
+        ratio_ceiling=1e6,
+    )
+
+    assert report["depth_trend"] == pytest.approx(0.0)
+    assert report["linear_depth_redistribution_policy"]["depth_trend"] == pytest.approx(0.0)
+    # On-trend layers keep one gain per role regardless of depth: the late-heavy
+    # profile is neither cut at the top nor boosted at the bottom. The first and
+    # last three blocks are excluded because the 7-wide moving median is clamped
+    # there and their small residual is corrected like any other.
+    for role in ("attn_qkv_proj", "mlp_fc2"):
+        gains = [
+            targets[f"b{block}_{role}"]
+            for block in range(3, 27)
+            if not (role == "mlp_fc2" and 9 <= block <= 15)
+        ]
+        assert max(gains) / min(gains) == pytest.approx(1.0, abs=1e-6)
+    # The role levels differ by 2x in score, so the role-level correction still
+    # applies (qkv down, fc2 up), and the off-trend layer is pulled toward its trend.
+    assert targets["b0_attn_qkv_proj"] < 1.0 < targets["b0_mlp_fc2"]
+    assert targets["b12_mlp_fc2"] < targets["b11_mlp_fc2"]
+
+
+@pytest.mark.parametrize("depth_trend", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
+def test_depth_trend_endpoints_and_gain_neutrality(dora_modules, depth_trend, beta):
+    nodes, _ = dora_modules
+    lora_sd, key_map, model_state, profile = _late_heavy_two_role_lora()
+
+    targets, report = _analyze(
+        nodes, lora_sd, key_map, model_state,
+        ratio_floor=0.0, ratio_ceiling=1e6, residual_beta=beta, depth_trend=depth_trend,
+    )
+
+    items = {item["logical_id"]: item for item in report["logical_groups"]}
+    assert not any(item["outlier_corrected"] for item in items.values())
+    assert _geomean(item["ratio_raw"] for item in items.values()) == pytest.approx(1.0)
+    for item in items.values():
+        local = item["depth_reference_score"]
+        baseline = item["depth_baseline_score"]
+        center = next(
+            cohort["depth_trend_center_score"]
+            for cohort in report["cohorts"]
+            if cohort["semantic_role"] == item["semantic_role"]
+        )
+        assert baseline == pytest.approx(center ** (1.0 - depth_trend) * local ** depth_trend)
+
+    # Interior on-trend layers: depth_trend alone decides how much of the trend
+    # is flattened (beta only acts on deviations from the local trend).
+    early, late = targets["b4_attn_qkv_proj"], targets["b25_attn_qkv_proj"]
+    score_ratio = profile["b25_attn_qkv_proj"] / profile["b4_attn_qkv_proj"]
+    assert early / late == pytest.approx(score_ratio ** depth_trend)
+
+
+def test_loader_node_exposes_depth_trend_with_default_zero(dora_modules):
+    nodes, _ = dora_modules
+    spec = nodes.DoraPowerLoraLoader.INPUT_TYPES()
+    inputs = {}
+    for section in spec.values():
+        if isinstance(section, dict):
+            inputs.update(section)
+    assert inputs["auto_strength_depth_trend"][1]["default"] == 0.0
+    assert "auto_strength_depth_trend" in nodes._DORA_STATE_LOADER_GLOBAL_KEYS
+    normalized = nodes._normalize_manager_loader_globals(
+        {"auto_strength_depth_trend": "0.25", "auto_strength_residual_beta": 0.75}
+    )
+    assert normalized == {"auto_strength_depth_trend": 0.25, "auto_strength_residual_beta": 0.75}

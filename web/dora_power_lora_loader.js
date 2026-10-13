@@ -585,6 +585,7 @@ function defaultState() {
       auto_strength_ratio_floor: 0.30,
       auto_strength_ratio_ceiling: 1.50,
       auto_strength_residual_beta: 0.50,
+      auto_strength_depth_trend: 0.0,
       dora_decompose_debug: false,
       dora_decompose_debug_n: 30,
       dora_decompose_debug_stack_depth: 10,
@@ -631,6 +632,9 @@ function sanitizeState(st) {
     auto_strength_residual_beta: Number.isFinite(+globalsIn.auto_strength_residual_beta)
       ? Math.max(0, Math.min(1, +globalsIn.auto_strength_residual_beta))
       : 0.50,
+    auto_strength_depth_trend: Number.isFinite(+globalsIn.auto_strength_depth_trend)
+      ? Math.max(0, Math.min(1, +globalsIn.auto_strength_depth_trend))
+      : 0.0,
     dora_decompose_debug: globalsIn.dora_decompose_debug !== undefined ? !!globalsIn.dora_decompose_debug : false,
     dora_decompose_debug_n: Number.isFinite(+globalsIn.dora_decompose_debug_n)
       ? Math.max(0, Math.floor(+globalsIn.dora_decompose_debug_n))
@@ -1865,7 +1869,21 @@ function buildUI(node, state, loraValues) {
     },
     { min: 0.0, max: 1.0, step: 0.05 }
   );
-  wAutoStrengthResidualBeta.label = "Auto-strength residual β (0=local, 1=old per-layer)";
+  wAutoStrengthResidualBeta.label = "Auto-strength residual β (0=keep, 1=full per-layer)";
+
+  const wAutoStrengthDepthTrend = node.addWidget(
+    "number",
+    "auto_strength_depth_trend",
+    Number.isFinite(+node._doraGlobals.auto_strength_depth_trend)
+      ? +node._doraGlobals.auto_strength_depth_trend
+      : 0.0,
+    (v) => {
+      node._doraGlobals.auto_strength_depth_trend = Math.max(0, Math.min(1, +v || 0));
+      persistNodeState(node);
+    },
+    { min: 0.0, max: 1.0, step: 0.05 }
+  );
+  wAutoStrengthDepthTrend.label = "Auto-strength depth trend (0=keep, 1=flatten)";
 
   const autoStrengthReportWidget =
     reusableCustomWidgets.report || new DoraAutoStrengthReportWidget("auto_strength_visualization", node);
@@ -1939,6 +1957,7 @@ app.registerExtension({
               auto_strength_ratio_floor: 0.30,
               auto_strength_ratio_ceiling: 1.50,
               auto_strength_residual_beta: 0.50,
+              auto_strength_depth_trend: 0.0,
               dora_decompose_debug: false,
               dora_decompose_debug_n: 30,
               dora_decompose_debug_stack_depth: 10,

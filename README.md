@@ -99,13 +99,14 @@ then enabling auto-strength is a true no-op.
 - separates model and CLIP and keeps tensor families isolated
 - infers repeated-block projection roles structurally from mapped destination paths; there is no MiniMax-H3 role table
 - derives linear cohort shape from the adapter's logical update matrix when possible, so packed/quantized checkpoint storage does not split an otherwise identical role
-- uses one broad **family reference** across eligible linear logical sources, defined as the scalar that makes the unclamped ordinary gains (below) multiply to exactly 1 for the configured β
+- uses one broad **family reference** across eligible linear logical sources, defined as the scalar that makes the unclamped ordinary gains (below) multiply to exactly 1 for the configured β and depth trend
 - excludes linear weight patches that ComfyUI would reject on a dense floating-point destination, so they never shift the references used for other layers: `.set_weight` / `.diff` need the exact destination shape, factorized LoRA updates need an equal element count
 - for ordered repeated-block roles, builds a robust **local depth reference** with a centered 7-member moving log-median
-- applies `family_reference / local_depth_reference` as the robust regional baseline, so a coherently weak depth region can still receive the large boosts that made the original Auto-strength useful
-- restores a configurable fraction of the remaining per-layer residual in log space: `final_gain = depth_gain * (local_depth_reference / layer_score)^β`
-- exposes **Auto-strength residual β** in the node and State Manager, clamped to `0…1`, with default `0.50`
-- `β = 0` is the local-depth-only behavior; `β = 1` is the direct family/per-layer gain; intermediate values are geometric/log-space blends rather than linear ratio interpolation
+- builds each member's **depth baseline** as `role_trend_center^(1-τ) * local_depth_reference^τ`, where `role_trend_center` is the geometric mean of the role's local depth references and τ is **Auto-strength depth trend**
+- applies `family_reference / depth_baseline` as the depth gain and corrects a configurable fraction of each member's residual against its local trend: `final_gain = depth_gain * (local_depth_reference / layer_score)^β`
+- exposes **Auto-strength depth trend** τ and **Auto-strength residual β** in the node and State Manager, both clamped to `0…1`; defaults are τ = `0.0` and β = `0.50`
+- `τ = 0` keeps the adapter's smooth depth profile: only the role level and per-layer deviations from the local trend are corrected; `τ = 1` moves every local trend to the family reference, so a coherently weak depth region receives large boosts and a strong one is cut
+- `β = 0` leaves per-layer deviations from the local trend alone; `β = 1` removes them fully; intermediate values are geometric/log-space blends rather than linear ratio interpolation
 - uses one role-wide geometric-mean gain only as a fallback when a reliable depth profile cannot be inferred
 - isolated statistical outliers are promoted to residual exponent `1.0` regardless of β, preserving the conservative full correction already used for a single clearly broken member; that extra correction is deliberately excluded from the family normalization, so fixing one member does not shift the others
 - multiple anomaly candidates suppress only the isolated-member correction; they do not suppress coherent depth redistribution
@@ -124,12 +125,18 @@ which could produce useful 4–5× boosts but also reacted to every layer indepe
 The first role-aware redesign protected depth structure too aggressively and could
 collapse Auto-strength to a near no-op.
 
-The current policy keeps the original family target but estimates a robust local trend
-inside each semantic role. It then restores a controlled fraction of the remaining
-layer-to-layer residual in multiplicative/log space. This makes the behavior explicitly
-testable between the two useful endpoints instead of hard-coding another smoothing
-choice: β=0 is the regional correction, β=1 is the direct per-layer correction, and
-the default β=0.5 is their geometric midpoint for ordinary members.
+The current policy estimates a robust local trend inside each semantic role and
+separates two decisions. The depth trend τ decides how much of that smooth trend is
+flattened toward the family reference; β decides how much of each layer's deviation
+from the trend is corrected. τ=1 with β=1 is the direct per-layer correction against
+one family level.
+
+The default τ=0 keeps depth profiles. Adapters trained on deep repeated-block models
+commonly concentrate their update in particular depth ranges (for example a smooth
+growth toward the last blocks that is shared by every projection role). Such a
+profile reflects where the adapter learned, not a defect, and flattening it cuts the
+layers that carry the adapter's content while boosting layers where little was
+learned. Raise τ only for adapters whose depth imbalance is known to be unwanted.
 
 Two properties keep linear redistribution from reshaping a balanced adapter:
 
@@ -141,8 +148,8 @@ Two properties keep linear redistribution from reshaping a balanced adapter:
   systematically strong, independent of how the adapter was trained. The output-gain
   score removes that bias. Within one role every member has the same shape, so depth
   redistribution inside a role is unchanged by it.
-- **Log-space gain neutrality.** For every β, the unclamped ordinary per-layer gains
-  `family_reference / local_reference * (local_reference / score)^β` have a geometric
+- **Log-space gain neutrality.** For every β and τ, the unclamped ordinary per-layer gains
+  `family_reference / depth_baseline * (local_reference / score)^β` have a geometric
   mean of exactly 1 across the family, so the redistribution is centred on the row's
   own strength instead of drifting with the spread of scores (an arithmetic-mean
   reference pushes the mean gain above 1). This is a property of the gains in log

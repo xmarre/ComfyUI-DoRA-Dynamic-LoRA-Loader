@@ -43,6 +43,8 @@ const DORA_LOADER_GLOBAL_DEFAULTS = Object.freeze({
   auto_strength_device: "gpu",
   auto_strength_ratio_floor: 0.30,
   auto_strength_ratio_ceiling: 1.50,
+  auto_strength_residual_beta: 0.50,
+  auto_strength_depth_trend: 0.0,
 });
 const OUTPUT_NAMES = {
   control: ["state_control"],
@@ -447,6 +449,10 @@ function normalizeLoaderGlobals(globalsIn) {
     if (ceiling < floor) [floor, ceiling] = [ceiling, floor];
     out.auto_strength_ratio_floor = floor;
     out.auto_strength_ratio_ceiling = ceiling;
+  }
+  for (const key of ["auto_strength_residual_beta", "auto_strength_depth_trend"]) {
+    if (!Object.prototype.hasOwnProperty.call(src, key)) continue;
+    out[key] = Math.max(0, Math.min(1, normalizeNumber(src[key], DORA_LOADER_GLOBAL_DEFAULTS[key])));
   }
   for (const key of ["dora_decompose_debug_n", "dora_decompose_debug_stack_depth"]) {
     if (Object.prototype.hasOwnProperty.call(src, key)) out[key] = Math.floor(normalizeNumber(src[key], key === "dora_decompose_debug_n" ? 30 : 10));
