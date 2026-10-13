@@ -479,73 +479,61 @@ function normalizeAutoStrengthDevice(value) {
   return AUTO_STRENGTH_DEVICE_CHOICES.includes(v) ? v : "auto";
 }
 
-function parseRowsFromWidgetValues(widgetsValues) {
-  const vals = Array.isArray(widgetsValues) ? widgetsValues : [];
+// Widget-only workflows were written only by the first two loader builds.
+// Each row serialized enabled/name/strength_model/strength_clip followed by a
+// non-serialized Remove button; an Add button and three global toggles came
+// last, and the second build added a leading Refresh button. Frontends either
+// skipped non-serialized widgets or kept null placeholders at their positions.
+const LEGACY_WIDGET_LAYOUTS = [
+  { leading: 0, rowPadding: 0, trailing: 0 },
+  { leading: 0, rowPadding: 1, trailing: 1 },
+  { leading: 1, rowPadding: 1, trailing: 1 },
+];
+const LEGACY_GLOBAL_KEYS = ["stack_enabled", "verbose", "log_unloaded_keys"];
+const LEGACY_WIDGET_VALUES_PROPERTY = "dora_power_lora_unrecognized_widgets_values";
 
-  const parseWithLayout = (perRow, globalsCount) => {
-    if (vals.length < globalsCount) return null;
-    if ((vals.length - globalsCount) % perRow !== 0) return null;
+function isLegacyPlaceholder(value) {
+  return value === null || value === undefined;
+}
 
-    const outRows = [];
-    let idx = 0;
-    const rowsCount = Math.max(0, Math.floor((vals.length - globalsCount) / perRow));
-    for (let i = 0; i < rowsCount; i++) {
-      const r = makeRowDefaults();
-      r.enabled = Boolean(vals[idx++]);
-      const nm = vals[idx++];
-      r.name = typeof nm === "string" ? nm : (nm ?? "None");
-      const sm = Number(vals[idx++]);
-      r.strengthModel = sm;
-      if (perRow === 4) {
-        const sc = Number(vals[idx++]);
-        r.strengthClip = Number.isFinite(sc) ? sc : sm;
-      } else {
-        r.strengthClip = sm;
-      }
-      outRows.push(r);
+function decodeLegacyWidgetLayout(vals, { leading, rowPadding, trailing }) {
+  const rowWidth = 4 + rowPadding;
+  const rowValues = vals.length - leading - trailing - LEGACY_GLOBAL_KEYS.length;
+  if (rowValues <= 0 || rowValues % rowWidth !== 0) return null;
+  if (!vals.slice(0, leading).every(isLegacyPlaceholder)) return null;
+
+  const rows = [];
+  let idx = leading;
+  for (let i = 0; i < rowValues / rowWidth; i++, idx += rowWidth) {
+    const [enabled, name, strengthModel, strengthClip, ...padding] = vals.slice(idx, idx + rowWidth);
+    if (
+      typeof enabled !== "boolean" ||
+      typeof name !== "string" ||
+      !Number.isFinite(strengthModel) ||
+      !Number.isFinite(strengthClip) ||
+      !padding.every(isLegacyPlaceholder)
+    ) {
+      return null;
     }
-
-    const globals = {
-      stack_enabled: Boolean(vals[idx++]),
-      verbose: Boolean(vals[idx++]),
-      log_unloaded_keys: Boolean(vals[idx++]),
-    };
-
-    if (globalsCount >= 7) {
-      globals.dora_decompose_debug = Boolean(vals[idx++]);
-      globals.dora_decompose_debug_n = Number(vals[idx++]);
-      globals.dora_decompose_debug_stack_depth = Number(vals[idx++]);
-      globals.dora_slice_fix = Boolean(vals[idx++]);
-      globals.dora_adaln_swap_fix = true;
-    }
-
-    return { rows: outRows, globals };
-  };
-
-  const looksValid = (parsed) => {
-    if (!parsed) return false;
-    if (parsed.rows && parsed.rows.length) {
-      const r0 = parsed.rows[0];
-      if (typeof r0.name !== "string") return false;
-      if (!Number.isFinite(+r0.strengthModel)) return false;
-      if (!Number.isFinite(+r0.strengthClip)) return false;
-    }
-    return true;
-  };
-
-  const layouts = [
-    [4, 3],
-    [4, 7],
-    [3, 3],
-    [3, 7],
-  ];
-
-  for (const [perRow, globalsCount] of layouts) {
-    const parsed = parseWithLayout(perRow, globalsCount);
-    if (looksValid(parsed)) return parsed;
+    rows.push({ enabled, name, strengthModel, strengthClip });
   }
 
-  return { rows: [], globals: { stack_enabled: true, verbose: false, log_unloaded_keys: false } };
+  if (!vals.slice(idx, idx + trailing).every(isLegacyPlaceholder)) return null;
+  const globalValues = vals.slice(idx + trailing);
+  if (!globalValues.every((value) => typeof value === "boolean")) return null;
+  const globals = Object.fromEntries(LEGACY_GLOBAL_KEYS.map((key, i) => [key, globalValues[i]]));
+  return { rows, globals };
+}
+
+// Returns null unless exactly one known layout matches every field's type.
+function parseLegacyWidgetValues(widgetsValues) {
+  const vals = Array.isArray(widgetsValues) ? widgetsValues : [];
+  const matches = new Map();
+  for (const layout of LEGACY_WIDGET_LAYOUTS) {
+    const decoded = decodeLegacyWidgetLayout(vals, layout);
+    if (decoded) matches.set(JSON.stringify(decoded), decoded);
+  }
+  return matches.size === 1 ? [...matches.values()][0] : null;
 }
 
 function normalizeStateSlot(value, fallback = "default") {
@@ -566,6 +554,29 @@ function setStateSlot(node, value) {
   node.properties = node.properties || {};
   const slot = normalizeStateSlot(value, `loader_${node.id ?? "default"}`);
   node.properties.dora_state_slot = slot;
+  return slot;
+}
+
+// Slot the loader was last saved to or applied from before user renames.
+// Presets use it to move the saved stack instead of duplicating it.
+const PREVIOUS_SLOT_PROPERTY = "dora_state_slot_previous";
+
+function getPreviousStateSlot(node) {
+  const value = node?.properties?.[PREVIOUS_SLOT_PROPERTY];
+  return value == null ? null : normalizeStateSlot(value, "") || null;
+}
+
+function clearPreviousStateSlot(node) {
+  if (node?.properties) delete node.properties[PREVIOUS_SLOT_PROPERTY];
+}
+
+function renameStateSlot(node, value) {
+  const current = getStateSlot(node);
+  const slot = setStateSlot(node, value);
+  if (slot === current) return slot;
+  const previous = getPreviousStateSlot(node);
+  if (previous === slot) clearPreviousStateSlot(node);
+  else if (!previous) node.properties[PREVIOUS_SLOT_PROPERTY] = current;
   return slot;
 }
 
@@ -704,6 +715,7 @@ function installGlobalStateApi() {
       if (externalState && Object.prototype.hasOwnProperty.call(externalState, "slot")) {
         setStateSlot(node, externalState.slot);
       }
+      clearPreviousStateSlot(node);
       setState(node, next);
       node._doraRows = next.rows;
       node._doraGlobals = next.globals;
@@ -720,8 +732,15 @@ function installGlobalStateApi() {
     getSlot(node) {
       return getStateSlot(node);
     },
+    getPreviousSlot(node) {
+      return getPreviousStateSlot(node);
+    },
+    markSlotSaved(node) {
+      clearPreviousStateSlot(node);
+    },
     setSlot(node, value) {
       const slot = setStateSlot(node, value);
+      clearPreviousStateSlot(node);
       try { rebuild(node); } catch (_) {}
       node?.setDirtyCanvas?.(true, true);
       node?.graph?.change?.();
@@ -1577,7 +1596,7 @@ function buildUI(node, state, loraValues) {
   wRefresh.serialize = false;
 
   const wStateSlot = node.addWidget("text", "state_slot", getStateSlot(node), (v) => {
-    wStateSlot.value = setStateSlot(node, v);
+    wStateSlot.value = renameStateSlot(node, v);
     node.setDirtyCanvas?.(true, true);
     node.graph?.change?.();
   });
@@ -1838,10 +1857,15 @@ app.registerExtension({
     nodeType.prototype.configure = function (info) {
       try {
         let st = null;
+        let unrecognizedLegacyValues = null;
         if (info?.properties?.dora_power_lora) {
           st = sanitizeState(info.properties.dora_power_lora);
         } else if (Array.isArray(info?.widgets_values) && info.widgets_values.length) {
-          const parsed = parseRowsFromWidgetValues(info.widgets_values);
+          let parsed = parseLegacyWidgetValues(info.widgets_values);
+          if (!parsed) {
+            unrecognizedLegacyValues = info.widgets_values;
+            parsed = { rows: [], globals: {} };
+          }
           st = sanitizeState({
             rows: parsed.rows,
             globals: {
@@ -1867,6 +1891,13 @@ app.registerExtension({
         }
         setState(this, st);
         setStateSlot(this, info?.properties?.dora_state_slot ?? this.properties?.dora_state_slot ?? `loader_${this.id ?? "default"}`);
+        if (unrecognizedLegacyValues) {
+          // Keep the original values in the workflow instead of discarding them.
+          this.properties[LEGACY_WIDGET_VALUES_PROPERTY] = JSON.parse(JSON.stringify(unrecognizedLegacyValues));
+          console.warn(
+            `[${EXT_NAME}] Unrecognized legacy widget values; loaded default rows and kept the original values in properties.${LEGACY_WIDGET_VALUES_PROPERTY}`
+          );
+        }
 
         if (origConfigure) {
           const safeInfo = info ? { ...info } : info;

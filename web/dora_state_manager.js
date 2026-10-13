@@ -2255,6 +2255,7 @@ function applyLoraStackToNode(targetNode, character) {
   }));
   targetNode.properties = targetNode.properties || {};
   targetNode.properties.dora_state_slot = slot;
+  delete targetNode.properties.dora_state_slot_previous;
   targetNode.properties.dora_power_lora = { rows, globals: normalizeLoaderGlobals(payload.loader_globals) };
   targetNode._doraRows = rows;
   targetNode._doraGlobals = normalizeLoaderGlobals(payload.loader_globals);
@@ -2367,6 +2368,66 @@ function saveLoaderStackIntoCharacter(character, stack, index = 0) {
     }
   }
   return setCharacterLoaderStack(character, incoming);
+}
+
+function getDoraLoaderPreviousSlot(loader) {
+  const loaderApi = globalThis.__doraPowerLoraLoaderApi;
+  const raw = loaderApi?.getPreviousSlot && isDoraLoaderNode(loader)
+    ? loaderApi.getPreviousSlot(loader)
+    : loader?.properties?.dora_state_slot_previous;
+  return raw == null ? "" : normalizeLoaderSlot(raw, "");
+}
+
+function setDoraLoaderSlotFromPreset(loader, slot) {
+  const loaderApi = globalThis.__doraPowerLoraLoaderApi;
+  if (loaderApi?.setSlot && isDoraLoaderNode(loader)) {
+    loaderApi.setSlot(loader, slot);
+    return;
+  }
+  loader.properties = loader.properties || {};
+  loader.properties.dora_state_slot = slot;
+  delete loader.properties.dora_state_slot_previous;
+}
+
+function markDoraLoaderSlotSaved(loader) {
+  const loaderApi = globalThis.__doraPowerLoraLoaderApi;
+  if (loaderApi?.markSlotSaved && isDoraLoaderNode(loader)) loaderApi.markSlotSaved(loader);
+  else if (loader?.properties) delete loader.properties.dora_state_slot_previous;
+}
+
+// Explicit Save of connected/selected loaders into a preset. A loader whose
+// State slot was renamed since it was last saved or applied moves its saved
+// stack to the new slot. Renaming onto a slot another saved stack already uses
+// keeps the loader on its previous slot instead of overwriting that stack.
+function saveLoadersIntoCharacter(character, loaders) {
+  let saved = 0;
+  const notes = [];
+  loaders.forEach((loader, index) => {
+    const stack = extractLoraStackFromNode(loader, index);
+    if (!stack) return;
+    const incoming = normalizeLoaderStack(stack, index);
+    const previousSlot = getDoraLoaderPreviousSlot(loader);
+    const stacks = getCharacterLoaderStacks(character);
+    const previousIndex = previousSlot && previousSlot !== incoming.slot
+      ? stacks.findIndex((item) => normalizeLoaderSlot(item?.slot, "default") === previousSlot)
+      : -1;
+    if (previousIndex >= 0) {
+      const occupied = stacks.some((item) => normalizeLoaderSlot(item?.slot, "default") === incoming.slot);
+      if (occupied) {
+        notes.push(`State slot "${incoming.slot}" already holds another saved stack; kept the loader on "${previousSlot}".`);
+        setDoraLoaderSlotFromPreset(loader, previousSlot);
+        stacks[previousIndex] = { ...incoming, slot: previousSlot, label: stacks[previousIndex]?.label || previousSlot };
+      } else {
+        stacks[previousIndex] = incoming;
+      }
+      syncLegacyLoaderMirror(character);
+    } else {
+      saveLoaderStackIntoCharacter(character, incoming, index);
+    }
+    markDoraLoaderSlotSaved(loader);
+    saved += 1;
+  });
+  return { saved, notes };
 }
 
 function loaderStackHasMeaningfulState(stack) {
@@ -2982,7 +3043,7 @@ function applySettingsToNodes(nodes, settings) {
   return changedNodes;
 }
 
-function saveConnectedState(targetNode, character, prompt) {
+function saveConnectedState(targetNode, character, prompt, notes = []) {
   const changes = [];
   const controlledNodes = getControlledNodes(targetNode).filter((node) => node && node !== targetNode);
 
@@ -2990,13 +3051,8 @@ function saveConnectedState(targetNode, character, prompt) {
   const controlledLoaderTargets = controlledNodes.filter(isDoraLoaderNode);
   const legacyLoaderTargets = controlledLoaderTargets.length ? [] : uniqueNodes([...getOutputTargets(targetNode, OUTPUT_NAMES.lora)]).filter(isDoraLoaderNode);
   const loaderTargets = controlledLoaderTargets.length ? controlledLoaderTargets : legacyLoaderTargets;
-  let savedLoaders = 0;
-  loaderTargets.forEach((loader, index) => {
-    const stack = extractLoraStackFromNode(loader, index);
-    if (!stack) return;
-    saveLoaderStackIntoCharacter(character, stack, index);
-    savedLoaders += 1;
-  });
+  const { saved: savedLoaders, notes: loaderNotes } = saveLoadersIntoCharacter(character, loaderTargets);
+  notes.push(...loaderNotes);
   if (savedLoaders) changes.push(`${savedLoaders} LoRA loader${savedLoaders === 1 ? "" : "s"}`);
 
   const controlledTextNodes = controlledNodes.filter(isStateTextNode);
@@ -3129,17 +3185,12 @@ function classifySelectedTextNodes(nodes) {
   return { positive, negative: fallbackNegative, used: [positive?.node, fallbackNegative?.node].filter(Boolean) };
 }
 
-function saveSelectedState(targetNode, character, prompt) {
+function saveSelectedState(targetNode, character, prompt, notes = []) {
   const selected = getSelectedGraphNodes().filter((node) => node && node !== targetNode);
   const changes = [];
   const loaders = selected.filter(isDoraLoaderNode);
-  let savedLoaders = 0;
-  loaders.forEach((loader, index) => {
-    const stack = extractLoraStackFromNode(loader, index);
-    if (!stack) return;
-    saveLoaderStackIntoCharacter(character, stack, index);
-    savedLoaders += 1;
-  });
+  const { saved: savedLoaders, notes: loaderNotes } = saveLoadersIntoCharacter(character, loaders);
+  notes.push(...loaderNotes);
   if (savedLoaders) changes.push(`${savedLoaders} LoRA loader${savedLoaders === 1 ? "" : "s"}`);
 
   const selectedStateTextNodes = selected.filter(isStateTextNode);
@@ -3622,11 +3673,13 @@ function renderHeader(node, state, uiState, character, prompt) {
   });
 
   const saveConnected = makeButton("Save connected", () => {
-    const changes = saveConnectedState(node, character, prompt);
+    const notes = [];
+    const changes = saveConnectedState(node, character, prompt, notes);
+    const summary = changes.length ? `Saved ${changes.join(", ")} from connected nodes.` : "No connected downstream nodes had capturable state.";
     updateState(node, state, uiState, {
       characterId: character.id,
       promptId: prompt.id,
-      status: changes.length ? `Saved ${changes.join(", ")} from connected nodes.` : "No connected downstream nodes had capturable state.",
+      status: [summary, ...notes].join(" "),
     });
   }, "Capture current values from nodes connected to this manager's outputs");
   saveConnected.classList.add("dsm-primary");
@@ -3646,11 +3699,13 @@ function renderHeader(node, state, uiState, character, prompt) {
     saveConnected,
     loadConnected,
     makeButton("Save selected", () => {
-      const changes = saveSelectedState(node, character, prompt);
+      const notes = [];
+      const changes = saveSelectedState(node, character, prompt, notes);
+      const summary = changes.length ? `Saved ${changes.join(", ")} from selected nodes.` : "Select a loader, text, seed, or settings node first.";
       updateState(node, state, uiState, {
         characterId: character.id,
         promptId: prompt.id,
-        status: changes.length ? `Saved ${changes.join(", ")} from selected nodes.` : "Select a loader, text, seed, or settings node first.",
+        status: [summary, ...notes].join(" "),
       });
     }, "Capture selected graph nodes into the current character/preset"),
     makeButton("Apply selected", () => {
@@ -4417,14 +4472,9 @@ function renderLoraPanelContent(section, node, state, uiState, character, prompt
     makeButton("Save connected loaders", () => {
       const controlledLoaders = getControlledNodes(node).filter(isDoraLoaderNode);
       const loaders = controlledLoaders.length ? controlledLoaders : uniqueNodes(getOutputTargets(node, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
-      let count = 0;
-      loaders.forEach((loader, index) => {
-        const stack = extractLoraStackFromNode(loader, index);
-        if (!stack) return;
-        saveLoaderStackIntoCharacter(character, stack, index);
-        count += 1;
-      });
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: count ? `Saved ${count} connected DoRA loader${count === 1 ? "" : "s"}.` : "No connected DoRA loader found." });
+      const { saved: count, notes } = saveLoadersIntoCharacter(character, loaders);
+      const summary = count ? `Saved ${count} connected DoRA loader${count === 1 ? "" : "s"}.` : "No connected DoRA loader found.";
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: [summary, ...notes].join(" ") });
     }),
     makeButton("Apply connected loaders", () => {
       const controlledLoaders = getControlledNodes(node).filter(isDoraLoaderNode);
