@@ -559,11 +559,14 @@ function setStateSlot(node, value) {
 
 // A user State slot rename is tracked in the workflow until a State Manager
 // save of it is confirmed by the library, or a preset is applied:
-//   from    - the slot the library last confirmed for this loader's stack
-//   savedTo - where the latest save put the stack (pending or committed)
-//   seq     - counter of saves made under this rename
-// Presets resolve the loader's own saved stack from savedTo, then from, so a
-// save still pending, rejected, or committed before a reload is found again.
+//   from      - the slot the library last confirmed for this loader's stack
+//   savedTo   - where the latest save put the stack (pending or committed)
+//   savedToIn - the persistent character id that latest save wrote into
+//   seq       - counter of saves made under this rename
+// A preset resolves the loader's own saved stack from savedTo only when it is
+// the character recorded in savedToIn, then from, so a save still pending,
+// rejected, or committed before a reload is found again without claiming a
+// same-named stack in another character.
 const SLOT_RENAME_PROPERTY = "dora_state_slot_rename";
 
 function makeSlotRenameId() {
@@ -577,8 +580,9 @@ function getSlotRename(node) {
   const id = typeof value.id === "string" ? value.id : "";
   if (!from || !id) return null;
   const savedTo = value.savedTo == null ? "" : normalizeStateSlot(value.savedTo, "");
+  const savedToIn = typeof value.savedToIn === "string" ? value.savedToIn : "";
   const seq = Number.isInteger(value.seq) && value.seq > 0 ? value.seq : 0;
-  return { from, id, savedTo, seq };
+  return { from, id, savedTo: savedTo && savedToIn ? savedTo : "", savedToIn: savedTo && savedToIn ? savedToIn : "", seq };
 }
 
 function setSlotRename(node, rename) {
@@ -601,15 +605,15 @@ function renameStateSlot(node, value) {
   const slot = setStateSlot(node, value);
   if (slot === current) return slot;
   const rename = getSlotRename(node);
-  if (!rename) setSlotRename(node, { from: current, id: makeSlotRenameId(), savedTo: "", seq: 0 });
+  if (!rename) setSlotRename(node, { from: current, id: makeSlotRenameId(), savedTo: "", savedToIn: "", seq: 0 });
   else if (rename.from === slot && !rename.savedTo) clearSlotRename(node);
   return slot;
 }
 
-function recordSlotRenameSave(node, slot) {
+function recordSlotRenameSave(node, slot, characterId) {
   const rename = getSlotRename(node);
-  if (!rename) return null;
-  const next = { ...rename, savedTo: normalizeStateSlot(slot, "default"), seq: rename.seq + 1 };
+  if (!rename || typeof characterId !== "string" || !characterId) return null;
+  const next = { ...rename, savedTo: normalizeStateSlot(slot, "default"), savedToIn: characterId, seq: rename.seq + 1 };
   setSlotRename(node, next);
   return { id: next.id, seq: next.seq };
 }
@@ -780,8 +784,8 @@ function installGlobalStateApi() {
     getSlotRename(node) {
       return getSlotRename(node);
     },
-    recordSlotRenameSave(node, slot) {
-      return recordSlotRenameSave(node, slot);
+    recordSlotRenameSave(node, slot, characterId) {
+      return recordSlotRenameSave(node, slot, characterId);
     },
     commitSlotRenameSave(node, id, seq, slot) {
       commitSlotRenameSave(node, id, seq, slot);
