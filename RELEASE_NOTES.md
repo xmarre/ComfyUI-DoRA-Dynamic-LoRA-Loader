@@ -27,7 +27,7 @@ This release makes each DoRA Power LoRA Loader's rows and settings belong to its
 
 ## Compatibility
 
-- Workflow JSON, library format, and node inputs/outputs are unchanged.
+- Library format and node inputs/outputs are unchanged. Loaders add optional node properties (`dora_state_binding`, `dora_state_epoch`, `dora_state_slot_rename`, and, for undecodable legacy values, `dora_power_lora_unrecognized_widgets_values`); earlier versions ignore them.
 - Workflows that relied on the State Manager silently re-syncing loaders from the library on load must click **Load connected** to pull a preset's stack into the loaders.
 
 # DoRA Dynamic LoRA Loader v1.0.47
