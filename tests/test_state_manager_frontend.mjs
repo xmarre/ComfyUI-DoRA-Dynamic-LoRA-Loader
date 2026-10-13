@@ -10,7 +10,7 @@ async function loadStateManagerHelpers() {
     .replace('import { app } from "../../scripts/app.js";', "let capturedExtension = null; const app = { registerExtension(value) { capturedExtension = value; }, graph: { extra: {} } };")
     .replace('import { api } from "../../scripts/api.js";', "const api = { fetchApi(...args) { if (typeof globalThis.__dsmTestFetchApi === 'function') return globalThis.__dsmTestFetchApi(...args); throw new Error('not used'); }, apiURL(value) { return value; } };")
     .replace('import "../../scripts/domWidget.js";', "");
-  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, normalizeSelectionIdentity, readSelectionMirror, readLocalSelection, writeLocalSelection, writeSelectionMirror, configuredSelectionIdentity, selectionResolutionForLibraryLoad, selectionIdentityForLibraryLoad, authoritativeSelectionIdentity, rememberAuthoritativeSelection, captureStateManagerWorkflowState, updateState, initializeNode, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, syncConnectedLoaderStateIntoManager, synchronizeConnectedLoadersAfterLibraryLoad, restoreNodeAndConnectedLoadersFromLibrary, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary, flushPendingLibraryWrites, validateManagedQueueTextState, prepareStateManagerQueuePayload };\n`;
+  source += `\nexport { app, capturedExtension, defaultBinding, defaultState, deletePromptPreset, deleteStateCharacter, makeId, materializeEditedDefault, mergeScheduledLibraryUpdate, persistentCharacters, serializeBinding, serializeWorkflowUiState, serializeQueuedUiStateOverride, parseLegacyEmbeddedState, normalizeSelectionIdentity, readSelectionMirror, readLocalSelection, writeLocalSelection, writeSelectionMirror, configuredSelectionIdentity, selectionResolutionForLibraryLoad, selectionIdentityForLibraryLoad, authoritativeSelectionIdentity, rememberAuthoritativeSelection, captureStateManagerWorkflowState, updateState, initializeNode, stateLibraryClient, stateViewForSelection, syncCharacterLoaderStacksToConnectedNodes, saveLoaderStackIntoCharacter, normalizeLoaderGlobals, pickPrimarySettingsLoaderStack, refreshAllNodesFromLibrary, normalizePromptDocument, previewPromptTransportText, requestLogicalTimelineSkeleton, updateManagedStateTextBox, updateManagedPromptDocument, mutatePromptForStateManagers, writePendingLibrary, flushPendingLibraryWrites, validateManagedQueueTextState, prepareStateManagerQueuePayload };\n`;
   const encoded = Buffer.from(source, "utf8").toString("base64");
   return import(`data:text/javascript;base64,${encoded}#${Date.now()}-${Math.random()}`);
 }
@@ -1380,8 +1380,8 @@ test("queued library values never synchronize into the workflow copy", async () 
 test("blocked writes clear pending work and restore the persisted view", async () => {
   const source = await readFile(new URL("../web/dora_state_manager.js", import.meta.url), "utf8");
   assert.match(source, /function blockLibraryWrites[\s\S]*stateLibraryClient\.pending = \[\]/);
-  assert.match(source, /function blockLibraryWrites[\s\S]*restoreNodeAndConnectedLoadersFromLibrary\(node/);
-  assert.match(source, /if \(stateLibraryClient\.blocked\) \{[\s\S]*restoreNodeAndConnectedLoadersFromLibrary\(node/);
+  assert.match(source, /function blockLibraryWrites[\s\S]*refreshNodeFromLibrary\(node/);
+  assert.match(source, /if \(stateLibraryClient\.blocked\) \{[\s\S]*refreshNodeFromLibrary\(node/);
 });
 
 
@@ -1429,75 +1429,30 @@ function makeConnectedManagerAndLoader(helpers, character) {
 }
 
 
-test("connected loader edits replace the selected State Manager stack immediately", async () => {
+test("Save connected loaders copies the live loader stack into the selected preset", async () => {
   const helpers = await loadStateManagerHelpers();
   const character = privateCharacter("character-a", "A", "A0");
   character.loader_stacks = [{
     slot: "default",
     label: "Default loader",
-    loras: [{
-      enabled: true,
-      name: "old.safetensors",
-      strength_model: 1.0,
-      strength_clip: 1.0,
-    }],
-    loader_globals: {
-      auto_strength_enabled: false,
-      auto_strength_device: "gpu",
-      auto_strength_ratio_floor: 0.3,
-      auto_strength_ratio_ceiling: 1.5,
-    },
+    loras: [{ enabled: true, name: "old.safetensors", strength_model: 1.0, strength_clip: 1.0 }],
+    loader_globals: { auto_strength_enabled: false },
   }];
-  character.loras = structuredClone(character.loader_stacks[0].loras);
-  character.loader_globals = structuredClone(character.loader_stacks[0].loader_globals);
-  const { manager, loader } = makeConnectedManagerAndLoader(helpers, character);
 
-  const previousLoaderApi = globalThis.__doraPowerLoraLoaderApi;
-  globalThis.__doraPowerLoraLoaderApi = {
-    getSlot() {
-      return "default";
-    },
-    getState() {
-      return {
-        slot: "default",
-        label: "Default loader",
-        rows: [{
-          enabled: true,
-          name: "h3-character.safetensors",
-          strengthModel: 0.82,
-          strengthClip: 0.61,
-        }],
-        globals: {
-          auto_strength_enabled: true,
-          auto_strength_device: "cpu",
-          auto_strength_ratio_floor: 0.44,
-          auto_strength_ratio_ceiling: 1.91,
-        },
-      };
-    },
-  };
+  helpers.saveLoaderStackIntoCharacter(character, {
+    slot: "default",
+    label: "Default loader",
+    loras: [{ enabled: true, name: "h3-character.safetensors", strength_model: 0.82, strength_clip: 0.61 }],
+    loader_globals: { auto_strength_enabled: true, auto_strength_device: "cpu" },
+  });
 
-  try {
-    const changed = helpers.syncConnectedLoaderStateIntoManager(
-      manager,
-      loader,
-      { persist: false, render: false, dirty: false },
-    );
-    assert.equal(changed, 1);
-
-    const savedCharacter = manager.__dsm.state.characters.find((item) => item.id === "character-a");
-    const savedStack = savedCharacter.loader_stacks.find((item) => item.slot === "default");
-    assert.equal(savedStack.loader_globals.auto_strength_enabled, true);
-    assert.equal(savedStack.loader_globals.auto_strength_device, "cpu");
-    assert.equal(savedStack.loader_globals.auto_strength_ratio_floor, 0.44);
-    assert.equal(savedStack.loader_globals.auto_strength_ratio_ceiling, 1.91);
-    assert.equal(savedStack.loras[0].name, "h3-character.safetensors");
-    assert.equal(savedStack.loras[0].strength_model, 0.82);
-    assert.equal(savedStack.loras[0].strength_clip, 0.61);
-  } finally {
-    if (previousLoaderApi === undefined) delete globalThis.__doraPowerLoraLoaderApi;
-    else globalThis.__doraPowerLoraLoaderApi = previousLoaderApi;
-  }
+  assert.equal(character.loader_stacks.length, 1);
+  const savedStack = character.loader_stacks[0];
+  assert.equal(savedStack.loras[0].name, "h3-character.safetensors");
+  assert.equal(savedStack.loras[0].strength_model, 0.82);
+  assert.equal(savedStack.loras[0].strength_clip, 0.61);
+  assert.equal(savedStack.loader_globals.auto_strength_enabled, true);
+  assert.equal(savedStack.loader_globals.auto_strength_device, "cpu");
 });
 
 
@@ -1549,7 +1504,6 @@ test("State Manager loader edits are pushed into the matching loader without a s
     assert.equal(stateCall.payload.loader_globals.auto_strength_enabled, true);
     assert.equal(stateCall.payload.loader_globals.auto_strength_ratio_floor, 0.41);
     assert.equal(stateCall.payload.loras[0].strength_model, 0.73);
-    assert.deepEqual(stateCall.options, { notifyStateManager: false });
 
     assert.equal(
       calls.some((call) => call.kind === "slot"),
@@ -1563,322 +1517,150 @@ test("State Manager loader edits are pushed into the matching loader without a s
 });
 
 
-test("loader-side State slot rename moves the saved stack identity instead of duplicating it", async () => {
-  const helpers = await loadStateManagerHelpers();
-  const character = privateCharacter("character-a", "A", "A0");
-  character.loader_stacks = [{
-    slot: "default",
-    label: "Default loader",
-    loras: [{ enabled: true, name: "old.safetensors", strength_model: 1.0, strength_clip: 1.0 }],
-    loader_globals: { auto_strength_enabled: false },
-  }];
-  character.loras = structuredClone(character.loader_stacks[0].loras);
-  character.loader_globals = structuredClone(character.loader_stacks[0].loader_globals);
-  const { manager, loader } = makeConnectedManagerAndLoader(helpers, character);
-  loader.properties.dora_state_slot = "style";
-  loader.widgets[0].value = "style";
+test("opening a workflow never rewrites its connected loader or the shared library", async () => {
+  for (const selection of [
+    { characterId: "character-a", promptId: "prompt-a" },
+    { characterId: "default_character", promptId: "default_prompt" },
+  ]) {
+    const helpers = await loadStateManagerHelpers();
+    const previousRaf = globalThis.requestAnimationFrame;
+    const previousCancel = globalThis.cancelAnimationFrame;
+    const previousLoaderApi = globalThis.__doraPowerLoraLoaderApi;
+    const frames = new Map();
+    let nextFrame = 1;
+    globalThis.requestAnimationFrame = (callback) => {
+      const id = nextFrame++;
+      frames.set(id, callback);
+      return id;
+    };
+    globalThis.cancelAnimationFrame = (id) => {
+      frames.delete(id);
+    };
+    const flushFrames = () => {
+      for (let round = 0; round < 10 && frames.size; round += 1) {
+        const pending = [...frames.values()];
+        frames.clear();
+        for (const callback of pending) callback();
+      }
+    };
 
-  const previousLoaderApi = globalThis.__doraPowerLoraLoaderApi;
-  globalThis.__doraPowerLoraLoaderApi = {
-    getSlot(node) {
-      return node.properties.dora_state_slot;
-    },
-    getState(node) {
-      return {
-        slot: node.properties.dora_state_slot,
-        label: "Style",
-        rows: [{
-          enabled: true,
-          name: "style.safetensors",
-          strengthModel: 0.66,
-          strengthClip: 0.55,
-        }],
-        globals: {
-          auto_strength_enabled: true,
-          auto_strength_device: "gpu",
-          auto_strength_ratio_floor: 0.4,
-          auto_strength_ratio_ceiling: 1.8,
-        },
-      };
-    },
-  };
-
-  try {
-    const changed = helpers.syncConnectedLoaderStateIntoManager(
-      manager,
-      loader,
-      { persist: false, render: false, dirty: false, previousSlot: "default" },
-    );
-    assert.equal(changed, 1);
-    const savedCharacter = manager.__dsm.state.characters.find((item) => item.id === "character-a");
-    assert.equal(savedCharacter.loader_stacks.length, 1);
-    assert.equal(savedCharacter.loader_stacks[0].slot, "style");
-    assert.equal(savedCharacter.loader_stacks[0].loras[0].name, "style.safetensors");
-    assert.equal(savedCharacter.loader_stacks[0].loader_globals.auto_strength_enabled, true);
-    assert.equal(savedCharacter.loader_stacks.some((item) => item.slot === "default"), false);
-  } finally {
-    if (previousLoaderApi === undefined) delete globalThis.__doraPowerLoraLoaderApi;
-    else globalThis.__doraPowerLoraLoaderApi = previousLoaderApi;
-  }
-});
-
-
-test("loader-side State slot collision is visibly reverted without overwriting either saved stack", async () => {
-  const helpers = await loadStateManagerHelpers();
-  const character = privateCharacter("character-a", "A", "A0");
-  character.loader_stacks = [
-    {
-      slot: "default",
-      label: "Default loader",
-      loras: [{ enabled: true, name: "default-old.safetensors", strength_model: 1.0, strength_clip: 1.0 }],
-      loader_globals: { auto_strength_enabled: false },
-    },
-    {
-      slot: "style",
-      label: "Existing style",
-      loras: [{ enabled: true, name: "existing-style.safetensors", strength_model: 0.4, strength_clip: 0.4 }],
-      loader_globals: { auto_strength_enabled: false },
-    },
-  ];
-  character.loras = structuredClone(character.loader_stacks[0].loras);
-  character.loader_globals = structuredClone(character.loader_stacks[0].loader_globals);
-  const { manager, loader } = makeConnectedManagerAndLoader(helpers, character);
-  loader.properties.dora_state_slot = "style";
-  loader.widgets[0].value = "style";
-
-  const setSlotCalls = [];
-  const previousLoaderApi = globalThis.__doraPowerLoraLoaderApi;
-  globalThis.__doraPowerLoraLoaderApi = {
-    getSlot(node) {
-      return node.properties.dora_state_slot;
-    },
-    getState(node) {
-      return {
-        slot: node.properties.dora_state_slot,
-        label: "Renamed loader",
-        rows: [{
-          enabled: true,
-          name: "live-loader.safetensors",
-          strengthModel: 0.77,
-          strengthClip: 0.68,
-        }],
-        globals: { auto_strength_enabled: true },
-      };
-    },
-    setSlot(node, slot, options) {
-      setSlotCalls.push({ slot, options });
-      node.properties.dora_state_slot = slot;
-      node.widgets[0].value = slot;
-      return slot;
-    },
-  };
-
-  try {
-    const changed = helpers.syncConnectedLoaderStateIntoManager(
-      manager,
-      loader,
-      { persist: false, render: false, dirty: false, previousSlot: "default" },
-    );
-    assert.equal(changed, 1);
-    assert.equal(loader.properties.dora_state_slot, "default");
-    assert.deepEqual(setSlotCalls, [{
-      slot: "default",
-      options: { notifyStateManager: false },
-    }]);
-
-    const savedCharacter = manager.__dsm.state.characters.find((item) => item.id === "character-a");
-    const defaultStack = savedCharacter.loader_stacks.find((item) => item.slot === "default");
-    const styleStack = savedCharacter.loader_stacks.find((item) => item.slot === "style");
-    assert.equal(defaultStack.loras[0].name, "live-loader.safetensors");
-    assert.equal(defaultStack.loader_globals.auto_strength_enabled, true);
-    assert.equal(styleStack.loras[0].name, "existing-style.safetensors");
-    assert.equal(savedCharacter.loader_stacks.length, 2);
-  } finally {
-    if (previousLoaderApi === undefined) delete globalThis.__doraPowerLoraLoaderApi;
-    else globalThis.__doraPowerLoraLoaderApi = previousLoaderApi;
-  }
-});
-
-
-test("first load of a durable preset applies saved loader state instead of overwriting the preset", async () => {
-  const helpers = await loadStateManagerHelpers();
-  const character = privateCharacter("character-a", "Saved Character", "A0");
-  character.loader_stacks = [{
-    slot: "default",
-    label: "Default loader",
-    loras: [{
-      enabled: true,
-      name: "saved-character.safetensors",
-      strength_model: 0.58,
-      strength_clip: 0.49,
-    }],
-    loader_globals: {
-      auto_strength_enabled: true,
-      auto_strength_device: "cpu",
-      auto_strength_ratio_floor: 0.46,
-      auto_strength_ratio_ceiling: 1.88,
-    },
-  }];
-  character.loras = structuredClone(character.loader_stacks[0].loras);
-  character.loader_globals = structuredClone(character.loader_stacks[0].loader_globals);
-  const { manager, loader } = makeConnectedManagerAndLoader(helpers, character);
-
-  const calls = [];
-  const previousLoaderApi = globalThis.__doraPowerLoraLoaderApi;
-  globalThis.__doraPowerLoraLoaderApi = {
-    getSlot() {
-      return "default";
-    },
-    setSlot(node, slot, options) {
-      calls.push({ kind: "slot", slot, options });
-      node.properties.dora_state_slot = slot;
-      return slot;
-    },
-    setState(node, payload, options) {
-      calls.push({ kind: "state", payload: structuredClone(payload), options });
-      return true;
-    },
-  };
-
-  try {
-    const before = structuredClone(manager.__dsm.state);
-    const changed = helpers.synchronizeConnectedLoadersAfterLibraryLoad(manager);
-    assert.equal(changed, 1);
-    assert.deepEqual(manager.__dsm.state, before, "opening a saved preset must not rewrite its library state");
-
-    const stateCall = calls.find((call) => call.kind === "state");
-    assert.ok(stateCall);
-    assert.equal(stateCall.payload.loras[0].name, "saved-character.safetensors");
-    assert.equal(stateCall.payload.loader_globals.auto_strength_enabled, true);
-    assert.equal(stateCall.payload.loader_globals.auto_strength_device, "cpu");
-    assert.equal(stateCall.payload.loader_globals.auto_strength_ratio_floor, 0.46);
-    assert.deepEqual(stateCall.options, { notifyStateManager: false });
-  } finally {
-    if (previousLoaderApi === undefined) delete globalThis.__doraPowerLoraLoaderApi;
-    else globalThis.__doraPowerLoraLoaderApi = previousLoaderApi;
-  }
-});
-
-
-test("library rollback restores the persisted loader globals into the visible connected loader", async () => {
-  const helpers = await loadStateManagerHelpers();
-  const persisted = privateCharacter("character-a", "A", "A0");
-  persisted.loader_stacks = [{
-    slot: "default",
-    label: "Default loader",
-    loras: [{
-      enabled: true,
-      name: "persisted.safetensors",
-      strength_model: 0.62,
-      strength_clip: 0.51,
-    }],
-    loader_globals: {
-      auto_strength_enabled: false,
-      auto_strength_device: "gpu",
-      auto_strength_ratio_floor: 0.3,
-      auto_strength_ratio_ceiling: 1.5,
-    },
-  }];
-  persisted.loras = structuredClone(persisted.loader_stacks[0].loras);
-  persisted.loader_globals = structuredClone(persisted.loader_stacks[0].loader_globals);
-  helpers.stateLibraryClient.state = { version: 2, characters: [structuredClone(persisted)] };
-
-  const unpersisted = structuredClone(persisted);
-  unpersisted.loader_stacks[0].loras[0].name = "unpersisted.safetensors";
-  unpersisted.loader_stacks[0].loader_globals.auto_strength_enabled = true;
-  unpersisted.loader_globals = structuredClone(unpersisted.loader_stacks[0].loader_globals);
-  unpersisted.loras = structuredClone(unpersisted.loader_stacks[0].loras);
-  const { manager, loader } = makeConnectedManagerAndLoader(helpers, unpersisted);
-
-  const calls = [];
-  const previousLoaderApi = globalThis.__doraPowerLoraLoaderApi;
-  const previousRaf = globalThis.requestAnimationFrame;
-  globalThis.requestAnimationFrame = () => 1;
-  globalThis.__doraPowerLoraLoaderApi = {
-    getSlot() {
-      return "default";
-    },
-    setSlot(node, slot, options) {
-      calls.push({ kind: "slot", slot, options });
-      node.properties.dora_state_slot = slot;
-      return slot;
-    },
-    setState(node, payload, options) {
-      calls.push({ kind: "state", payload: structuredClone(payload), options });
-      return true;
-    },
-  };
-
-  try {
-    const changed = helpers.restoreNodeAndConnectedLoadersFromLibrary(manager, {
-      status: "Library write rejected.",
-    });
-    assert.equal(changed, 1);
-
-    const restoredCharacter = manager.__dsm.state.characters.find((item) => item.id === "character-a");
-    assert.equal(restoredCharacter.loader_stacks[0].loras[0].name, "persisted.safetensors");
-    assert.equal(restoredCharacter.loader_stacks[0].loader_globals.auto_strength_enabled, false);
-
-    const stateCall = calls.find((call) => call.kind === "state");
-    assert.ok(stateCall);
-    assert.equal(stateCall.payload.loras[0].name, "persisted.safetensors");
-    assert.equal(stateCall.payload.loader_globals.auto_strength_enabled, false);
-    assert.deepEqual(stateCall.options, { notifyStateManager: false });
-  } finally {
-    if (previousLoaderApi === undefined) delete globalThis.__doraPowerLoraLoaderApi;
-    else globalThis.__doraPowerLoraLoaderApi = previousLoaderApi;
-    if (previousRaf === undefined) delete globalThis.requestAnimationFrame;
-    else globalThis.requestAnimationFrame = previousRaf;
-  }
-});
-
-
-test("untouched default loader state does not materialize a persistent preset on first load", async () => {
-  const helpers = await loadStateManagerHelpers();
-  const character = helpers.defaultState().characters[0];
-  const { manager } = makeConnectedManagerAndLoader(helpers, character);
-
-  const previousLoaderApi = globalThis.__doraPowerLoraLoaderApi;
-  globalThis.__doraPowerLoraLoaderApi = {
-    getSlot() {
-      return "default";
-    },
-    getState() {
-      return {
+    const savedCharacter = {
+      id: "character-a",
+      name: "Character A",
+      loader_stacks: [{
         slot: "default",
         label: "Default loader",
-        rows: [{ enabled: true, name: "None", strengthModel: 1.0, strengthClip: 1.0 }],
-        globals: {
-          stack_enabled: true,
-          verbose: false,
-          log_unloaded_keys: false,
-          broadcast_auto_scale: true,
-          broadcast_modulations: true,
-          broadcast_include_dora_scale: false,
-          broadcast_scale: 1.0,
-          dora_decompose_debug: false,
-          dora_decompose_debug_n: 30,
-          dora_decompose_debug_stack_depth: 10,
-          dora_slice_fix: true,
-          dora_adaln_swap_fix: true,
-          zimage_lumina2_compat: true,
-          auto_strength_enabled: false,
-          auto_strength_device: "gpu",
-          auto_strength_ratio_floor: 0.30,
-          auto_strength_ratio_ceiling: 1.50,
+        loras: [{ enabled: false, name: "library-stack.safetensors", strength_model: 1, strength_clip: 1 }],
+        loader_globals: {},
+      }],
+      prompts: [{ id: "prompt-a", name: "Prompt A", positive: "saved", negative: "", settings: {} }],
+    };
+    const requests = [];
+    globalThis.__dsmTestFetchApi = async (path, options = {}) => {
+      requests.push({ path, method: options.method || "GET" });
+      return {
+        ok: true,
+        async json() {
+          return { version: 2, revision: 3, characters: [structuredClone(savedCharacter)], user_id: "default" };
         },
       };
-    },
-  };
+    };
 
-  try {
-    const changed = helpers.synchronizeConnectedLoadersAfterLibraryLoad(manager);
-    assert.equal(changed, 0);
-    assert.equal(manager.__dsm.state.characters[0].id, "default_character");
-    assert.deepEqual(helpers.persistentCharacters(manager.__dsm.state), []);
-  } finally {
-    if (previousLoaderApi === undefined) delete globalThis.__doraPowerLoraLoaderApi;
-    else globalThis.__doraPowerLoraLoaderApi = previousLoaderApi;
+    const loaderCalls = [];
+    globalThis.__doraPowerLoraLoaderApi = {
+      getSlot() {
+        return "default";
+      },
+      getState() {
+        return {
+          slot: "default",
+          rows: [{ enabled: true, name: "workflow-stack.safetensors", strengthModel: 0.8, strengthClip: 0.8 }],
+          globals: { auto_strength_enabled: true },
+        };
+      },
+      setState(...args) {
+        loaderCalls.push(["setState", ...args]);
+        return true;
+      },
+      setSlot(...args) {
+        loaderCalls.push(["setSlot", ...args]);
+        return "default";
+      },
+    };
+
+    const widgets = [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: selection.characterId },
+      { name: "selected_prompt_id", value: selection.promptId },
+    ];
+    const manager = {
+      id: 1,
+      type: "State Manager",
+      comfyClass: "State Manager",
+      outputs: [{ name: "state_control", links: [100] }],
+      widgets,
+      properties: {},
+      size: [820, 720],
+      __dsm: { state: null, uiState: null, renderFrame: 0 },
+      setSize() {},
+      setDirtyCanvas() {},
+    };
+    const loader = {
+      id: 2,
+      comfyClass: "DoRA Power LoRA Loader",
+      title: "DoRA Power LoRA Loader",
+      inputs: [{ name: "state_control", link: 100 }],
+      properties: { dora_state_slot: "default" },
+      widgets: [{ name: "state_slot", value: "default" }],
+      setDirtyCanvas() {},
+    };
+    const graph = {
+      links: { 100: { origin_id: 1, origin_slot: 0, target_id: 2, target_slot: 0 } },
+      getNodeById(id) {
+        return id === 1 ? manager : id === 2 ? loader : null;
+      },
+      change() {},
+    };
+    manager.graph = graph;
+    loader.graph = graph;
+
+    try {
+      helpers.initializeNode(manager, {});
+      manager.onConfigure({
+        widgets_values: [
+          helpers.serializeBinding(),
+          helpers.serializeWorkflowUiState({}),
+          selection.characterId,
+          selection.promptId,
+        ],
+        properties: {},
+      });
+      helpers.capturedExtension.loadedGraphNode(manager);
+      for (let round = 0; round < 5; round += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        flushFrames();
+      }
+      await helpers.flushPendingLibraryWrites?.();
+
+      assert.equal(manager.__dsmLibraryHydrated, true);
+      assert.deepEqual(loaderCalls, [], `loading ${selection.characterId} must not rewrite the connected loader`);
+      assert.deepEqual(
+        requests.filter((request) => request.method !== "GET"),
+        [],
+        `loading ${selection.characterId} must not write to the shared library`,
+      );
+      assert.deepEqual(helpers.persistentCharacters(helpers.stateLibraryClient.state).map((item) => item.id), ["character-a"]);
+    } finally {
+      helpers.stateLibraryClient.nodes.delete(manager);
+      delete globalThis.__dsmTestFetchApi;
+      if (previousLoaderApi === undefined) delete globalThis.__doraPowerLoraLoaderApi;
+      else globalThis.__doraPowerLoraLoaderApi = previousLoaderApi;
+      if (previousRaf === undefined) delete globalThis.requestAnimationFrame;
+      else globalThis.requestAnimationFrame = previousRaf;
+      if (previousCancel === undefined) delete globalThis.cancelAnimationFrame;
+      else globalThis.cancelAnimationFrame = previousCancel;
+    }
   }
 });
 
@@ -1907,7 +1689,7 @@ test("State Manager canonicalizes auto-strength ratio bounds with loader semanti
 });
 
 
-test("capturing a named connected loader replaces the unused sole default stack", async () => {
+test("saving a named connected loader replaces the unused sole default stack", async () => {
   const helpers = await loadStateManagerHelpers();
   const character = privateCharacter("character-a", "A", "A0");
   character.loader_stacks = [{
@@ -1943,13 +1725,9 @@ test("capturing a named connected loader replaces the unused sole default stack"
   };
 
   try {
-    const changed = helpers.syncConnectedLoaderStateIntoManager(
-      manager,
-      loader,
-      { persist: false, render: false, dirty: false },
-    );
-    assert.equal(changed, 1);
-    const savedCharacter = manager.__dsm.state.characters.find((item) => item.id === "character-a");
+    const stack = globalThis.__doraPowerLoraLoaderApi.getState(loader);
+    helpers.saveLoaderStackIntoCharacter(character, stack);
+    const savedCharacter = character;
     assert.equal(savedCharacter.loader_stacks.length, 1);
     assert.equal(savedCharacter.loader_stacks[0].slot, "loader_207");
     assert.equal(savedCharacter.loader_stacks[0].loader_globals.auto_strength_enabled, true);
@@ -2002,7 +1780,7 @@ test("State Manager settings select the connected loader stack instead of an unu
 });
 
 
-test("persistent library refresh updates connected loaders and can skip the writer node", async () => {
+test("persistent library refreshes update State Manager views but never connected loaders", async () => {
   const helpers = await loadStateManagerHelpers();
   const persisted = privateCharacter("character-a", "A", "A0");
   persisted.loader_stacks = [{
@@ -2011,11 +1789,11 @@ test("persistent library refresh updates connected loaders and can skip the writ
     loras: [{ enabled: true, name: "persisted.safetensors", strength_model: 0.7, strength_clip: 0.6 }],
     loader_globals: { auto_strength_enabled: true },
   }];
-  persisted.loras = structuredClone(persisted.loader_stacks[0].loras);
-  persisted.loader_globals = structuredClone(persisted.loader_stacks[0].loader_globals);
   helpers.stateLibraryClient.state = { version: 2, characters: [structuredClone(persisted)] };
 
-  const { manager } = makeConnectedManagerAndLoader(helpers, persisted);
+  const edited = structuredClone(persisted);
+  edited.loader_stacks[0].loras[0].name = "unpersisted.safetensors";
+  const { manager } = makeConnectedManagerAndLoader(helpers, edited);
   helpers.stateLibraryClient.nodes.add(manager);
 
   const calls = [];
@@ -2026,21 +1804,16 @@ test("persistent library refresh updates connected loaders and can skip the writ
     getSlot() {
       return "default";
     },
-    setState(node, payload, options) {
-      calls.push({ payload: structuredClone(payload), options });
+    setState(node, payload) {
+      calls.push(structuredClone(payload));
       return true;
     },
   };
 
   try {
-    helpers.refreshAllNodesFromLibrary({ syncLoaders: true });
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].payload.loras[0].name, "persisted.safetensors");
-    assert.equal(calls[0].payload.loader_globals.auto_strength_enabled, true);
-    assert.deepEqual(calls[0].options, { notifyStateManager: false });
-
-    calls.length = 0;
-    helpers.refreshAllNodesFromLibrary({ syncLoaders: true, skipLoaderSyncNode: manager });
+    helpers.refreshAllNodesFromLibrary();
+    const refreshed = manager.__dsm.state.characters.find((item) => item.id === "character-a");
+    assert.equal(refreshed.loader_stacks[0].loras[0].name, "persisted.safetensors");
     assert.equal(calls.length, 0);
   } finally {
     helpers.stateLibraryClient.nodes.delete(manager);
@@ -2049,14 +1822,6 @@ test("persistent library refresh updates connected loaders and can skip the writ
     if (previousRaf === undefined) delete globalThis.requestAnimationFrame;
     else globalThis.requestAnimationFrame = previousRaf;
   }
-});
-
-
-test("post-load loader synchronization frame is tracked and canceled on State Manager removal", async () => {
-  const source = await readFile(new URL("../web/dora_state_manager.js", import.meta.url), "utf8");
-  assert.match(source, /ctx\.postLoadSyncFrame\s*=\s*requestAnimationFrame/);
-  assert.match(source, /if \(ctx\.postLoadSyncFrame\) \{[\s\S]*cancelAnimationFrame\(ctx\.postLoadSyncFrame\)[\s\S]*ctx\.postLoadSyncFrame\s*=\s*0/);
-  assert.match(source, /if \(!stateLibraryClient\.nodes\.has\(node\)\) return;/);
 });
 
 
@@ -2624,4 +2389,66 @@ test("queue preparation blocks a nonempty managed Text Box when persistent text 
     },
   );
   assert.equal(promptPayload.output["2"].inputs.text, timeline);
+});
+
+
+test("only character-wildcard queues replace a connected loader's own rows", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const character = privateCharacter("character-a", "A", "A0");
+  character.loader_stacks = [{
+    slot: "default",
+    label: "Default loader",
+    loras: [{ enabled: true, name: "preset.safetensors", strength_model: 0.5, strength_clip: 0.5 }],
+    loader_globals: {},
+  }];
+  const previousLoaderApi = globalThis.__doraPowerLoraLoaderApi;
+  globalThis.__doraPowerLoraLoaderApi = {
+    getSlot() {
+      return "default";
+    },
+  };
+
+  try {
+    for (const [uiState, expectOverride] of [
+      [{}, false],
+      [{ queue_prompt_wildcard: true }, false],
+      [{ queue_randomize_saved_seed: true }, false],
+      [{ queue_character_wildcard: true, queue_character_ids: ["character-a"] }, true],
+    ]) {
+      const { manager, loader } = makeConnectedManagerAndLoader(helpers, character);
+      manager.type = "State Manager";
+      manager.inputs = [];
+      manager.widgets[1].value = helpers.serializeWorkflowUiState(uiState);
+      manager.__dsm.uiState = uiState;
+      loader.inputs[0].link = 100;
+      manager.graph._nodes = [manager, loader];
+      helpers.app.graph = manager.graph;
+
+      const promptPayload = {
+        output: {
+          "1": { class_type: "StateManager", inputs: { ui_state_json: manager.widgets[1].value } },
+          "2": {
+            class_type: "DoraPowerLoraLoader",
+            inputs: {
+              state_control: ["1", 7],
+              LORA_1: { on: true, lora: "workflow.safetensors", strength: 1, strengthTwo: 1 },
+            },
+          },
+        },
+        workflow: { nodes: [] },
+      };
+
+      helpers.mutatePromptForStateManagers(promptPayload, 0, 1);
+      const queued = promptPayload.output["2"].inputs.state_control;
+      if (expectOverride) {
+        assert.equal(queued.loader_override, true, JSON.stringify(uiState));
+        assert.equal(queued.loras[0].name, "preset.safetensors");
+      } else {
+        assert.deepEqual(queued, ["1", 7], JSON.stringify(uiState));
+      }
+    }
+  } finally {
+    if (previousLoaderApi === undefined) delete globalThis.__doraPowerLoraLoaderApi;
+    else globalThis.__doraPowerLoraLoaderApi = previousLoaderApi;
+  }
 });

@@ -1565,6 +1565,20 @@ def _normalize_runtime_dora_state_payload(raw: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+_DORA_LOADER_OVERRIDE_KEY = "loader_override"
+
+
+def _loader_override_state_payload(kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # The state_control graph edge is an editor relationship: it replaces the
+    # loader's own rows only when the queued payload is an explicit loader
+    # override (character-wildcard queues). A wired dora_state input is the
+    # deliberate runtime path and keeps driving the loader.
+    raw_control = _safe_json_load(kwargs.get("state_control"), None)
+    if isinstance(raw_control, dict) and raw_control.get(_DORA_LOADER_OVERRIDE_KEY) is True:
+        return _normalize_runtime_dora_state_payload(raw_control)
+    return _normalize_runtime_dora_state_payload(kwargs.get("dora_state"))
+
+
 def _state_payload_text_for_box(state_payload: Optional[Dict[str, Any]], role: Any, slot: Any = "default") -> Optional[str]:
     if not isinstance(state_payload, dict):
         return None
@@ -1736,11 +1750,7 @@ def _loader_cache_globals(kwargs: Dict[str, Any], state_payload: Optional[Dict[s
 
 def _dora_loader_cache_key_from_inputs(model: Any, clip: Any, kwargs: Dict[str, Any]) -> str:
     state_slot = _clean_loader_slot(kwargs.get("state_slot", "default"), "default")
-    # Prefer state_control. It is the intended State Manager edge. dora_state remains
-    # a compatibility fallback for old workflows or direct runtime payload wiring.
-    state_payload = _normalize_runtime_dora_state_payload(kwargs.get("state_control"))
-    if state_payload is None:
-        state_payload = _normalize_runtime_dora_state_payload(kwargs.get("dora_state"))
+    state_payload = _loader_override_state_payload(kwargs)
 
     entries = _parse_dora_state_lora_entries(state_payload, state_slot) if state_payload is not None else None
     if entries is None:
@@ -5150,13 +5160,13 @@ class DoraPowerLoraLoader:
             "optional": FlexibleOptionalInputType(
                 any_type,
                 data={
-                    # Optional runtime state-manager input. When connected, this overrides local LoRA rows
-                    # and any saved loader-global settings in the manager payload.
-                    # Prefer state_control for save/load-only graph-editor workflows.
+                    # Optional runtime State Manager input. When connected, the selected
+                    # preset's loader stack replaces the local LoRA rows and globals.
                     "dora_state": ("DORA_STATE",),
 
-                    # Editor-only relationship used by State Manager Save/Load connected.
-                    # Ignored by backend execution.
+                    # Editor relationship used by State Manager Save/Load connected. It
+                    # replaces local rows only for queued character-wildcard payloads
+                    # marked as a loader override.
                     "state_control": ("STATE_MANAGER_CONTROL",),
                     "state_slot": ("STRING", {"default": "default", "multiline": False}),
 
@@ -5454,14 +5464,10 @@ class DoraPowerLoraLoader:
         return model, clip, auto_strength_report
 
     def load_loras(self, model, clip, **kwargs):
-        # state_control is the intended State Manager relationship edge. When it
-        # carries a runtime payload, use it as the primary source for LoRA rows
-        # and loader-global settings so state_control-only graphs follow queued
-        # character/prompt wildcarding. dora_state is only a compatibility fallback.
+        # The loader's own rows and globals are authoritative unless dora_state is
+        # wired or a queued character-wildcard loader override arrives on state_control.
         state_slot = _clean_loader_slot(kwargs.get("state_slot", "default"), "default")
-        state_payload = _normalize_runtime_dora_state_payload(kwargs.get("state_control"))
-        if state_payload is None:
-            state_payload = _normalize_runtime_dora_state_payload(kwargs.get("dora_state"))
+        state_payload = _loader_override_state_payload(kwargs)
         kwargs.pop("state_control", None)
 
         # Global controls (provided by JS UI; optionally overridden by DoRA State Manager)
