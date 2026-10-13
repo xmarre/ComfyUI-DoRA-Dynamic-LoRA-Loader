@@ -479,73 +479,61 @@ function normalizeAutoStrengthDevice(value) {
   return AUTO_STRENGTH_DEVICE_CHOICES.includes(v) ? v : "auto";
 }
 
-function parseRowsFromWidgetValues(widgetsValues) {
-  const vals = Array.isArray(widgetsValues) ? widgetsValues : [];
+// Widget-only workflows were written only by the first two loader builds.
+// Each row serialized enabled/name/strength_model/strength_clip followed by a
+// non-serialized Remove button; an Add button and three global toggles came
+// last, and the second build added a leading Refresh button. Frontends either
+// skipped non-serialized widgets or kept null placeholders at their positions.
+const LEGACY_WIDGET_LAYOUTS = [
+  { leading: 0, rowPadding: 0, trailing: 0 },
+  { leading: 0, rowPadding: 1, trailing: 1 },
+  { leading: 1, rowPadding: 1, trailing: 1 },
+];
+const LEGACY_GLOBAL_KEYS = ["stack_enabled", "verbose", "log_unloaded_keys"];
+const LEGACY_WIDGET_VALUES_PROPERTY = "dora_power_lora_unrecognized_widgets_values";
 
-  const parseWithLayout = (perRow, globalsCount) => {
-    if (vals.length < globalsCount) return null;
-    if ((vals.length - globalsCount) % perRow !== 0) return null;
+function isLegacyPlaceholder(value) {
+  return value === null || value === undefined;
+}
 
-    const outRows = [];
-    let idx = 0;
-    const rowsCount = Math.max(0, Math.floor((vals.length - globalsCount) / perRow));
-    for (let i = 0; i < rowsCount; i++) {
-      const r = makeRowDefaults();
-      r.enabled = Boolean(vals[idx++]);
-      const nm = vals[idx++];
-      r.name = typeof nm === "string" ? nm : (nm ?? "None");
-      const sm = Number(vals[idx++]);
-      r.strengthModel = sm;
-      if (perRow === 4) {
-        const sc = Number(vals[idx++]);
-        r.strengthClip = Number.isFinite(sc) ? sc : sm;
-      } else {
-        r.strengthClip = sm;
-      }
-      outRows.push(r);
+function decodeLegacyWidgetLayout(vals, { leading, rowPadding, trailing }) {
+  const rowWidth = 4 + rowPadding;
+  const rowValues = vals.length - leading - trailing - LEGACY_GLOBAL_KEYS.length;
+  if (rowValues <= 0 || rowValues % rowWidth !== 0) return null;
+  if (!vals.slice(0, leading).every(isLegacyPlaceholder)) return null;
+
+  const rows = [];
+  let idx = leading;
+  for (let i = 0; i < rowValues / rowWidth; i++, idx += rowWidth) {
+    const [enabled, name, strengthModel, strengthClip, ...padding] = vals.slice(idx, idx + rowWidth);
+    if (
+      typeof enabled !== "boolean" ||
+      typeof name !== "string" ||
+      !Number.isFinite(strengthModel) ||
+      !Number.isFinite(strengthClip) ||
+      !padding.every(isLegacyPlaceholder)
+    ) {
+      return null;
     }
-
-    const globals = {
-      stack_enabled: Boolean(vals[idx++]),
-      verbose: Boolean(vals[idx++]),
-      log_unloaded_keys: Boolean(vals[idx++]),
-    };
-
-    if (globalsCount >= 7) {
-      globals.dora_decompose_debug = Boolean(vals[idx++]);
-      globals.dora_decompose_debug_n = Number(vals[idx++]);
-      globals.dora_decompose_debug_stack_depth = Number(vals[idx++]);
-      globals.dora_slice_fix = Boolean(vals[idx++]);
-      globals.dora_adaln_swap_fix = true;
-    }
-
-    return { rows: outRows, globals };
-  };
-
-  const looksValid = (parsed) => {
-    if (!parsed) return false;
-    if (parsed.rows && parsed.rows.length) {
-      const r0 = parsed.rows[0];
-      if (typeof r0.name !== "string") return false;
-      if (!Number.isFinite(+r0.strengthModel)) return false;
-      if (!Number.isFinite(+r0.strengthClip)) return false;
-    }
-    return true;
-  };
-
-  const layouts = [
-    [4, 3],
-    [4, 7],
-    [3, 3],
-    [3, 7],
-  ];
-
-  for (const [perRow, globalsCount] of layouts) {
-    const parsed = parseWithLayout(perRow, globalsCount);
-    if (looksValid(parsed)) return parsed;
+    rows.push({ enabled, name, strengthModel, strengthClip });
   }
 
-  return { rows: [], globals: { stack_enabled: true, verbose: false, log_unloaded_keys: false } };
+  if (!vals.slice(idx, idx + trailing).every(isLegacyPlaceholder)) return null;
+  const globalValues = vals.slice(idx + trailing);
+  if (!globalValues.every((value) => typeof value === "boolean")) return null;
+  const globals = Object.fromEntries(LEGACY_GLOBAL_KEYS.map((key, i) => [key, globalValues[i]]));
+  return { rows, globals };
+}
+
+// Returns null unless exactly one known layout matches every field's type.
+function parseLegacyWidgetValues(widgetsValues) {
+  const vals = Array.isArray(widgetsValues) ? widgetsValues : [];
+  const matches = new Map();
+  for (const layout of LEGACY_WIDGET_LAYOUTS) {
+    const decoded = decodeLegacyWidgetLayout(vals, layout);
+    if (decoded) matches.set(JSON.stringify(decoded), decoded);
+  }
+  return matches.size === 1 ? [...matches.values()][0] : null;
 }
 
 function normalizeStateSlot(value, fallback = "default") {
@@ -567,6 +555,146 @@ function setStateSlot(node, value) {
   const slot = normalizeStateSlot(value, `loader_${node.id ?? "default"}`);
   node.properties.dora_state_slot = slot;
   return slot;
+}
+
+// Which saved stack the loader holds, recorded only by explicit State Manager
+// actions: applying a preset stack to the loader, or a confirmed save of the
+// loader into a preset. Selecting a preset does not bind the loader.
+//   { characterId, slot }
+const BINDING_PROPERTY = "dora_state_binding";
+// Incremented by every explicit change to which saved stack the loader holds
+// (preset application, State slot changes, renames). A save acknowledgment
+// only binds the loader when no such change happened after that save.
+const SAVE_EPOCH_PROPERTY = "dora_state_epoch";
+
+function getSaveEpoch(node) {
+  const value = node?.properties?.[SAVE_EPOCH_PROPERTY];
+  return Number.isInteger(value) && value > 0 ? value : 0;
+}
+
+function bumpSaveEpoch(node) {
+  node.properties = node.properties || {};
+  node.properties[SAVE_EPOCH_PROPERTY] = getSaveEpoch(node) + 1;
+}
+
+// A user State slot rename is tracked in the workflow until a State Manager
+// save of it is confirmed by the library, or a preset is applied:
+//   from      - the slot the library last confirmed for this loader's stack
+//   fromIn    - the character that slot belongs to: the loader's binding when
+//               the rename started on its bound slot, then the preset of each
+//               committed save ("" when unknown)
+//   savedTo   - where the latest save put the stack (pending or committed)
+//   savedToIn - the persistent character id that latest save wrote into
+//   seq       - counter of saves made under this rename
+// A preset resolves the loader's own saved stack only from slots recorded for
+// that same character, so a save still pending, rejected, or committed before
+// a reload is found again without claiming a same-named stack elsewhere.
+const SLOT_RENAME_PROPERTY = "dora_state_slot_rename";
+
+function makeSlotRenameId() {
+  return globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function getBinding(node) {
+  const value = node?.properties?.[BINDING_PROPERTY];
+  if (!value || typeof value !== "object" || typeof value.characterId !== "string" || !value.characterId) return null;
+  const slot = normalizeStateSlot(value.slot, "");
+  return slot ? { characterId: value.characterId, slot } : null;
+}
+
+function setBinding(node, characterId, slot) {
+  if (typeof characterId !== "string" || !characterId) return;
+  node.properties = node.properties || {};
+  node.properties[BINDING_PROPERTY] = { characterId, slot: normalizeStateSlot(slot, "default") };
+}
+
+function getSlotRename(node) {
+  const value = node?.properties?.[SLOT_RENAME_PROPERTY];
+  if (!value || typeof value !== "object") return null;
+  const from = normalizeStateSlot(value.from, "");
+  const id = typeof value.id === "string" ? value.id : "";
+  if (!from || !id) return null;
+  const fromIn = typeof value.fromIn === "string" ? value.fromIn : "";
+  const savedTo = value.savedTo == null ? "" : normalizeStateSlot(value.savedTo, "");
+  const savedToIn = typeof value.savedToIn === "string" ? value.savedToIn : "";
+  const seq = Number.isInteger(value.seq) && value.seq > 0 ? value.seq : 0;
+  return { from, fromIn, id, savedTo: savedTo && savedToIn ? savedTo : "", savedToIn: savedTo && savedToIn ? savedToIn : "", seq };
+}
+
+function setSlotRename(node, rename) {
+  node.properties = node.properties || {};
+  node.properties[SLOT_RENAME_PROPERTY] = { ...rename };
+}
+
+function clearSlotRename(node) {
+  if (node?.properties) delete node.properties[SLOT_RENAME_PROPERTY];
+}
+
+function hasPendingSlotRenameSave(rename) {
+  return !!rename && !!globalThis.__doraStateManagerLoaderSaveApi?.hasPendingSave?.(rename.id);
+}
+
+// An explicit preset application settles the rename: the loader now holds the
+// applied stack. Only a save into that same preset whose library write is
+// still in flight keeps the rename, since the applied stack is that save's
+// local result and the write may still be rejected.
+function settleSlotRenameOnApply(node, characterId) {
+  const rename = getSlotRename(node);
+  if (!rename) return;
+  if (hasPendingSlotRenameSave(rename) && (!characterId || rename.savedToIn === characterId)) return;
+  clearSlotRename(node);
+}
+
+function renameStateSlot(node, value) {
+  const current = getStateSlot(node);
+  const slot = setStateSlot(node, value);
+  if (slot === current) return slot;
+  bumpSaveEpoch(node);
+  const rename = getSlotRename(node);
+  if (!rename) {
+    const binding = getBinding(node);
+    setSlotRename(node, {
+      from: current,
+      fromIn: binding?.slot === current ? binding.characterId : "",
+      id: makeSlotRenameId(),
+      savedTo: "",
+      savedToIn: "",
+      seq: 0,
+    });
+  } else if (rename.from === slot && !rename.savedTo) {
+    clearSlotRename(node);
+  }
+  return slot;
+}
+
+function recordSlotRenameSave(node, slot, characterId) {
+  const rename = getSlotRename(node);
+  if (!rename || typeof characterId !== "string" || !characterId) return null;
+  const next = { ...rename, savedTo: normalizeStateSlot(slot, "default"), savedToIn: characterId, seq: rename.seq + 1 };
+  setSlotRename(node, next);
+  return { id: next.id, seq: next.seq };
+}
+
+// A save of this loader into characterId at slot is now held by the library.
+// A save that did not track a rename binds the loader only if nothing changed
+// its held stack since (epoch), and settles a leftover rename unless that
+// rename's own save is still pending.
+function commitLoaderSave(node, { id, seq, slot, characterId, epoch }) {
+  const committed = normalizeStateSlot(slot, "default");
+  const rename = getSlotRename(node);
+  if (!id) {
+    if (epoch !== getSaveEpoch(node) || getStateSlot(node) !== committed) return;
+    if (rename && !hasPendingSlotRenameSave(rename)) clearSlotRename(node);
+    setBinding(node, characterId, committed);
+    return;
+  }
+  if (!rename || rename.id !== id) return;
+  if (rename.seq === seq && rename.savedTo === committed && getStateSlot(node) === committed) {
+    clearSlotRename(node);
+    setBinding(node, characterId, committed);
+    return;
+  }
+  if (seq <= rename.seq) setSlotRename(node, { ...rename, from: committed, fromIn: characterId });
 }
 
 function defaultState() {
@@ -659,45 +787,9 @@ function setState(node, st) {
   node.properties.dora_power_lora = sanitizeState(st);
 }
 
-function notifyStateManagerOfLoaderChange(node, details = {}) {
-  if (!node) return false;
-  cancelScheduledStateManagerNotify(node);
-  const syncApi = globalThis.__doraStateManagerSyncApi;
-  if (typeof syncApi?.loaderStateChanged !== "function") return false;
-  try {
-    return !!syncApi.loaderStateChanged(node, details);
-  } catch (err) {
-    console.warn(`[${EXT_NAME}] Failed to synchronize loader state into State Manager`, err);
-    return false;
-  }
-}
-
-const STATE_MANAGER_NOTIFY_DELAY_MS = 150;
-const _stateManagerNotifyTimers = new WeakMap();
-
-function cancelScheduledStateManagerNotify(node) {
-  const timer = node ? _stateManagerNotifyTimers.get(node) : null;
-  if (timer == null) return false;
-  clearTimeout(timer);
-  _stateManagerNotifyTimers.delete(node);
-  return true;
-}
-
-function scheduleStateManagerNotify(node) {
-  if (!node) return false;
-  cancelScheduledStateManagerNotify(node);
-  const timer = setTimeout(() => {
-    _stateManagerNotifyTimers.delete(node);
-    notifyStateManagerOfLoaderChange(node);
-  }, STATE_MANAGER_NOTIFY_DELAY_MS);
-  _stateManagerNotifyTimers.set(node, timer);
-  return true;
-}
-
 function persistNodeState(node) {
   setState(node, { rows: node._doraRows || [], globals: node._doraGlobals || {} });
   clearExecutionReport(node);
-  scheduleStateManagerNotify(node);
 }
 
 
@@ -734,12 +826,16 @@ function installGlobalStateApi() {
       const state = getState(node);
       return { ...state, slot: getStateSlot(node), label: String(node?.title || getStateSlot(node)) };
     },
+    // options.characterId: the preset whose saved stack is being applied.
     setState(node, externalState, options = {}) {
       if (!node) return false;
       const next = normalizeExternalDoraState(externalState);
       if (externalState && Object.prototype.hasOwnProperty.call(externalState, "slot")) {
         setStateSlot(node, externalState.slot);
       }
+      bumpSaveEpoch(node);
+      settleSlotRenameOnApply(node, options?.characterId);
+      setBinding(node, options?.characterId, getStateSlot(node));
       setState(node, next);
       node._doraRows = next.rows;
       node._doraGlobals = next.globals;
@@ -751,21 +847,40 @@ function installGlobalStateApi() {
       }
       node.setDirtyCanvas?.(true, true);
       node.graph?.change?.();
-      if (options?.notifyStateManager !== false) notifyStateManagerOfLoaderChange(node);
       return true;
     },
     getSlot(node) {
       return getStateSlot(node);
     },
-    setSlot(node, value, options = {}) {
-      const previousSlot = getStateSlot(node);
+    getSlotRename(node) {
+      return getSlotRename(node);
+    },
+    recordSlotRenameSave(node, slot, characterId) {
+      return recordSlotRenameSave(node, slot, characterId);
+    },
+    getSaveEpoch(node) {
+      return getSaveEpoch(node);
+    },
+    commitLoaderSave(node, commit) {
+      commitLoaderSave(node, commit);
+    },
+    // Moves the loader back onto the slot its saved stack occupies without
+    // dropping rename tracking that a pending save still depends on.
+    restoreSlot(node, value) {
       const slot = setStateSlot(node, value);
+      bumpSaveEpoch(node);
       try { rebuild(node); } catch (_) {}
       node?.setDirtyCanvas?.(true, true);
       node?.graph?.change?.();
-      if (options?.notifyStateManager !== false) {
-        notifyStateManagerOfLoaderChange(node, { previousSlot });
-      }
+      return slot;
+    },
+    setSlot(node, value) {
+      const slot = setStateSlot(node, value);
+      bumpSaveEpoch(node);
+      settleSlotRenameOnApply(node);
+      try { rebuild(node); } catch (_) {}
+      node?.setDirtyCanvas?.(true, true);
+      node?.graph?.change?.();
       return slot;
     },
   };
@@ -1618,11 +1733,9 @@ function buildUI(node, state, loraValues) {
   wRefresh.serialize = false;
 
   const wStateSlot = node.addWidget("text", "state_slot", getStateSlot(node), (v) => {
-    const previousSlot = getStateSlot(node);
-    wStateSlot.value = setStateSlot(node, v);
+    wStateSlot.value = renameStateSlot(node, v);
     node.setDirtyCanvas?.(true, true);
     node.graph?.change?.();
-    notifyStateManagerOfLoaderChange(node, { previousSlot });
   });
   wStateSlot.label = "State slot";
 
@@ -1877,20 +1990,19 @@ app.registerExtension({
       return r;
     };
 
-    const origOnRemoved = nodeType.prototype.onRemoved;
-    nodeType.prototype.onRemoved = function () {
-      cancelScheduledStateManagerNotify(this);
-      return origOnRemoved?.apply(this, arguments);
-    };
-
     const origConfigure = nodeType.prototype.configure;
     nodeType.prototype.configure = function (info) {
       try {
         let st = null;
+        let unrecognizedLegacyValues = null;
         if (info?.properties?.dora_power_lora) {
           st = sanitizeState(info.properties.dora_power_lora);
         } else if (Array.isArray(info?.widgets_values) && info.widgets_values.length) {
-          const parsed = parseRowsFromWidgetValues(info.widgets_values);
+          let parsed = parseLegacyWidgetValues(info.widgets_values);
+          if (!parsed) {
+            unrecognizedLegacyValues = info.widgets_values;
+            parsed = { rows: [], globals: {} };
+          }
           st = sanitizeState({
             rows: parsed.rows,
             globals: {
@@ -1916,6 +2028,13 @@ app.registerExtension({
         }
         setState(this, st);
         setStateSlot(this, info?.properties?.dora_state_slot ?? this.properties?.dora_state_slot ?? `loader_${this.id ?? "default"}`);
+        if (unrecognizedLegacyValues) {
+          // Keep the original values in the workflow instead of discarding them.
+          this.properties[LEGACY_WIDGET_VALUES_PROPERTY] = JSON.parse(JSON.stringify(unrecognizedLegacyValues));
+          console.warn(
+            `[${EXT_NAME}] Unrecognized legacy widget values; loaded default rows and kept the original values in properties.${LEGACY_WIDGET_VALUES_PROPERTY}`
+          );
+        }
 
         if (origConfigure) {
           const safeInfo = info ? { ...info } : info;

@@ -288,3 +288,65 @@ def test_v2_import_requires_prompt_document_capability_before_mutation(dora_modu
             "kind": "dora_state_manager_library_export",
             "characters": [persistent_character()],
         })
+
+
+def test_loader_rows_stay_authoritative_unless_queued_override(configured_nodes):
+    nodes = configured_nodes
+    character = persistent_character()
+    store = nodes._get_state_manager_store()
+    store.replace([character], 0)
+    payload = nodes._resolve_dora_state_payload(
+        json.dumps(nodes._state_manager_default_binding()),
+        character["id"],
+        character["prompts"][0]["id"],
+    )
+    graph_edge = nodes._build_state_control_payload(payload)
+    own_rows = {"LORA_1": {"on": True, "lora": "workflow.safetensors", "strength": 1.0, "strengthTwo": 1.0}}
+
+    def queued_lora_names(**inputs):
+        key = json.loads(nodes._dora_loader_cache_key_from_inputs(None, None, {**own_rows, **inputs}))
+        return [entry["lora"] for entry in key["loras"]]
+
+    assert queued_lora_names(state_control=graph_edge) == ["workflow.safetensors"]
+    assert queued_lora_names(state_control={**graph_edge, "loader_override": True}) == ["runtime.safetensors"]
+    assert queued_lora_names(dora_state=payload) == ["runtime.safetensors"]
+
+
+def test_load_loras_runs_workflow_rows_unless_dora_state_or_queued_override(configured_nodes):
+    nodes = configured_nodes
+    character = persistent_character()
+    store = nodes._get_state_manager_store()
+    store.replace([character], 0)
+    payload = nodes._resolve_dora_state_payload(
+        json.dumps(nodes._state_manager_default_binding()),
+        character["id"],
+        character["prompts"][0]["id"],
+    )
+    graph_edge = nodes._build_state_control_payload(payload)
+    loader = nodes.DoraPowerLoraLoader()
+
+    def executed(**inputs):
+        # stack_enabled=False returns before any model patching but still
+        # reports the stack and globals the loader resolved for this run.
+        output = loader.load_loras(
+            None,
+            None,
+            stack_enabled=False,
+            state_slot="default",
+            LORA_1={"on": True, "lora": "workflow.safetensors", "strength": 0.9, "strengthTwo": 0.8},
+            auto_strength_enabled=False,
+            **inputs,
+        )
+        stack = output["result"][4]
+        return (
+            [(row["name"], row["strength_model"], row["strength_clip"]) for row in stack["loras"]],
+            stack["loader_globals"]["auto_strength_enabled"],
+        )
+
+    workflow_rows = ([("workflow.safetensors", 0.9, 0.8)], False)
+    preset_rows = ([("runtime.safetensors", 0.75, 0.5)], True)
+    assert executed() == workflow_rows
+    assert executed(state_control=graph_edge) == workflow_rows
+    assert executed(state_control={**graph_edge, "loader_override": True}) == preset_rows
+    assert executed(dora_state=payload) == preset_rows
+    assert executed(state_control=graph_edge, dora_state=payload) == preset_rows

@@ -572,7 +572,7 @@ The manager separates **saved state** from **runtime execution**:
 
 - execution outputs are source-only and acyclic
 - save/load/apply actions are explicit frontend graph edits
-- `state_control` links are editor/control-only and do not replace prompt text, seed values, or LoRA rows during execution
+- `state_control` links are editor/control-only and do not replace prompt text, seed values, or LoRA rows during execution; the one exception is a character-wildcard queue, which runs each queued character's saved loader stacks
 - no prompt, LoRA stack, settings, or seed value is captured through runtime feedback inputs or wildcard feedback loops
 
 Use it to save:
@@ -677,6 +677,12 @@ State Manager.state_control -> DoRA Loader D.state_control  # State slot: refine
 
 Click **Save connected** to capture all four stacks separately. Click **Load connected** to push each saved stack back into the matching loader.
 
+Renaming a loader's **State slot** is remembered until a save of it has been committed to the library, or a preset is applied to the loader. Saving then moves that loader's saved stack to the new slot instead of leaving a stale copy under the old one. A rejected or blocked library write keeps the rename, so saving again after **Reload library** still moves the stack.
+
+A renamed loader never overwrites a different stack already saved under its new slot. If the preset holds the loader's previous slot, the save keeps the loader on that slot and saves there; otherwise the loader is not saved and the status says why. A slot that another loader in the workflow (including inside subgraphs) is on belongs to that loader: renaming a copied loader saves the copy as a new slot and leaves the original's stack in place.
+
+A loader is bound to a preset only by an explicit action: applying that preset's stack to it (**Load connected**, **Apply selected**, **Apply connected loaders**, clicking a character tile) or a confirmed save of it into that preset. Selecting a preset does not bind it. A rename belongs to the preset the loader was bound to on its previous slot. Until a save of it has been committed, saving that loader into a different preset is refused, so another preset's stacks are never taken over by slot name alone; applying the other preset or renaming the slot back lets it save there. A loader that was never bound (for example, from a workflow saved by an earlier version) is refused when renamed onto a preset that holds its previous slot until it is saved once on that slot or a preset is applied.
+
 ### Save / load / apply workflow
 
 The UI has four graph-editing actions:
@@ -686,7 +692,14 @@ The UI has four graph-editing actions:
 - **Save selected** — captures state from selected graph nodes.
 - **Apply selected** — pushes the selected character/preset into selected graph nodes.
 
-Selecting a character tile or prompt preset only changes the manager selection. It does not mutate other nodes until **Load connected** or **Apply selected** is clicked.
+Each DoRA loader's LoRA rows and settings belong to its workflow:
+
+- Opening a workflow, switching workflow tabs, and library refreshes never change a connected loader, and never create or modify presets.
+- Editing a loader never writes into the selected preset. Use **Save connected**, **Save selected**, or **Save connected loaders** to store the loader state in the preset.
+- Clicking a character tile, **Load connected**, **Apply selected**, **Apply connected loaders**, and edits in the State Manager LoRA tab copy the preset's saved stacks into the connected loaders once.
+- An ordinary queue runs the loader's own rows. A character-wildcard queue runs each queued character's saved loader stacks.
+
+Selecting a prompt preset only changes the manager selection.
 
 For older workflows that do not have `state_control` links, the frontend keeps a compatibility fallback that can inspect legacy runtime output links. Treat that as migration support, not the canonical wiring for new graphs.
 
