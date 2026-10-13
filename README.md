@@ -677,7 +677,9 @@ State Manager.state_control -> DoRA Loader D.state_control  # State slot: refine
 
 Click **Save connected** to capture all four stacks separately. Click **Load connected** to push each saved stack back into the matching loader.
 
-Renaming a loader's **State slot** is remembered until the next save or preset application. Saving then moves that loader's saved stack to the new slot instead of leaving a stale copy under the old one. If the new slot already holds a different saved stack in the preset, the save keeps the loader on its previous slot and reports it, so the other stack is never overwritten.
+Renaming a loader's **State slot** is remembered until a save of it has been committed to the library, or a preset is applied to the loader. Saving then moves that loader's saved stack to the new slot instead of leaving a stale copy under the old one. A rejected or blocked library write keeps the rename, so saving again after **Reload library** still moves the stack.
+
+A renamed loader never overwrites a different stack already saved under its new slot. If the preset holds the loader's previous slot, the save keeps the loader on that slot and saves there; otherwise the loader is not saved and the status says why.
 
 ### Save / load / apply workflow
 

@@ -48,7 +48,7 @@ async function loadExtensions() {
       ['import { api } from "../../scripts/api.js";', "const api = { fetchApi(...args) { return globalThis.__dsmTestFetchApi(...args); }, apiURL(value) { return value; } };"],
       ['import "../../scripts/domWidget.js";', ""],
     ],
-    "\nexport { app, capturedExtension, initializeNode, stateLibraryClient, serializeBinding, serializeWorkflowUiState, mutatePromptForStateManagers, saveLoadersIntoCharacter, syncCharacterLoaderStacksToConnectedNodes };\n",
+    "\nexport { app, capturedExtension, initializeNode, stateLibraryClient, serializeBinding, serializeWorkflowUiState, mutatePromptForStateManagers, saveLoadersIntoCharacter, syncCharacterLoaderStacksToConnectedNodes, updateState, flushPendingLibraryWrites, reloadStateLibrary };\n",
   );
 
   class LoaderNode {
@@ -145,17 +145,20 @@ function makeHarness({ manager, LoaderNode }) {
   };
   globalThis.cancelAnimationFrame = (id) => frames.delete(id);
 
-  const library = { revision: 1, characters: [presetCharacter()] };
+  const library = { revision: 1, characters: [presetCharacter()], putOutcomes: [] };
   const writes = [];
+  const snapshot = () => ({ version: 2, revision: library.revision, characters: structuredClone(library.characters), user_id: "default" });
+  const respond = (ok, status, body) => ({ ok, status, async json() { return body; } });
   globalThis.__dsmTestFetchApi = async (path, options = {}) => {
     const method = options.method || "GET";
-    if (method !== "GET") writes.push({ path, method });
-    return {
-      ok: true,
-      async json() {
-        return { version: 2, revision: library.revision, characters: structuredClone(library.characters), user_id: "default" };
-      },
-    };
+    if (method === "GET") return respond(true, 200, snapshot());
+    writes.push({ path, method });
+    const outcome = library.putOutcomes.shift() || "ok";
+    if (outcome === "conflict") return respond(false, 409, { error: "revision conflict" });
+    if (typeof outcome === "object" && outcome.deferred) await outcome.deferred;
+    library.characters = JSON.parse(options.body).characters;
+    library.revision += 1;
+    return respond(true, 200, snapshot());
   };
 
   async function open(workflow) {
@@ -214,6 +217,26 @@ function makeHarness({ manager, LoaderNode }) {
   }
 
   return { open, leave, library, writes, frames };
+}
+
+const savedSlots = (characters, id = "character-a") =>
+  characters.find((character) => character.id === id).loader_stacks.map((stack) => stack.slot);
+
+// Same path as the Save connected loaders button: explicit save into the
+// selected character, then the State Manager's library write.
+async function saveConnectedLoaders(manager, tab, characterId = "character-a") {
+  const { managerNode, loader } = tab;
+  const state = structuredClone(managerNode.__dsm.state);
+  const character = state.characters.find((item) => item.id === characterId);
+  const result = manager.saveLoadersIntoCharacter(character, [loader]);
+  manager.updateState(managerNode, state, managerNode.__dsm.uiState, {
+    characterId,
+    promptId: character.prompts[0].id,
+    renameCommits: result.renameCommits,
+    render: false,
+  });
+  await manager.flushPendingLibraryWrites().catch(() => {});
+  return result;
 }
 
 const ownState = (loader) => ({
@@ -281,48 +304,51 @@ test("switching between workflows bound to the same preset keeps each loader's o
   harness.leave(tab);
 });
 
-test("saving a renamed loader moves its stack, and an occupied slot is never overwritten", async () => {
+const renameSlot = (loader, slot) => loader.widgets.find((widget) => widget.name === "state_slot").callback(slot);
+const renameOf = (loader) => loader.properties.dora_state_slot_rename;
+const savedStack = (characters, slot, id = "character-a") =>
+  characters.find((character) => character.id === id).loader_stacks.find((stack) => stack.slot === slot);
+const rowNames = (stack) => stack.loras.map((row) => row.name);
+
+test("a renamed loader's stack moves only after the library write commits, including after a rejected write", async () => {
   const extensions = await loadExtensions();
   const { manager } = extensions;
   const harness = makeHarness(extensions);
   const tab = await harness.open(WORKFLOW_A);
-  const character = presetCharacter();
-  character.loader_stacks.push({
-    slot: "outfit",
-    label: "Outfit",
-    loras: [{ enabled: true, name: "outfit.safetensors", strength_model: 1, strength_clip: 1 }],
-    loader_globals: {},
-  });
-  const slotWidget = tab.loader.widgets.find((widget) => widget.name === "state_slot");
-  const slots = () => character.loader_stacks.map((stack) => stack.slot);
 
-  slotWidget.callback("style");
-  slotWidget.callback("hair");
-  assert.equal(tab.loader.properties.dora_state_slot_previous, "face", "lineage keeps the last saved slot across renames");
-  let result = manager.saveLoadersIntoCharacter(character, [tab.loader]);
-  assert.deepEqual(result.notes, []);
-  assert.deepEqual(slots(), ["hair", "outfit"], "rename to a new slot moves the saved stack");
-  assert.deepEqual(character.loader_stacks[0].loras.map((row) => row.name), ["face.safetensors", "style.safetensors"]);
-  assert.equal(tab.loader.properties.dora_state_slot_previous, undefined);
+  renameSlot(tab.loader, "style");
+  renameSlot(tab.loader, "hair");
+  assert.equal(renameOf(tab.loader).from, "face", "the rename keeps the last saved slot across further renames");
 
-  slotWidget.callback("outfit");
-  result = manager.saveLoadersIntoCharacter(character, [tab.loader]);
-  assert.equal(result.notes.length, 1);
-  assert.deepEqual(slots(), ["hair", "outfit"], "rename onto an occupied slot keeps both stacks");
-  assert.deepEqual(character.loader_stacks[1].loras.map((row) => row.name), ["outfit.safetensors"]);
-  assert.equal(tab.loader.properties.dora_state_slot, "hair", "the loader stays on its previous slot");
-  assert.equal(tab.loader.properties.dora_state_slot_previous, undefined);
+  harness.library.putOutcomes.push("conflict");
+  await saveConnectedLoaders(manager, tab);
+  assert.equal(manager.stateLibraryClient.blocked, true);
+  assert.equal(renameOf(tab.loader)?.from, "face", "a rejected write keeps the rename pending");
+  assert.deepEqual(savedSlots(harness.library.characters), ["face"]);
 
-  slotWidget.callback("face");
-  slotWidget.callback("hair");
-  assert.equal(tab.loader.properties.dora_state_slot_previous, undefined, "renaming back to the saved slot clears lineage");
+  const writesBeforeBlockedSave = harness.writes.length;
+  await saveConnectedLoaders(manager, tab);
+  assert.equal(harness.writes.length, writesBeforeBlockedSave, "a save while writes are blocked sends nothing");
+  assert.equal(renameOf(tab.loader)?.from, "face", "a blocked save keeps the rename pending");
 
+  await manager.reloadStateLibrary(tab.managerNode);
+  await saveConnectedLoaders(manager, tab);
+  assert.deepEqual(savedSlots(harness.library.characters), ["hair"], "the retried save moves the stack instead of duplicating it");
+  assert.deepEqual(rowNames(savedStack(harness.library.characters, "hair")), ["face.safetensors", "style.safetensors"]);
+  assert.equal(renameOf(tab.loader), undefined, "the committed write acknowledges the rename");
+
+  await saveConnectedLoaders(manager, tab);
+  assert.deepEqual(savedSlots(harness.library.characters), ["hair"]);
+
+  renameSlot(tab.loader, "face");
+  renameSlot(tab.loader, "hair");
+  assert.equal(renameOf(tab.loader), undefined, "renaming back to the saved slot clears the rename");
+
+  const character = structuredClone(harness.library.characters[0]);
   tab.loader.properties.dora_power_lora.rows[0].strengthModel = 0.1;
   assert.equal(manager.syncCharacterLoaderStacksToConnectedNodes(tab.managerNode, character), 1);
   assert.equal(tab.loader.properties.dora_power_lora.rows[0].strengthModel, 0.85, "applying the preset uses the moved stack");
 
-  manager.stateLibraryClient.state = { version: 2, characters: [character] };
-  tab.managerNode.__dsm.state = { version: 2, characters: [character] };
   const wildcard = queuedLoaderInputs(manager, tab.managerNode, tab.loader, {
     queue_character_wildcard: true,
     queue_character_ids: ["character-a"],
@@ -330,5 +356,111 @@ test("saving a renamed loader moves its stack, and an occupied slot is never ove
   assert.equal(wildcard.state_control.loader_override, true);
   assert.equal(wildcard.state_control.loader_stacks[0].slot, "hair");
   assert.deepEqual(wildcard.state_control.loras.map((row) => row.name), ["face.safetensors", "style.safetensors"]);
+  harness.leave(tab);
+});
+
+test("a rename onto an occupied slot keeps both stacks even when the write is rejected", async () => {
+  const extensions = await loadExtensions();
+  const { manager } = extensions;
+  const harness = makeHarness(extensions);
+  harness.library.characters[0].loader_stacks.push({
+    slot: "outfit",
+    label: "Outfit",
+    loras: [{ enabled: true, name: "outfit.safetensors", strength_model: 1, strength_clip: 1 }],
+    loader_globals: {},
+  });
+  const tab = await harness.open(WORKFLOW_A);
+
+  renameSlot(tab.loader, "outfit");
+  harness.library.putOutcomes.push("conflict");
+  const result = await saveConnectedLoaders(manager, tab);
+  assert.equal(result.notes.length, 1);
+  assert.equal(tab.loader.properties.dora_state_slot, "face", "the loader returns to its saved slot");
+  assert.equal(renameOf(tab.loader), undefined);
+  assert.deepEqual(savedSlots(harness.library.characters), ["face", "outfit"]);
+  assert.deepEqual(rowNames(savedStack(harness.library.characters, "face")), ["preset.safetensors"]);
+
+  await manager.reloadStateLibrary(tab.managerNode);
+  await saveConnectedLoaders(manager, tab);
+  assert.deepEqual(savedSlots(harness.library.characters), ["face", "outfit"]);
+  assert.deepEqual(rowNames(savedStack(harness.library.characters, "face")), ["face.safetensors", "style.safetensors"]);
+  assert.deepEqual(rowNames(savedStack(harness.library.characters, "outfit")), ["outfit.safetensors"]);
+  harness.leave(tab);
+});
+
+test("a rename committed while its workflow tab is closed is settled when the tab reopens", async () => {
+  const extensions = await loadExtensions();
+  const { manager } = extensions;
+  const harness = makeHarness(extensions);
+  let tab = await harness.open(WORKFLOW_A);
+
+  renameSlot(tab.loader, "hair");
+  let release;
+  harness.library.putOutcomes.push({ deferred: new Promise((resolve) => { release = resolve; }) });
+  const pendingSave = saveConnectedLoaders(manager, tab);
+  const savedA = harness.leave(tab);
+  assert.equal(savedA.loader.dora_state_slot_rename.from, "face", "the tab was serialized before the write committed");
+
+  tab = await harness.open(WORKFLOW_B);
+  release();
+  await pendingSave;
+  assert.deepEqual(savedSlots(harness.library.characters), ["hair"]);
+  harness.leave(tab);
+
+  tab = await harness.open(savedA);
+  assert.equal(renameOf(tab.loader), undefined, "the reopened tab adopts the committed rename");
+  await saveConnectedLoaders(manager, tab);
+  assert.deepEqual(savedSlots(harness.library.characters), ["hair"], "saving again neither duplicates nor resurrects the old slot");
+  harness.leave(tab);
+});
+
+test("a renamed loader never overwrites a different stack when its previous slot is not in the preset", async () => {
+  const extensions = await loadExtensions();
+  const { manager } = extensions;
+  const harness = makeHarness(extensions);
+  const characterB = {
+    id: "character-b",
+    name: "Character B",
+    loader_stacks: [{
+      slot: "style",
+      label: "Style",
+      loras: [{ enabled: true, name: "saved-style.safetensors", strength_model: 0.9, strength_clip: 0.9 }],
+      loader_globals: {},
+    }],
+    prompts: [{ id: "prompt-b", name: "Prompt B", positive: "b", negative: "", settings: {} }],
+  };
+  harness.library.characters[0].loader_stacks.push(structuredClone(characterB.loader_stacks[0]));
+  harness.library.characters.push(characterB);
+  const savedStacks = () => harness.library.characters.map((character) => [
+    character.id,
+    character.loader_stacks.map((stack) => [stack.slot, rowNames(stack)]),
+  ]);
+  const stacksBefore = savedStacks();
+  const workflow = structuredClone(WORKFLOW_A);
+  workflow.loader.dora_state_slot = "new";
+  const tab = await harness.open(workflow);
+  const rowsBefore = structuredClone(tab.loader.properties.dora_power_lora.rows);
+
+  renameSlot(tab.loader, "style");
+  let result = await saveConnectedLoaders(manager, tab);
+  assert.equal(result.saved, 0);
+  assert.match(result.notes[0], /Not saved/);
+  assert.deepEqual(savedStacks(), stacksBefore, "the occupied stack is untouched");
+  assert.equal(tab.loader.properties.dora_state_slot, "style");
+  assert.deepEqual(tab.loader.properties.dora_power_lora.rows, rowsBefore);
+  assert.equal(renameOf(tab.loader)?.from, "new", "a rejected save keeps the rename");
+
+  // Select another preset (as prompt selection does, without applying stacks)
+  // and save into it: the rename still cannot claim its occupied slot.
+  const state = structuredClone(tab.managerNode.__dsm.state);
+  manager.updateState(tab.managerNode, state, tab.managerNode.__dsm.uiState, {
+    characterId: "character-b",
+    promptId: "prompt-b",
+    render: false,
+  });
+  result = await saveConnectedLoaders(manager, tab, "character-b");
+  assert.equal(result.saved, 0);
+  assert.deepEqual(savedStacks(), stacksBefore);
+  assert.equal(renameOf(tab.loader)?.from, "new");
   harness.leave(tab);
 });

@@ -9,7 +9,8 @@ This release makes each DoRA Power LoRA Loader's rows and settings belong to its
 - Opening a workflow no longer captures loader state into a newly materialized preset when the State Manager is on the built-in default selection.
 - Legacy embedded State Manager libraries are still imported automatically on load; the import no longer rewrites connected loaders.
 - Clicking a character tile, **Load connected**, **Apply selected**, **Apply connected loaders**, and State Manager LoRA tab edits still copy the preset's stacks into connected loaders.
-- A loader's State slot rename is remembered until the next save or preset application. **Save connected**, **Save selected**, and **Save connected loaders** move the renamed loader's saved stack to its new slot; when the new slot already holds another saved stack, the loader stays on its previous slot and the status reports it instead of overwriting that stack.
+- A loader's State slot rename is remembered until a library write that saved it commits, or a preset is applied to the loader. **Save connected**, **Save selected**, and **Save connected loaders** move the renamed loader's saved stack to its new slot. A rejected or blocked write keeps the rename for the next save, including in workflow tabs closed and reopened while the write was pending.
+- A renamed loader never overwrites a different stack saved under its new slot: it stays on its previous slot when the preset holds that slot, and is otherwise not saved, with the reason in the status.
 
 ## Legacy widget-only workflows
 

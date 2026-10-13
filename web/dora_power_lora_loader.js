@@ -557,26 +557,46 @@ function setStateSlot(node, value) {
   return slot;
 }
 
-// Slot the loader was last saved to or applied from before user renames.
-// Presets use it to move the saved stack instead of duplicating it.
-const PREVIOUS_SLOT_PROPERTY = "dora_state_slot_previous";
+// A user State slot rename is tracked as { from, id } until a State Manager
+// library write that saved it commits, or a preset is applied to the loader.
+// Presets use `from` to move the saved stack instead of duplicating it.
+const SLOT_RENAME_PROPERTY = "dora_state_slot_rename";
+// Rename ids whose save committed, mapped to the slot the library now holds.
+// Workflow tabs reopened from JSON serialized before the commit still carry
+// the rename; configure() settles it against this map.
+const committedSlotRenames = new Map();
 
-function getPreviousStateSlot(node) {
-  const value = node?.properties?.[PREVIOUS_SLOT_PROPERTY];
-  return value == null ? null : normalizeStateSlot(value, "") || null;
+function makeSlotRenameId() {
+  return globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
-function clearPreviousStateSlot(node) {
-  if (node?.properties) delete node.properties[PREVIOUS_SLOT_PROPERTY];
+function getSlotRename(node) {
+  const value = node?.properties?.[SLOT_RENAME_PROPERTY];
+  if (!value || typeof value !== "object") return null;
+  const from = normalizeStateSlot(value.from, "");
+  const id = typeof value.id === "string" ? value.id : "";
+  return from && id ? { from, id } : null;
+}
+
+function clearSlotRename(node) {
+  if (node?.properties) delete node.properties[SLOT_RENAME_PROPERTY];
+}
+
+function settleCommittedSlotRename(node) {
+  const rename = getSlotRename(node);
+  if (!rename || !committedSlotRenames.has(rename.id)) return;
+  const committedSlot = committedSlotRenames.get(rename.id);
+  if (committedSlot === getStateSlot(node)) clearSlotRename(node);
+  else node.properties[SLOT_RENAME_PROPERTY] = { from: committedSlot, id: makeSlotRenameId() };
 }
 
 function renameStateSlot(node, value) {
   const current = getStateSlot(node);
   const slot = setStateSlot(node, value);
   if (slot === current) return slot;
-  const previous = getPreviousStateSlot(node);
-  if (previous === slot) clearPreviousStateSlot(node);
-  else if (!previous) node.properties[PREVIOUS_SLOT_PROPERTY] = current;
+  const rename = getSlotRename(node);
+  if (rename?.from === slot) clearSlotRename(node);
+  else if (!rename) node.properties[SLOT_RENAME_PROPERTY] = { from: current, id: makeSlotRenameId() };
   return slot;
 }
 
@@ -715,7 +735,7 @@ function installGlobalStateApi() {
       if (externalState && Object.prototype.hasOwnProperty.call(externalState, "slot")) {
         setStateSlot(node, externalState.slot);
       }
-      clearPreviousStateSlot(node);
+      clearSlotRename(node);
       setState(node, next);
       node._doraRows = next.rows;
       node._doraGlobals = next.globals;
@@ -732,15 +752,16 @@ function installGlobalStateApi() {
     getSlot(node) {
       return getStateSlot(node);
     },
-    getPreviousSlot(node) {
-      return getPreviousStateSlot(node);
+    getSlotRename(node) {
+      return getSlotRename(node);
     },
-    markSlotSaved(node) {
-      clearPreviousStateSlot(node);
+    commitSlotRename(node, id, committedSlot) {
+      committedSlotRenames.set(id, normalizeStateSlot(committedSlot, "default"));
+      settleCommittedSlotRename(node);
     },
     setSlot(node, value) {
       const slot = setStateSlot(node, value);
-      clearPreviousStateSlot(node);
+      clearSlotRename(node);
       try { rebuild(node); } catch (_) {}
       node?.setDirtyCanvas?.(true, true);
       node?.graph?.change?.();
@@ -1906,6 +1927,7 @@ app.registerExtension({
             origConfigure.call(this, safeInfo);
           } catch (_) {}
         }
+        settleCommittedSlotRename(this);
 
         rebuild(this);
       } catch (e) {
