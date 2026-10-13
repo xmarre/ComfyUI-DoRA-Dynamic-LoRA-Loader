@@ -2413,6 +2413,16 @@ function commitDoraLoaderSaves(loaderCommits) {
   }
 }
 
+// A copied loader carries the original's binding and rename tracking; a slot
+// another loader in the workflow (any subgraph included) currently uses
+// belongs to that loader.
+function slotHeldByAnotherLoader(loader, slot) {
+  const root = loader?.graph?.rootGraph ?? loader?.graph;
+  const graphs = [root, ...(root?.subgraphs?.values?.() ?? [])];
+  return graphs.some((graph) => (graph?._nodes ?? graph?.nodes ?? []).some((node) =>
+    node !== loader && isDoraLoaderNode(node) && normalizeLoaderSlot(getDoraLoaderSlot(node), "default") === slot));
+}
+
 function sameLoaderStackContent(a, b) {
   const content = (stack) => {
     const normalized = normalizeLoaderStack(stack);
@@ -2430,7 +2440,8 @@ function sameLoaderStackContent(a, b) {
 // when fromIn is this character). A slot name recorded for another character,
 // or of unknown origin while this character holds that slot, never identifies
 // the loader's stack here: such a save is refused rather than consuming
-// another preset's stack. Saving moves the loader's own stack to its current
+// another preset's stack. Neither does a slot another loader in the workflow
+// is currently on. Saving moves the loader's own stack to its current
 // slot. A renamed loader never overwrites a different stack saved under its
 // new slot: it returns to its own stack's slot when the preset holds one, and
 // is otherwise not saved. The returned loaderSaves are recorded on the loaders by
@@ -2455,8 +2466,10 @@ function saveLoadersIntoCharacter(character, loaders) {
     // still resolves the pending rename.
     const tracksRename = rename && !(incoming.slot === rename.from && rename.savedToIn !== character.id);
     if (tracksRename) {
-      const savedToIndex = rename.savedToIn === character.id ? slotIndex(rename.savedTo) : -1;
-      const fromIndex = rename.fromIn === character.id ? slotIndex(rename.from) : -1;
+      const ownCandidate = (slot, inCharacter) =>
+        (inCharacter === character.id && !slotHeldByAnotherLoader(loader, slot) ? slotIndex(slot) : -1);
+      const savedToIndex = ownCandidate(rename.savedTo, rename.savedToIn);
+      const fromIndex = ownCandidate(rename.from, rename.fromIn);
       if (savedToIndex < 0 && rename.fromIn !== character.id) {
         if (rename.fromIn) {
           notes.push(`Not saved: the loader's State slot rename from "${rename.from}" belongs to another preset. Save it into that preset, apply this preset, or rename the loader back first.`);

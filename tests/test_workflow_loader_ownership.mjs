@@ -845,3 +845,46 @@ test("a confirmed save into another preset after renaming back binds that preset
     harness.leave(tab);
   }
 });
+
+for (const placement of ["the same graph", "a subgraph"]) test(`a copied loader in ${placement} renamed away from the original's slot never moves the original's stack`, async () => {
+  const extensions = await loadExtensions();
+  const { manager, LoaderNode } = extensions;
+  const harness = makeHarness(extensions);
+  const tab = await harness.open(WORKFLOW_A);
+  await saveConnectedLoaders(manager, tab);
+  const originalFace = JSON.stringify(savedStack(harness.library.characters, "face"));
+
+  // Paste a copy: it carries the original's properties, including its binding.
+  const copy = new LoaderNode();
+  copy.onNodeCreated?.();
+  copy.id = 3;
+  copy.configure({ properties: structuredClone(tab.loader.properties) });
+  if (placement === "a subgraph") {
+    const root = tab.loader.graph;
+    copy.graph = { _nodes: [copy], rootGraph: root };
+    root.subgraphs = new Map([["subgraph-1", copy.graph]]);
+  } else {
+    copy.graph = tab.loader.graph;
+    tab.loader.graph._nodes.push(copy);
+  }
+  copy.properties.dora_power_lora.rows[0].name = "copy.safetensors";
+  copy._doraRows = copy.properties.dora_power_lora.rows;
+  renameSlot(copy, "hair");
+  assert.equal(renameOf(copy)?.fromIn, "character-a");
+
+  const state = structuredClone(tab.managerNode.__dsm.state);
+  const character = state.characters.find((item) => item.id === "character-a");
+  const result = manager.saveLoadersIntoCharacter(character, [tab.loader, copy]);
+  manager.updateState(tab.managerNode, state, tab.managerNode.__dsm.uiState, {
+    characterId: "character-a",
+    promptId: "prompt-a",
+    loaderSaves: result.loaderSaves,
+    render: false,
+  });
+  await manager.flushPendingLibraryWrites();
+
+  assert.deepEqual(savedSlots(harness.library.characters), ["face", "hair"]);
+  assert.equal(JSON.stringify(savedStack(harness.library.characters, "face")), originalFace, "the original's stack stays put");
+  assert.equal(savedStack(harness.library.characters, "hair").loras[0].name, "copy.safetensors");
+  harness.leave(tab);
+});
