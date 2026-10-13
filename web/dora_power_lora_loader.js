@@ -560,13 +560,15 @@ function setStateSlot(node, value) {
 // A user State slot rename is tracked in the workflow until a State Manager
 // save of it is confirmed by the library, or a preset is applied:
 //   from      - the slot the library last confirmed for this loader's stack
+//   fromIn    - the character id that slot belongs to: the preset selected by
+//               the connected State Manager at rename time, then the preset
+//               of each committed save ("" when unknown)
 //   savedTo   - where the latest save put the stack (pending or committed)
 //   savedToIn - the persistent character id that latest save wrote into
 //   seq       - counter of saves made under this rename
-// A preset resolves the loader's own saved stack from savedTo only when it is
-// the character recorded in savedToIn, then from, so a save still pending,
-// rejected, or committed before a reload is found again without claiming a
-// same-named stack in another character.
+// A preset resolves the loader's own saved stack only from slots recorded for
+// that same character, so a save still pending, rejected, or committed before
+// a reload is found again without claiming a same-named stack elsewhere.
 const SLOT_RENAME_PROPERTY = "dora_state_slot_rename";
 
 function makeSlotRenameId() {
@@ -579,10 +581,11 @@ function getSlotRename(node) {
   const from = normalizeStateSlot(value.from, "");
   const id = typeof value.id === "string" ? value.id : "";
   if (!from || !id) return null;
+  const fromIn = typeof value.fromIn === "string" ? value.fromIn : "";
   const savedTo = value.savedTo == null ? "" : normalizeStateSlot(value.savedTo, "");
   const savedToIn = typeof value.savedToIn === "string" ? value.savedToIn : "";
   const seq = Number.isInteger(value.seq) && value.seq > 0 ? value.seq : 0;
-  return { from, id, savedTo: savedTo && savedToIn ? savedTo : "", savedToIn: savedTo && savedToIn ? savedToIn : "", seq };
+  return { from, fromIn, id, savedTo: savedTo && savedToIn ? savedTo : "", savedToIn: savedTo && savedToIn ? savedToIn : "", seq };
 }
 
 function setSlotRename(node, rename) {
@@ -605,7 +608,17 @@ function renameStateSlot(node, value) {
   const slot = setStateSlot(node, value);
   if (slot === current) return slot;
   const rename = getSlotRename(node);
-  if (!rename) setSlotRename(node, { from: current, id: makeSlotRenameId(), savedTo: "", savedToIn: "", seq: 0 });
+  if (!rename) {
+    const fromIn = globalThis.__doraStateManagerLoaderSelectionApi?.selectedCharacterIdForLoader?.(node);
+    setSlotRename(node, {
+      from: current,
+      fromIn: typeof fromIn === "string" ? fromIn : "",
+      id: makeSlotRenameId(),
+      savedTo: "",
+      savedToIn: "",
+      seq: 0,
+    });
+  }
   else if (rename.from === slot && !rename.savedTo) clearSlotRename(node);
   return slot;
 }
@@ -618,7 +631,7 @@ function recordSlotRenameSave(node, slot, characterId) {
   return { id: next.id, seq: next.seq };
 }
 
-function commitSlotRenameSave(node, id, seq, slot) {
+function commitSlotRenameSave(node, id, seq, slot, characterId) {
   const rename = getSlotRename(node);
   if (!rename || rename.id !== id) return;
   const committed = normalizeStateSlot(slot, "default");
@@ -626,7 +639,7 @@ function commitSlotRenameSave(node, id, seq, slot) {
     clearSlotRename(node);
     return;
   }
-  if (seq <= rename.seq) setSlotRename(node, { ...rename, from: committed });
+  if (seq <= rename.seq) setSlotRename(node, { ...rename, from: committed, fromIn: characterId });
 }
 
 function defaultState() {
@@ -787,8 +800,8 @@ function installGlobalStateApi() {
     recordSlotRenameSave(node, slot, characterId) {
       return recordSlotRenameSave(node, slot, characterId);
     },
-    commitSlotRenameSave(node, id, seq, slot) {
-      commitSlotRenameSave(node, id, seq, slot);
+    commitSlotRenameSave(node, id, seq, slot, characterId) {
+      commitSlotRenameSave(node, id, seq, slot, characterId);
     },
     // Moves the loader back onto the slot its saved stack occupies without
     // dropping rename tracking that a pending save still depends on.

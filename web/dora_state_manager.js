@@ -2407,8 +2407,8 @@ function restoreDoraLoaderSlot(loader, slot) {
 }
 
 function commitDoraLoaderSlotRenames(renameCommits) {
-  for (const { loader, id, seq, slot } of renameCommits || []) {
-    doraLoaderApiFor(loader)?.commitSlotRenameSave?.(loader, id, seq, slot);
+  for (const { loader, id, seq, slot, characterId } of renameCommits || []) {
+    doraLoaderApiFor(loader)?.commitSlotRenameSave?.(loader, id, seq, slot, characterId);
   }
 }
 
@@ -2424,12 +2424,15 @@ function sameLoaderStackContent(a, b) {
 //
 // A loader whose State slot was renamed carries rename tracking (see the
 // loader's SLOT_RENAME_PROPERTY). Its own saved stack is this character's
-// stack at the slot its latest save wrote (savedTo, only when that save wrote
-// into this same character) or, failing that, at the slot the library last
-// confirmed (from). Saving moves that stack to the loader's current slot. A
-// renamed loader never overwrites a different stack saved under its new slot:
-// it returns to its own stack's slot when the preset holds one, and is
-// otherwise not saved. The returned renameSaves are recorded on the loaders by
+// stack at the slot its latest save wrote (savedTo, when savedToIn is this
+// character) or, failing that, at the slot the library last confirmed (from,
+// when fromIn is this character). A slot name recorded for another character,
+// or of unknown origin while this character holds that slot, never identifies
+// the loader's stack here: such a save is refused rather than consuming
+// another preset's stack. Saving moves the loader's own stack to its current
+// slot. A renamed loader never overwrites a different stack saved under its
+// new slot: it returns to its own stack's slot when the preset holds one, and
+// is otherwise not saved. The returned renameSaves are recorded on the loaders by
 // updateState and acknowledged only after the library write that holds them
 // commits, so pending, rejected, and reloaded saves resolve the same way from
 // the preset contents.
@@ -2448,7 +2451,18 @@ function saveLoadersIntoCharacter(character, loaders) {
 
     if (rename) {
       const savedToIndex = rename.savedToIn === character.id ? slotIndex(rename.savedTo) : -1;
-      const ownIndex = savedToIndex >= 0 ? savedToIndex : slotIndex(rename.from);
+      const fromIndex = rename.fromIn === character.id ? slotIndex(rename.from) : -1;
+      if (savedToIndex < 0 && rename.fromIn !== character.id) {
+        if (rename.fromIn) {
+          notes.push(`Not saved: the loader's State slot rename from "${rename.from}" belongs to another preset. Save it into that preset, apply this preset, or rename the loader back first.`);
+          return;
+        }
+        if (slotIndex(rename.from) >= 0) {
+          notes.push(`Not saved: cannot tell whether this preset's "${rename.from}" stack belongs to the renamed loader. Apply this preset or rename the loader back to "${rename.from}" first.`);
+          return;
+        }
+      }
+      const ownIndex = savedToIndex >= 0 ? savedToIndex : fromIndex;
       const ownSlot = ownIndex >= 0 ? normalizeLoaderSlot(stacks[ownIndex].slot, "default") : "";
       const targetIndex = slotIndex(incoming.slot);
 
@@ -2487,7 +2501,7 @@ function recordDoraLoaderRenameSaves(renameSaves, materializedCharacterIds) {
   for (const { loader, slot, characterId } of renameSaves || []) {
     const finalCharacterId = materializedCharacterIds.get(characterId) || characterId;
     const record = doraLoaderApiFor(loader)?.recordSlotRenameSave?.(loader, slot, finalCharacterId);
-    if (record) commits.push({ loader, ...record, slot });
+    if (record) commits.push({ loader, ...record, slot, characterId: finalCharacterId });
   }
   return commits;
 }
@@ -5819,6 +5833,16 @@ function maybeInjectWidgetInput(nodeData) {
   if (!required || required[CUSTOM_WIDGET_INPUT]) return;
   nodeData.input.required = { ...required, [CUSTOM_WIDGET_INPUT]: [CUSTOM_WIDGET_TYPE, {}] };
 }
+
+// Lets a loader record which preset its State slot belonged to when renamed:
+// the selected character of the single State Manager that manages it.
+globalThis.__doraStateManagerLoaderSelectionApi = {
+  selectedCharacterIdForLoader(loader) {
+    const owners = [...stateLibraryClient.nodes].filter((managerNode) => getManagedLoaderNodes(managerNode).includes(loader));
+    if (owners.length !== 1) return "";
+    return String(widgetValue(getWidgets(owners[0]).characterWidget, "") || "");
+  },
+};
 
 installStateManagerPromptIntegrationApi();
 void loadPromptTransportProvider();

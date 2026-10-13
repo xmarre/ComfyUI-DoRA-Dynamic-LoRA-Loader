@@ -11,6 +11,7 @@ This release makes each DoRA Power LoRA Loader's rows and settings belong to its
 - Clicking a character tile, **Load connected**, **Apply selected**, **Apply connected loaders**, and State Manager LoRA tab edits still copy the preset's stacks into connected loaders.
 - A loader's State slot rename is remembered until a library write that saved it commits, or a preset is applied to the loader. **Save connected**, **Save selected**, and **Save connected loaders** move the renamed loader's saved stack to its new slot. The workflow records where each save put the stack and into which preset, so a save into a different preset never claims that preset's same-named stack, and a rejected or blocked write, a second save while the first is still in flight, and a workflow reopened after its save committed (in the same session or after a browser restart) all resolve to exactly one saved stack.
 - A renamed loader never overwrites a different stack saved under its new slot: it stays on its previous slot when the preset holds that slot, and is otherwise not saved, with the reason in the status.
+- A rename belongs to the preset selected by the connected State Manager when the slot was renamed. While it is unconfirmed, saving that loader into another preset is refused instead of moving or replacing that preset's same-named stacks.
 
 ## Legacy widget-only workflows
 
