@@ -572,7 +572,7 @@ The manager separates **saved state** from **runtime execution**:
 
 - execution outputs are source-only and acyclic
 - save/load/apply actions are explicit frontend graph edits
-- `state_control` links are editor/control-only and do not replace prompt text, seed values, or LoRA rows during execution
+- `state_control` links are editor/control-only and do not replace prompt text, seed values, or LoRA rows during execution; the one exception is a character-wildcard queue, which runs each queued character's saved loader stacks
 - no prompt, LoRA stack, settings, or seed value is captured through runtime feedback inputs or wildcard feedback loops
 
 Use it to save:
@@ -686,7 +686,14 @@ The UI has four graph-editing actions:
 - **Save selected** — captures state from selected graph nodes.
 - **Apply selected** — pushes the selected character/preset into selected graph nodes.
 
-Selecting a character tile or prompt preset only changes the manager selection. It does not mutate other nodes until **Load connected** or **Apply selected** is clicked.
+Each DoRA loader's LoRA rows and settings belong to its workflow:
+
+- Opening a workflow, switching workflow tabs, and library refreshes never change a connected loader, and never create or modify presets.
+- Editing a loader never writes into the selected preset. Use **Save connected**, **Save selected**, or **Save connected loaders** to store the loader state in the preset.
+- Clicking a character tile, **Load connected**, **Apply selected**, **Apply connected loaders**, and edits in the State Manager LoRA tab copy the preset's saved stacks into the connected loaders once.
+- An ordinary queue runs the loader's own rows. A character-wildcard queue runs each queued character's saved loader stacks.
+
+Selecting a prompt preset only changes the manager selection.
 
 For older workflows that do not have `state_control` links, the frontend keeps a compatibility fallback that can inspect legacy runtime output links. Treat that as migration support, not the canonical wiring for new graphs.
 

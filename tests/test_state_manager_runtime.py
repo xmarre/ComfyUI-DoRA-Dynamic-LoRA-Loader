@@ -288,3 +288,25 @@ def test_v2_import_requires_prompt_document_capability_before_mutation(dora_modu
             "kind": "dora_state_manager_library_export",
             "characters": [persistent_character()],
         })
+
+
+def test_loader_rows_stay_authoritative_unless_queued_override(configured_nodes):
+    nodes = configured_nodes
+    character = persistent_character()
+    store = nodes._get_state_manager_store()
+    store.replace([character], 0)
+    payload = nodes._resolve_dora_state_payload(
+        json.dumps(nodes._state_manager_default_binding()),
+        character["id"],
+        character["prompts"][0]["id"],
+    )
+    graph_edge = nodes._build_state_control_payload(payload)
+    own_rows = {"LORA_1": {"on": True, "lora": "workflow.safetensors", "strength": 1.0, "strengthTwo": 1.0}}
+
+    def queued_lora_names(**inputs):
+        key = json.loads(nodes._dora_loader_cache_key_from_inputs(None, None, {**own_rows, **inputs}))
+        return [entry["lora"] for entry in key["loras"]]
+
+    assert queued_lora_names(state_control=graph_edge) == ["workflow.safetensors"]
+    assert queued_lora_names(state_control={**graph_edge, "loader_override": True}) == ["runtime.safetensors"]
+    assert queued_lora_names(dora_state=payload) == ["runtime.safetensors"]

@@ -1,3 +1,26 @@
+# DoRA Dynamic LoRA Loader v1.0.48
+
+This release makes each DoRA Power LoRA Loader's rows and settings belong to its own workflow when a State Manager is connected. Loader stacks no longer leak between workflows that select the same preset, and opening an older workflow no longer replaces its saved LoRA rows or creates presets.
+
+## Loader state ownership
+
+- Opening a workflow, switching workflow tabs, reloading the library, and successful or rejected library writes no longer push the selected preset's saved stack into connected loaders.
+- Loader edits, including State slot changes, no longer write into the selected preset. **Save connected**, **Save selected**, and **Save connected loaders** remain the way to store loader state in a preset.
+- Opening a workflow no longer captures loader state into a newly materialized preset when the State Manager is on the built-in default selection.
+- Legacy embedded State Manager libraries are still imported automatically on load; the import no longer rewrites connected loaders.
+- Clicking a character tile, **Load connected**, **Apply selected**, **Apply connected loaders**, and State Manager LoRA tab edits still copy the preset's stacks into connected loaders.
+
+## Execution
+
+- An ordinary queue, a prompt-wildcard queue, and a saved-seed randomization queue run each loader's own rows and globals.
+- A character-wildcard queue sends each loader an explicit `loader_override` payload with the queued character's saved stack; only that payload replaces the loader's rows on the `state_control` edge.
+- A wired `dora_state` input still drives the loader from the selected preset, unchanged.
+
+## Compatibility
+
+- Workflow JSON, library format, and node inputs/outputs are unchanged.
+- Workflows that relied on the State Manager silently re-syncing loaders from the library on load must click **Load connected** to pull a preset's stack into the loaders.
+
 # DoRA Dynamic LoRA Loader v1.0.47
 
 This release fixes State Manager character/preset selection persistence across a real ComfyUI restart. A saved non-default selection now restores as the same persistent character/preset before any State Manager interaction, so its reference set and managed prompt routing remain attached to the intended preset after startup.
