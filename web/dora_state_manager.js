@@ -73,6 +73,7 @@ const STATE_SEED_DECREMENT = -3;
 const STATE_SEED_SPECIALS = [STATE_SEED_RANDOM, STATE_SEED_INCREMENT, STATE_SEED_DECREMENT];
 const LAST_SEED_BUTTON_LABEL = "♻️ (Use Last Queued Seed)";
 const LIBRARY_API = "/dora_dynamic_lora/state-library";
+const LOADER_OVERRIDE_KEY = "loader_override";
 const BINDING_KIND = "dora_state_manager_binding";
 const BINDING_VERSION = 1;
 const SELECTION_MIRROR_PROPERTY = "dora_state_manager_selection_v1";
@@ -1244,26 +1245,10 @@ function refreshNodeFromLibrary(node, { status = "" } = {}) {
   scheduleRender(node);
 }
 
-function refreshAllNodesFromLibrary({ syncLoaders = false, skipLoaderSyncNode = null } = {}) {
-  for (const node of stateLibraryClient.nodes) {
-    refreshNodeFromLibrary(node);
-    if (!syncLoaders || node === skipLoaderSyncNode || !node?.__dsm) continue;
-    const current = getRenderableState(node);
-    const selection = ensureSelection(node, current.state);
-    const character = selection.character;
-    if (!character || character.__dsm_ephemeral) continue;
-    syncCharacterLoaderStacksToConnectedNodes(node, character);
-  }
-}
-
-function restoreNodeAndConnectedLoadersFromLibrary(node, { status = "" } = {}) {
-  refreshNodeFromLibrary(node, { status });
-  if (!node?.__dsm) return 0;
-  const current = getRenderableState(node);
-  const selection = ensureSelection(node, current.state);
-  const character = selection.character;
-  if (!character || character.__dsm_ephemeral) return 0;
-  return syncCharacterLoaderStacksToConnectedNodes(node, character);
+// Library refreshes only update State Manager views. Connected DoRA loaders
+// belong to their workflow and change only through an explicit preset action.
+function refreshAllNodesFromLibrary() {
+  for (const node of stateLibraryClient.nodes) refreshNodeFromLibrary(node);
 }
 
 function mergeScheduledLibraryUpdate(baseCharacters, desiredCharacters, currentCharacters, { allowOverwrite = false } = {}) {
@@ -1302,7 +1287,7 @@ function blockLibraryWrites(status) {
   stateLibraryClient.blocked = true;
   stateLibraryClient.pending = [];
   for (const node of stateLibraryClient.nodes) {
-    restoreNodeAndConnectedLoadersFromLibrary(node, { status });
+    refreshNodeFromLibrary(node, { status });
   }
 }
 
@@ -1342,7 +1327,7 @@ async function writePendingLibrary() {
           });
           installLibrarySnapshot(snapshot);
           stateLibraryClient.lastAppliedNode = pending.node;
-          refreshAllNodesFromLibrary({ syncLoaders: true, skipLoaderSyncNode: pending.node });
+          refreshAllNodesFromLibrary();
         } catch (error) {
           if (error.status === 409) {
             blockLibraryWrites("Library changed in another tab or State Manager. Reload the library before editing again; the stale write was rejected.");
@@ -1441,7 +1426,7 @@ function scheduleLibraryPersist(node, state) {
   const desiredCharacters = persistentCharacters(state);
   const canonical = canonicalJson(desiredCharacters);
   if (stateLibraryClient.blocked) {
-    restoreNodeAndConnectedLoadersFromLibrary(node, {
+    refreshNodeFromLibrary(node, {
       status: "This edit was not applied. Reload the State Manager library before editing again.",
     });
     return;
@@ -1464,7 +1449,7 @@ async function reloadStateLibrary(node, { status = "Reloaded State Manager libra
   stateLibraryClient.lastAppliedNode = null;
   const snapshot = await stateLibraryRequest();
   installLibrarySnapshot(snapshot, { force: true });
-  refreshAllNodesFromLibrary({ syncLoaders: true });
+  refreshAllNodesFromLibrary();
   refreshNodeFromLibrary(node, { status });
 }
 
@@ -1577,7 +1562,7 @@ async function importStateJsonFile(node, file) {
     body: JSON.stringify(parsed),
   });
   installLibrarySnapshot(result.snapshot);
-  refreshAllNodesFromLibrary({ syncLoaders: true });
+  refreshAllNodesFromLibrary();
   const characterId = result.character?.id || result.character_ids?.[0] || "";
   if (characterId) {
     const character = stateLibraryClient.state.characters.find((item) => item.id === characterId);
@@ -1585,7 +1570,12 @@ async function importStateJsonFile(node, file) {
     setWidgetValue(widgets.characterWidget, characterId);
     setWidgetValue(widgets.promptWidget, character?.prompts?.[0]?.id || "");
   }
-  restoreNodeAndConnectedLoadersFromLibrary(node, { status: `Imported ${file.name || "State Manager JSON"}.` });
+  refreshNodeFromLibrary(node, { status: `Imported ${file.name || "State Manager JSON"}.` });
+  if (characterId) {
+    // Importing selects the imported preset, which is an explicit selection.
+    const selection = ensureSelection(node, getRenderableState(node).state);
+    if (!selection.character.__dsm_ephemeral) syncCharacterLoaderStacksToConnectedNodes(node, selection.character);
+  }
 }
 
 function getWidgets(node) {
@@ -2072,18 +2062,6 @@ function scheduleRender(node) {
   });
 }
 
-function schedulePostLoadLoaderSync(node) {
-  const ctx = node?.__dsm;
-  if (!ctx) return false;
-  if (ctx.postLoadSyncFrame) cancelAnimationFrame(ctx.postLoadSyncFrame);
-  ctx.postLoadSyncFrame = requestAnimationFrame(() => {
-    ctx.postLoadSyncFrame = 0;
-    if (!stateLibraryClient.nodes.has(node)) return;
-    synchronizeConnectedLoadersAfterLibraryLoad(node);
-  });
-  return true;
-}
-
 function chainNodeCallback(node, name, fn) {
   const original = node[name];
   node[name] = function (...args) {
@@ -2266,7 +2244,7 @@ function applyLoraStackToNode(targetNode, character) {
   };
   const loaderApi = globalThis.__doraPowerLoraLoaderApi;
   if (loaderApi?.setState) {
-    return !!loaderApi.setState(targetNode, payload, { notifyStateManager: false });
+    return !!loaderApi.setState(targetNode, payload);
   }
 
   const rows = (payload.loras || []).map((row) => ({
@@ -2364,7 +2342,7 @@ function renameConnectedLoaderSlot(managerNode, character, fromSlot, toSlot) {
   for (const loader of getManagedLoaderNodes(managerNode)) {
     if (normalizeLoaderSlot(getDoraLoaderSlot(loader), "default") !== from) continue;
     if (loaderApi?.setSlot) {
-      loaderApi.setSlot(loader, to, { notifyStateManager: false });
+      loaderApi.setSlot(loader, to);
     } else {
       loader.properties = loader.properties || {};
       loader.properties.dora_state_slot = to;
@@ -2374,90 +2352,21 @@ function renameConnectedLoaderSlot(managerNode, character, fromSlot, toSlot) {
   return changed;
 }
 
-function syncConnectedLoaderStateIntoManager(
-  managerNode,
-  onlyLoader = null,
-  { persist = true, status = "", render = true, dirty = true, previousSlot = null } = {}
-) {
-  if (!managerNode) return 0;
-  const loaders = getManagedLoaderNodes(managerNode);
-  const current = getRenderableState(managerNode);
-  const selection = ensureSelection(managerNode, current.state);
-  let changed = 0;
-
-  let syncStatus = status;
-  for (const [index, loader] of loaders.entries()) {
-    if (onlyLoader && loader !== onlyLoader) continue;
-    const stack = extractLoraStackFromNode(loader, index);
-    if (!stack) continue;
-    let incomingNormalized = normalizeLoaderStack(stack, index);
-
-    const oldSlot = onlyLoader && previousSlot != null
-      ? normalizeLoaderSlot(previousSlot, "")
-      : "";
-    const newSlot = normalizeLoaderSlot(incomingNormalized.slot, "default");
-    if (oldSlot && oldSlot !== newSlot) {
-      const stacks = getCharacterLoaderStacks(selection.character);
-      const oldIndex = stacks.findIndex(
-        (item) => normalizeLoaderSlot(item?.slot, "default") === oldSlot
-      );
-      const targetIndex = stacks.findIndex(
-        (item) => normalizeLoaderSlot(item?.slot, "default") === newSlot
-      );
-
-      if (oldIndex >= 0 && targetIndex >= 0 && targetIndex !== oldIndex) {
-        // A loader slot is an identity key. Never silently overwrite a different
-        // saved stack when the user renames a connected loader onto an occupied slot.
-        const loaderApi = globalThis.__doraPowerLoraLoaderApi;
-        loaderApi?.setSlot?.(loader, oldSlot, { notifyStateManager: false });
-        incomingNormalized = {
-          ...incomingNormalized,
-          slot: oldSlot,
-          label: stacks[oldIndex]?.label || incomingNormalized.label || oldSlot,
-        };
-        syncStatus = `State slot "${newSlot}" already exists in this preset; kept connected loader on "${oldSlot}".`;
-      } else if (oldIndex >= 0) {
-        // Preserve stack identity across a loader-side slot rename instead of
-        // appending a second stack and leaving the old slot stale.
-        stacks[oldIndex] = incomingNormalized;
-        syncLegacyLoaderMirror(selection.character);
-        changed += 1;
-        continue;
-      }
+function saveLoaderStackIntoCharacter(character, stack, index = 0) {
+  const incoming = normalizeLoaderStack(stack, index);
+  const existing = findCharacterLoaderStack(character, incoming.slot, { allowFallback: false });
+  if (!existing && normalizeLoaderSlot(incoming.slot, "default") !== "default") {
+    const stacks = getCharacterLoaderStacks(character);
+    const soleUnusedDefault = stacks.length === 1
+      && normalizeLoaderSlot(stacks[0]?.slot, "default") === "default"
+      && !loaderStackHasMeaningfulState(stacks[0]);
+    if (soleUnusedDefault) {
+      stacks[0] = incoming;
+      syncLegacyLoaderMirror(character);
+      return incoming;
     }
-
-    const existing = findCharacterLoaderStack(selection.character, incomingNormalized.slot, { allowFallback: false });
-    const existingNormalized = existing ? normalizeLoaderStack(existing, index) : null;
-    if (existingNormalized && canonicalJson(existingNormalized) === canonicalJson(incomingNormalized)) continue;
-
-    if (!existing && normalizeLoaderSlot(incomingNormalized.slot, "default") !== "default") {
-      const stacks = getCharacterLoaderStacks(selection.character);
-      const soleDefault = stacks.length === 1
-        && normalizeLoaderSlot(stacks[0]?.slot, "default") === "default"
-        && !loaderStackHasMeaningfulState(stacks[0]);
-      if (soleDefault) {
-        stacks[0] = incomingNormalized;
-        syncLegacyLoaderMirror(selection.character);
-        changed += 1;
-        continue;
-      }
-    }
-
-    setCharacterLoaderStack(selection.character, incomingNormalized);
-    changed += 1;
   }
-
-  if (changed) {
-    updateState(managerNode, current.state, current.uiState, {
-      characterId: selection.character.id,
-      promptId: selection.prompt.id,
-      persist,
-      render,
-      dirty,
-      status: syncStatus || `Synced ${changed} connected DoRA loader${changed === 1 ? "" : "s"} into this preset.`,
-    });
-  }
-  return changed;
+  return setCharacterLoaderStack(character, incoming);
 }
 
 function loaderStackHasMeaningfulState(stack) {
@@ -2473,63 +2382,6 @@ function loaderStackHasMeaningfulState(stack) {
     if (value !== defaultValue) return true;
   }
   return false;
-}
-
-function synchronizeConnectedLoadersAfterLibraryLoad(managerNode) {
-  if (!managerNode) return 0;
-  const current = getRenderableState(managerNode);
-  const selection = ensureSelection(managerNode, current.state);
-  const character = selection.character;
-  const prompt = selection.prompt;
-
-  // A durable saved preset is authoritative when its workflow binding is restored:
-  // reflect the state that will execute into the visible loader immediately.
-  if (
-    character
-    && character.id !== "default_character"
-    && !character.__dsm_ephemeral
-    && prompt
-    && !prompt.__dsm_ephemeral
-  ) {
-    return syncCharacterLoaderStacksToConnectedNodes(managerNode, character);
-  }
-
-  // The built-in default is only a placeholder and is not stored in the library.
-  // If it controls a configured loader, capture that visible state and let the normal
-  // edited-default materialization path create a durable preset. This prevents the
-  // backend's empty default stack from silently replacing the visible loader at run time.
-  if (character?.id === "default_character" && !character.__dsm_ephemeral) {
-    const hasMeaningfulLoaderState = getManagedLoaderNodes(managerNode).some((loader, index) => {
-      const stack = extractLoraStackFromNode(loader, index);
-      return stack ? loaderStackHasMeaningfulState(stack) : false;
-    });
-    return hasMeaningfulLoaderState
-      ? syncConnectedLoaderStateIntoManager(managerNode)
-      : 0;
-  }
-
-  // Missing/ephemeral selections are intentionally not allowed to rewrite either side.
-  return 0;
-}
-
-function syncLoaderStateIntoConnectedManagers(loaderNode, details = {}) {
-  if (!loaderNode) return 0;
-  let changed = 0;
-  for (const managerNode of stateLibraryClient.nodes) {
-    if (!getManagedLoaderNodes(managerNode).includes(loaderNode)) continue;
-    changed += syncConnectedLoaderStateIntoManager(managerNode, loaderNode, {
-      previousSlot: details?.previousSlot ?? null,
-    });
-  }
-  return changed;
-}
-
-function installLoaderStateSyncApi() {
-  globalThis.__doraStateManagerSyncApi = {
-    loaderStateChanged(loaderNode, details = {}) {
-      return syncLoaderStateIntoConnectedManagers(loaderNode, details);
-    },
-  };
 }
 
 async function waitForStateManagerLibraryIdle(timeoutMs = 10000) {
@@ -3142,7 +2994,7 @@ function saveConnectedState(targetNode, character, prompt) {
   loaderTargets.forEach((loader, index) => {
     const stack = extractLoraStackFromNode(loader, index);
     if (!stack) return;
-    setCharacterLoaderStack(character, stack);
+    saveLoaderStackIntoCharacter(character, stack, index);
     savedLoaders += 1;
   });
   if (savedLoaders) changes.push(`${savedLoaders} LoRA loader${savedLoaders === 1 ? "" : "s"}`);
@@ -3285,7 +3137,7 @@ function saveSelectedState(targetNode, character, prompt) {
   loaders.forEach((loader, index) => {
     const stack = extractLoraStackFromNode(loader, index);
     if (!stack) return;
-    setCharacterLoaderStack(character, stack);
+    saveLoaderStackIntoCharacter(character, stack, index);
     savedLoaders += 1;
   });
   if (savedLoaders) changes.push(`${savedLoaders} LoRA loader${savedLoaders === 1 ? "" : "s"}`);
@@ -4569,7 +4421,7 @@ function renderLoraPanelContent(section, node, state, uiState, character, prompt
       loaders.forEach((loader, index) => {
         const stack = extractLoraStackFromNode(loader, index);
         if (!stack) return;
-        setCharacterLoaderStack(character, stack);
+        saveLoaderStackIntoCharacter(character, stack, index);
         count += 1;
       });
       updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: count ? `Saved ${count} connected DoRA loader${count === 1 ? "" : "s"}.` : "No connected DoRA loader found." });
@@ -5018,7 +4870,6 @@ function initializeNode(node, widget) {
       if (loaded) {
         delete node.__dsmPendingLegacyState;
         node.__dsmLibraryHydrated = true;
-        schedulePostLoadLoaderSync(node);
       }
     } catch (err) {
       if (node.__dsmLibraryLoadToken !== token) return;
@@ -5086,10 +4937,6 @@ function initializeNode(node, widget) {
     if (ctx.renderFrame) {
       cancelAnimationFrame(ctx.renderFrame);
       ctx.renderFrame = 0;
-    }
-    if (ctx.postLoadSyncFrame) {
-      cancelAnimationFrame(ctx.postLoadSyncFrame);
-      ctx.postLoadSyncFrame = 0;
     }
     if (newNodeLoadFrame) {
       cancelAnimationFrame(newNodeLoadFrame);
@@ -5378,6 +5225,9 @@ function buildQueuedDoraLoaderControlPayload(character, loader = null, fallbackI
   return {
     version: 2,
     kind: STATE_MANAGER_CONTROL_KIND,
+    // Only this queued character-wildcard payload may replace the loader's own
+    // workflow rows. The plain State Manager graph edge never does.
+    [LOADER_OVERRIDE_KEY]: true,
     state,
     loader_stacks: structuredCloneCompat(state.loader_stacks || []),
     loras: structuredCloneCompat(state.loras || []),
@@ -5572,7 +5422,7 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
       queueIndex,
       total,
     );
-    changed += mutateQueuedDoraLoaders(promptPayload, node, character);
+    if (uiState.queue_character_wildcard) changed += mutateQueuedDoraLoaders(promptPayload, node, character);
     changed += mutateQueuedLegacyTextTargets(promptPayload, node, prompt);
     changed += mutateQueuedSettingsNodes(promptPayload, node, payload.settings);
   }
@@ -5852,7 +5702,6 @@ function maybeInjectWidgetInput(nodeData) {
   nodeData.input.required = { ...required, [CUSTOM_WIDGET_INPUT]: [CUSTOM_WIDGET_TYPE, {}] };
 }
 
-installLoaderStateSyncApi();
 installStateManagerPromptIntegrationApi();
 void loadPromptTransportProvider();
 
@@ -5868,7 +5717,6 @@ app.registerExtension({
         node.__dsm = {
           root,
           renderFrame: 0,
-          postLoadSyncFrame: 0,
           state: null,
           uiState: null,
           libraryMode: "presets",
