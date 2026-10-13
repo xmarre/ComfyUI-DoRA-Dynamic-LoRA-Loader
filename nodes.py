@@ -3373,18 +3373,52 @@ def _auto_strength_destination_shape(weight: Optional[torch.Tensor]) -> str:
         return "unknown"
 
 
+def _auto_strength_weight_update_representation(
+    lora_sd: Dict[str, Any],
+    base: str,
+) -> Optional[Tuple[str, Tuple[int, ...]]]:
+    """Return ``(kind, shape)`` of the weight patch ComfyUI loads for ``base``.
+
+    ``comfy.lora.load_lora`` writes the weight patch in this order, later entries
+    replacing earlier ones: factorized adapters, then ``.diff``, then
+    ``.set_weight``. ``.diff_b`` is a separate patch on the bias tensor and never
+    describes the weight update. ``kind`` is ``"set"``, ``"diff"`` or
+    ``"factorized"``.
+    """
+    for suffix, kind in ((".set_weight", "set"), (".diff", "diff")):
+        tensor = lora_sd.get(base + suffix)
+        if isinstance(tensor, torch.Tensor):
+            try:
+                return kind, tuple(int(dim) for dim in tensor.shape)
+            except Exception:
+                return None
+
+    for up_suffix, down_suffix in _LORA_DIRECTION_SUFFIX_PAIRS:
+        up = lora_sd.get(base + up_suffix)
+        down = lora_sd.get(base + down_suffix)
+        if not isinstance(up, torch.Tensor) or not isinstance(down, torch.Tensor):
+            continue
+        try:
+            up_rows = int(up.shape[0])
+            down_rows = int(down.shape[0])
+            up_cols = int(up.numel()) // max(1, up_rows)
+            down_cols = int(down.numel()) // max(1, down_rows)
+        except Exception:
+            continue
+        if up_rows > 0 and down_cols > 0 and up_cols == down_rows:
+            return "factorized", (up_rows, down_cols)
+    return None
+
+
 def _auto_strength_logical_destination_shape(
     lora_sd: Dict[str, Any],
     base: str,
     weight: Optional[torch.Tensor],
 ) -> Tuple[str, str]:
     """Return the logical update shape without depending on packed weight storage."""
-    for suffix in (".diff", ".diff_b", ".set_weight"):
-        tensor = lora_sd.get(base + suffix)
-        if isinstance(tensor, torch.Tensor):
-            shape = _auto_strength_destination_shape(tensor)
-            if shape != "unknown":
-                return shape, "adapter_update"
+    representation = _auto_strength_weight_update_representation(lora_sd, base)
+    if representation is not None and representation[1]:
+        return "x".join(str(dim) for dim in representation[1]), "adapter_update"
 
     for up_suffix, down_suffix in _LORA_DIRECTION_SUFFIX_PAIRS:
         up = lora_sd.get(base + up_suffix)
@@ -3508,49 +3542,48 @@ def _auto_strength_fan_in(shape: Any) -> Optional[int]:
     return fan_in if fan_in > 0 else None
 
 
-def _auto_strength_shape_text_numel(shape_text: Optional[str]) -> Optional[int]:
-    try:
-        dims = [int(dim) for dim in str(shape_text).split("x")]
-    except Exception:
-        return None
-    if not dims or any(dim <= 0 for dim in dims):
-        return None
-    numel = 1
-    for dim in dims:
-        numel *= dim
-    return numel
-
-
 def _auto_strength_update_cannot_apply(
     weight: Optional[torch.Tensor],
-    logical_shape: Optional[str],
-    shape_source: Optional[str],
+    lora_sd: Dict[str, Any],
+    base: str,
 ) -> bool:
-    """Return True when an adapter update provably cannot be patched onto its destination.
+    """Return True when the base's weight patch provably cannot apply to its destination.
 
-    ComfyUI reshapes a LoRA/diff update to the destination shape and skips the patch
-    when the element counts differ (for example full-width AdaLN LoRAs on checkpoints
-    whose AdaLN projection was reduced to a small basis). Such updates have no effect
-    on the model and must not shift the references used for other layers.
+    Mirrors ComfyUI's acceptance rules for the weight patch ``comfy.lora.load_lora``
+    keeps for this base: ``.set_weight`` and ``.diff`` patches require the exact
+    destination shape; factorized LoRA updates are reshaped to the destination and
+    therefore require an equal element count. A rejected patch (for example a
+    full-width AdaLN LoRA on a checkpoint whose AdaLN input was reduced to a small
+    basis) has no effect on the model and must not shift references used for other
+    layers. ``.diff_b`` patches the bias separately and is not considered here.
 
-    Only plain dense floating-point destinations are checked. Quantized or packed
-    storage may report a physical shape that differs from the logical one. Callers
-    must not use this for adapters carrying ``.reshape_weight`` metadata, which makes
-    ComfyUI pad the destination to the update shape instead of skipping it.
+    Only plain dense floating-point destinations are checked, because quantized or
+    packed storage may report a physical shape that differs from the logical one.
+    Adapters with ``.reshape_weight`` metadata are not checked, because ComfyUI pads
+    the destination to the update shape for them.
     """
-    if shape_source != "adapter_update":
+    if (base + ".reshape_weight") in lora_sd:
         return False
     if type(weight) not in (torch.Tensor, torch.nn.Parameter):
         return False
     try:
         if not weight.dtype.is_floating_point:
             return False
-        destination_numel = int(weight.numel())
+        destination_shape = tuple(int(dim) for dim in weight.shape)
     except Exception:
         return False
-    update_numel = _auto_strength_shape_text_numel(logical_shape)
-    if update_numel is None or destination_numel <= 0:
+    representation = _auto_strength_weight_update_representation(lora_sd, base)
+    if representation is None or not destination_shape:
         return False
+    kind, update_shape = representation
+    if kind in ("set", "diff"):
+        return update_shape != destination_shape
+    update_numel = 1
+    for dim in update_shape:
+        update_numel *= dim
+    destination_numel = 1
+    for dim in destination_shape:
+        destination_numel *= dim
     return update_numel != destination_numel
 
 
@@ -3827,6 +3860,7 @@ def _auto_strength_measure_base_delta_on_device(
     current_model: Any = None,
     current_clip: Any = None,
     fan_in_normalize: bool = False,
+    details: Optional[Dict[str, Any]] = None,
 ) -> Optional[float]:
     """
     Return a comparable magnitude score for a single base's update.
@@ -3847,12 +3881,15 @@ def _auto_strength_measure_base_delta_on_device(
     same per-output effect has an element RMS proportional to ``1/sqrt(fan_in)``,
     so wide-input projections (for example MLP down-projections) would otherwise
     always look weak and narrow-input ones (for example AdaLN projections) strong.
-    Vector terms (``.diff_b``) are already output-space quantities and stay as-is.
+    In that mode the score also describes the weight update only: ``.diff_b`` is a
+    separate bias patch, so its RMS is recorded in ``details["bias_update_rms"]``
+    and used as the score only for bias-only bases.
 
     Returns None when the base has no measurable linear delta representation.
     """
     prefix = base + "."
     direct_norms: List[float] = []
+    bias_norms: List[float] = []
 
     def _output_gain(value: Optional[float], shape: Any) -> Optional[float]:
         if value is None or not fan_in_normalize:
@@ -3879,6 +3916,11 @@ def _auto_strength_measure_base_delta_on_device(
         key = base + suffix
         tensor = lora_sd.get(key)
         if not isinstance(tensor, torch.Tensor):
+            continue
+        if fan_in_normalize and suffix == ".diff_b":
+            bias_rms = _auto_strength_tensor_rms(tensor, analysis_device=analysis_device)
+            if bias_rms is not None:
+                bias_norms.append(bias_rms)
             continue
         if has_dora and isinstance(dest_weight, torch.Tensor):
             dora_rms = _auto_strength_measure_dora_effect(dest_weight, tensor, dora_scale, analysis_device=analysis_device)
@@ -3943,6 +3985,13 @@ def _auto_strength_measure_base_delta_on_device(
         if delta_rms is not None:
             direct_norms.append(_output_gain(delta_rms, delta.shape))
 
+    if bias_norms:
+        bias_value = float(sum(bias_norms) / len(bias_norms))
+        if details is not None:
+            details["bias_update_rms"] = bias_value
+        if not direct_norms:
+            return bias_value
+
     if not direct_norms:
         # Best-effort fallback for exotic exports that still expose one-side linear tensors.
         vals: List[float] = []
@@ -3972,6 +4021,7 @@ def _auto_strength_measure_base_delta(
     current_model: Any = None,
     current_clip: Any = None,
     fan_in_normalize: bool = False,
+    details: Optional[Dict[str, Any]] = None,
 ) -> Optional[float]:
     dest_weight = _auto_strength_get_destination_weight(base, key_map, model_state_dict, clip_state_dict)
     analysis_device = _auto_strength_resolve_analysis_device(analysis_device_mode, analysis_load_device, dest_weight)
@@ -3986,6 +4036,7 @@ def _auto_strength_measure_base_delta(
             current_model=current_model,
             current_clip=current_clip,
             fan_in_normalize=fan_in_normalize,
+            details=details,
         )
     except _AutoStrengthAnalysisDeviceError:
         if analysis_device is None or analysis_device.type == "cpu":
@@ -4006,6 +4057,7 @@ def _auto_strength_measure_base_delta(
             current_model=current_model,
             current_clip=current_clip,
             fan_in_normalize=fan_in_normalize,
+            details=details,
         )
 
 
@@ -4032,11 +4084,12 @@ def _auto_strength_analyze_base_targets(
     Linear adapters use two independent layers of inference:
 
     1. Depth redistribution moves each role's local depth trend (centered moving
-       log-median) toward the family reference, the geometric mean of fan-in
-       normalized output-gain scores across eligible linear logical sources, and
-       restores ``residual_beta`` of each member's remaining per-layer residual in
-       log space. Without an ordered depth profile one uniform role gain (family
-       over role geometric mean) is used instead.
+       log-median of fan-in normalized output-gain scores) toward one family
+       reference and restores ``residual_beta`` of each member's remaining
+       per-layer residual in log space. Without an ordered depth profile one
+       uniform role gain (family reference over role geometric mean) is used
+       instead. The family reference is chosen so these unclamped ordinary gains
+       have a geometric mean of exactly 1 across the family.
     2. A conservative log-median/MAD gate may additionally correct one isolated
        member inside a role. Coherent tails or multimodal depth regimes are never
        flattened by this secondary correction.
@@ -4065,6 +4118,7 @@ def _auto_strength_analyze_base_targets(
     base_scoring_bases: Dict[str, str] = {}
     unapplicable_bases: Set[str] = set()
     base_norms: Dict[str, float] = {}
+    base_bias_rms: Dict[str, float] = {}
     base_logical_ids: Dict[str, str] = {}
     base_logical_scales: Dict[str, float] = {}
     logical_norms: Dict[Tuple[str, str, str, str], float] = {}
@@ -4093,10 +4147,7 @@ def _auto_strength_analyze_base_targets(
                 destination_shape=logical_shape,
                 destination_shape_source=shape_source,
             )
-            if (
-                (base + ".reshape_weight") not in lora_sd
-                and _auto_strength_update_cannot_apply(dest_weight, logical_shape, shape_source)
-            ):
+            if _auto_strength_update_cannot_apply(dest_weight, lora_sd, base):
                 unapplicable_bases.add(base)
                 metadata["cohort_eligible"] = False
                 metadata["fallback_reason"] = "destination_shape_mismatch"
@@ -4156,6 +4207,7 @@ def _auto_strength_analyze_base_targets(
             # ComfyUI will skip this patch; it must not influence any reference.
             continue
 
+        measure_details: Dict[str, Any] = {}
         norm = _auto_strength_measure_base_delta(
             lora_sd=lora_sd,
             base=base,
@@ -4168,7 +4220,11 @@ def _auto_strength_analyze_base_targets(
             current_model=current_model,
             current_clip=current_clip,
             fan_in_normalize=(family == "linear"),
+            details=measure_details,
         )
+        bias_rms = measure_details.get("bias_update_rms")
+        if bias_rms is not None:
+            base_bias_rms[base] = float(bias_rms)
         if norm is None or not math.isfinite(float(norm)) or not (norm > _AUTO_STRENGTH_EPS):
             continue
         base_norms[base] = norm
@@ -4183,7 +4239,6 @@ def _auto_strength_analyze_base_targets(
     cohort_reference_statistics: Dict[Tuple[str, str, str], str] = {}
     cohort_role_eligible: Dict[Tuple[str, str, str], bool] = {}
     cohort_depth_models: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    family_values: Dict[Tuple[str, str], List[float]] = {}
 
     for cohort, vals_by_logical in grouped_norms.items():
         logical_values = {
@@ -4244,8 +4299,6 @@ def _auto_strength_analyze_base_targets(
                 depth_model["fallback_reason"] = "cohort_ineligible"
             cohort_depth_models[cohort] = depth_model
 
-            if role_eligible:
-                family_values.setdefault((cohort[0], cohort[1]), []).extend(logical_vals)
         else:
             reference = float(sum(logical_vals) / len(logical_vals)) if logical_vals else None
             eligible = cohort_is_eligible and len(logical_vals) >= 2 and reference is not None
@@ -4274,9 +4327,37 @@ def _auto_strength_analyze_base_targets(
             }
             cohort_reference_statistics[cohort] = "arithmetic_mean"
 
+    # The family reference is the scalar that makes the unclamped ordinary linear
+    # gains of every redistributed logical source multiply to exactly 1 for the
+    # configured residual beta, local-depth baselines and role fallbacks. Every
+    # ordinary gain below is ``family_reference * unit_gain`` where ``unit_gain`` is
+    # the same composition with a reference of 1. The full correction of a single
+    # isolated outlier is a deliberate exception layered on top and is excluded
+    # from this normalization, so correcting one broken member does not shift
+    # every other member.
+    family_unit_log_gains: Dict[Tuple[str, str], List[float]] = {}
+    for cohort, logical_values in cohort_logical_values.items():
+        if cohort[1] != "linear" or not cohort_role_eligible.get(cohort, False):
+            continue
+        role_reference = cohort_role_references.get(cohort)
+        if role_reference is None or not (role_reference > _AUTO_STRENGTH_EPS):
+            continue
+        depth_references = cohort_depth_models.get(cohort, {}).get("local_references", {})
+        for logical_id, norm in logical_values.items():
+            if not (norm > _AUTO_STRENGTH_EPS):
+                continue
+            depth_reference = depth_references.get(logical_id)
+            if depth_reference is not None and depth_reference > _AUTO_STRENGTH_EPS:
+                log_unit_gain = -math.log(depth_reference) + residual_beta * math.log(depth_reference / norm)
+            else:
+                log_unit_gain = -math.log(role_reference)
+            family_unit_log_gains.setdefault((cohort[0], cohort[1]), []).append(log_unit_gain)
+
     family_references: Dict[Tuple[str, str], Optional[float]] = {}
-    for family_key, values in family_values.items():
-        family_references[family_key] = _auto_strength_log_mean(values)
+    for family_key, log_gains in family_unit_log_gains.items():
+        family_references[family_key] = (
+            float(math.exp(-sum(log_gains) / len(log_gains))) if log_gains else None
+        )
 
     cohort_role_gains: Dict[Tuple[str, str, str], Optional[float]] = {}
     cohort_role_gain_reasons: Dict[Tuple[str, str, str], Optional[str]] = {}
@@ -4471,7 +4552,7 @@ def _auto_strength_analyze_base_targets(
                 "reference_score": _auto_strength_safe_number(anomaly_reference),
                 "role_reference_statistic": "geometric_mean" if is_linear else None,
                 "role_reference_score": _auto_strength_safe_number(role_reference),
-                "family_reference_statistic": "geometric_mean" if is_linear else None,
+                "family_reference_statistic": "gain_normalizing_geometric_mean" if is_linear else None,
                 "family_reference_score": _auto_strength_safe_number(family_reference),
                 "role_gain_raw": _auto_strength_safe_number(role_gain),
                 "depth_profile_eligible": bool(depth_model.get("eligible")) if is_linear else None,
@@ -4646,6 +4727,7 @@ def _auto_strength_analyze_base_targets(
                     "destination_slice": base_meta.get("destination_slice"),
                     "measurement_kind": base_measurement_kinds.get(base, "update_rms"),
                     "scoring_basis": base_scoring_bases.get(base, "absolute_update_rms"),
+                    "bias_update_rms": _auto_strength_safe_number(base_bias_rms.get(base)),
                     "norm": _auto_strength_safe_number(base_norms.get(base)),
                     "score": _auto_strength_safe_number(base_norms.get(base)),
                     "update_rms": (
@@ -4801,12 +4883,12 @@ def _auto_strength_analyze_base_targets(
         "scoring_basis": f"linear={_AUTO_STRENGTH_LINEAR_SCORING_BASIS};other=absolute_update_rms",
         "base_relative_scoring": False,
         "cohort_reference_policy": {
-            "repeated_block_linear": "family_geometric_local_depth_log_median_plus_single_outlier_gate",
+            "repeated_block_linear": "gain_normalized_family_local_depth_log_median_plus_single_outlier_gate",
             "other_tensor_families": "arithmetic_mean",
         },
         "linear_cohorting": "repeated_block_semantic_role_logical_shape_and_slice",
         "linear_role_redistribution_policy": {
-            "family_reference": "geometric_mean_of_eligible_logical_sources",
+            "family_reference": "scalar_making_unclamped_ordinary_gains_geometric_mean_one",
             "role_reference": "geometric_mean_fallback",
             "minimum_role_sample": _AUTO_STRENGTH_LINEAR_ROLE_MIN_SAMPLE,
             "fallback_gain": "family_reference_divided_by_role_reference",

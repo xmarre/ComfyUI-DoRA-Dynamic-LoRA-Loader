@@ -55,6 +55,15 @@ def _geomean(values):
     return math.exp(sum(math.log(value) for value in values) / len(values))
 
 
+def _family_reference(local_references, scores, beta):
+    """Scalar that makes ordinary gains ``F / L * (L / x) ** beta`` multiply to 1."""
+    pairs = list(zip(local_references, scores))
+    return math.exp(
+        sum((1.0 - beta) * math.log(local) + beta * math.log(score) for local, score in pairs)
+        / len(pairs)
+    )
+
+
 def _logical_report(report, logical_id):
     return next(item for item in report["logical_groups"] if item["logical_id"] == logical_id)
 
@@ -99,7 +108,7 @@ def test_minimax_projection_regimes_are_redistributed_by_uniform_role_gain(dora_
         expected_family_reference * math.sqrt(2.0)
     )
     assert report["cohort_reference_policy"] == {
-        "repeated_block_linear": "family_geometric_local_depth_log_median_plus_single_outlier_gate",
+        "repeated_block_linear": "gain_normalized_family_local_depth_log_median_plus_single_outlier_gate",
         "other_tensor_families": "arithmetic_mean",
     }
     assert {cohort["semantic_role"] for cohort in report["cohorts"]} == set(regimes)
@@ -131,7 +140,6 @@ def test_residual_beta_endpoints_and_log_midpoint(dora_modules):
             magnitude,
         )
 
-    family_reference = _geomean(magnitudes)
     center = "block_3"
     local_only, local_report = _analyze(
         nodes, lora_sd, key_map, model_state, residual_beta=0.0
@@ -145,9 +153,10 @@ def test_residual_beta_endpoints_and_log_midpoint(dora_modules):
 
     # The center is the cohort's single statistical outlier, so it is deliberately
     # promoted to full residual correction at every beta.
-    assert local_only[center] == pytest.approx(family_reference / 0.25)
-    assert hybrid[center] == pytest.approx(family_reference / 0.25)
-    assert direct[center] == pytest.approx(family_reference / 0.25)
+    local_references = [1.0] * len(magnitudes)
+    for targets, beta in ((local_only, 0.0), (hybrid, 0.5), (direct, 1.0)):
+        family_reference = _family_reference(local_references, magnitudes, beta)
+        assert targets[center] == pytest.approx(family_reference / 0.25)
     assert _logical_report(hybrid_report, center)["residual_exponent_applied"] == pytest.approx(1.0)
 
     # A non-outlier layer with score 1.0 has no residual and therefore stays at the
@@ -176,15 +185,16 @@ def test_residual_beta_partially_restores_non_outlier_per_layer_correction(dora_
             magnitude,
         )
 
-    family_reference = _geomean(magnitudes)
-    local_gain = family_reference / 1.0
-    direct_gain = family_reference / 0.7
+    local_references = [1.0] * len(magnitudes)
+    local_gain = _family_reference(local_references, magnitudes, 0.0) / 1.0
+    half_reference = _family_reference(local_references, magnitudes, 0.5)
+    direct_gain = _family_reference(local_references, magnitudes, 1.0) / 0.7
 
     local, _ = _analyze(nodes, lora_sd, key_map, model_state, residual_beta=0.0)
     half, half_report = _analyze(nodes, lora_sd, key_map, model_state, residual_beta=0.5)
     direct, _ = _analyze(nodes, lora_sd, key_map, model_state, residual_beta=1.0)
 
-    expected_half = local_gain * math.sqrt(1.0 / 0.7)
+    expected_half = half_reference * math.sqrt(1.0 / 0.7)
     assert local["block_3"] == pytest.approx(local_gain)
     assert half["block_3"] == pytest.approx(expected_half)
     assert direct["block_3"] == pytest.approx(direct_gain)
@@ -192,7 +202,7 @@ def test_residual_beta_partially_restores_non_outlier_per_layer_correction(dora_
     assert item["residual_beta"] == pytest.approx(0.5)
     assert item["residual_exponent_applied"] == pytest.approx(0.5)
     assert item["residual_gain_raw"] == pytest.approx(math.sqrt(1.0 / 0.7))
-    assert item["direct_family_gain_raw"] == pytest.approx(direct_gain)
+    assert item["direct_family_gain_raw"] == pytest.approx(half_reference / 0.7)
 
 
 def test_analyzer_default_residual_beta_is_half(dora_modules):
@@ -254,7 +264,9 @@ def test_h3_like_weak_fc2_depth_region_recovers_large_boosts(dora_modules):
 
     targets, report = _analyze(nodes, lora_sd, key_map, model_state)
 
-    family_reference = _geomean([1.0] * 50 + [0.25] * 35 + [2.0] * 15)
+    # Helper updates are 2x2: reported scores carry a sqrt(2) output-gain factor.
+    family_reference = report["family_references"]["model/linear"] / math.sqrt(2.0)
+    assert _geomean(targets.values()) == pytest.approx(1.0)
     early_gain = family_reference / 0.25
     late_gain = family_reference / 2.0
     assert early_gain > 2.5 and late_gain < 0.5
@@ -298,14 +310,14 @@ def test_role_gain_preserves_depth_profile_exactly(dora_modules):
 
     # Five members form one depth window, so each role's local reference is its
     # median (3.0 and 1.5). The role fallback reference is its geometric mean.
-    family_reference = _geomean(role_a + role_b)
+    family_reference = _family_reference([3.0] * 5 + [1.5] * 5, role_a + role_b, 0.0)
     assert all(targets[f"a_{block}"] == pytest.approx(family_reference / 3.0) for block in range(5))
     assert all(targets[f"b_{block}"] == pytest.approx(family_reference / 1.5) for block in range(5))
 
     gains = {cohort["semantic_role"]: cohort["role_gain_raw"] for cohort in report["cohorts"]}
     assert gains["attn.qkv_proj"] == pytest.approx(family_reference / _geomean(role_a))
     assert gains["mlp.fc2"] == pytest.approx(family_reference / _geomean(role_b))
-    assert gains["attn.qkv_proj"] * gains["mlp.fc2"] == pytest.approx(1.0)
+    assert _geomean(targets.values()) == pytest.approx(1.0)
 
     # The same scalar applies to every member in each role, so trained depth ratios survive.
     assert _logical_report(report, "a_0")["role_gain_raw"] == pytest.approx(
@@ -331,7 +343,7 @@ def test_weak_projection_composes_depth_gain_with_isolated_outlier_correction(do
     targets, report = _analyze(nodes, lora_sd, key_map, model_state)
 
     weak = "blocks_2_mlp_fc2"
-    family_reference = _geomean([4.0] * 5 + [0.2] + [1.0] * 4)
+    family_reference = _family_reference([4.0] * 5 + [1.0] * 5, [4.0] * 5 + [0.2] + [1.0] * 4, 0.0)
     qkv_gain = family_reference / 4.0
     fc2_depth_gain = family_reference / 1.0
 
@@ -368,7 +380,7 @@ def test_strong_projection_uses_family_over_local_depth_reference(dora_modules):
     targets, report = _analyze(nodes, lora_sd, key_map, model_state)
 
     strong = "blocks_3_mlp_fc2"
-    family_reference = _geomean((1.0, 1.0, 1.0, 5.0, 1.0))
+    family_reference = _family_reference([1.0] * 5, (1.0, 1.0, 1.0, 5.0, 1.0), 0.0)
     assert targets[strong] == pytest.approx(family_reference / 5.0)
     assert all(
         targets[f"blocks_{block}_mlp_fc2"] == pytest.approx(family_reference)
@@ -397,7 +409,7 @@ def test_mad_gate_composes_with_robust_local_depth_baseline(dora_modules):
 
     targets, report = _analyze(nodes, lora_sd, key_map, model_state)
 
-    family_reference = _geomean((0.9, 1.0, 1.05, 1.1, 0.2))
+    family_reference = _family_reference([1.0] * 5, (0.9, 1.0, 1.05, 1.1, 0.2), 0.0)
     assert targets["block_4"] == pytest.approx(family_reference / 0.2)
     assert all(targets[f"block_{block}"] == pytest.approx(family_reference) for block in range(4))
     cohort = report["cohorts"][0]
@@ -457,7 +469,8 @@ def test_smooth_depth_profile_uses_smooth_local_baseline(dora_modules):
 
     targets, report = _analyze(nodes, lora_sd, key_map, model_state)
 
-    family_reference = _geomean(magnitudes)
+    local_references = [magnitudes[min(max(block, 3), 46)] for block in range(50)]
+    family_reference = _family_reference(local_references, magnitudes, 0.0)
     for block in (3, 10, 24, 40, 46):
         assert targets[f"block_{block}"] == pytest.approx(
             family_reference / magnitudes[block]
@@ -680,7 +693,7 @@ def test_model_and_clip_roles_never_share_a_cohort(dora_modules):
 
     targets, report = _analyze(nodes, lora_sd, key_map, model_state, clip_state)
 
-    model_family_reference = _geomean((0.2, 1.0, 1.0, 1.0, 1.0))
+    model_family_reference = _family_reference([1.0] * 5, (0.2, 1.0, 1.0, 1.0, 1.0), 0.0)
     assert targets["model_0"] == pytest.approx(model_family_reference * 5.0)
     assert all(targets[f"model_{block}"] == pytest.approx(model_family_reference) for block in range(1, 5))
     assert all(targets[f"clip_{block}"] == pytest.approx(1.0) for block in range(5))
@@ -712,7 +725,9 @@ def test_same_named_roles_with_different_shapes_do_not_share_a_cohort(dora_modul
     # Scores are output gains: element RMS times sqrt(fan_in) (2 or 3 here).
     scores_2 = [math.sqrt(2.0) * (0.2 if block == 0 else 1.0) for block in range(5)]
     scores_3 = [math.sqrt(3.0)] * 5
-    family_reference = _geomean(scores_2 + scores_3)
+    family_reference = _family_reference(
+        [math.sqrt(2.0)] * 5 + [math.sqrt(3.0)] * 5, scores_2 + scores_3, 0.0
+    )
     assert targets["shape_0"] == pytest.approx(family_reference / math.sqrt(2.0) * 5.0)
     assert all(
         targets[f"shape_{block}"] == pytest.approx(family_reference / math.sqrt(2.0))
@@ -944,16 +959,11 @@ def test_linear_scores_are_comparable_across_projection_input_widths(dora_module
         assert item["update_rms"] is None
 
 
-def test_linear_redistribution_is_gain_neutral_before_clamping(dora_modules):
-    nodes, _ = dora_modules
+def _two_role_imbalanced_lora(role_a, role_b):
     lora_sd = {}
     key_map = {}
     model_state = {}
-    magnitudes = {
-        "attn.qkv_proj": (1.0, 1.3, 0.8, 1.1, 0.9, 1.2, 1.0),
-        "mlp.fc2": (0.2, 0.25, 0.3, 0.2, 0.35, 0.25, 0.3),
-    }
-    for role, values in magnitudes.items():
+    for role, values in (("attn.qkv_proj", role_a), ("mlp.fc2", role_b)):
         for block, magnitude in enumerate(values):
             _add_linear(
                 lora_sd,
@@ -963,14 +973,181 @@ def test_linear_redistribution_is_gain_neutral_before_clamping(dora_modules):
                 f"diffusion_model.blocks.{block}.{role}.weight",
                 magnitude,
             )
+    return lora_sd, key_map, model_state
 
-    _, report = _analyze(nodes, lora_sd, key_map, model_state, residual_beta=1.0)
 
-    ratios = [item["ratio_raw"] for item in report["logical_groups"]]
-    assert len(ratios) == 14
-    # An arithmetic reference would make this product exceed 1 and strengthen the
-    # adapter overall; the geometric reference only redistributes.
-    assert _geomean(ratios) == pytest.approx(1.0)
+@pytest.mark.parametrize("beta", [0.0, 0.25, 0.5, 1.0])
+@pytest.mark.parametrize(
+    "role_a, role_b",
+    [
+        ((1.0, 2.0, 3.0, 4.0, 5.0), (0.5, 1.0, 1.5, 2.0, 2.5)),
+        ((1.0, 1.3, 0.8, 1.1, 0.9, 1.2, 1.0), (0.2, 0.25, 0.3, 0.2, 0.35, 0.25, 0.3)),
+    ],
+)
+def test_linear_redistribution_is_gain_neutral_for_every_beta(dora_modules, beta, role_a, role_b):
+    nodes, _ = dora_modules
+    lora_sd, key_map, model_state = _two_role_imbalanced_lora(role_a, role_b)
+
+    _, report = _analyze(
+        nodes, lora_sd, key_map, model_state,
+        ratio_floor=0.0, ratio_ceiling=1e6, residual_beta=beta,
+    )
+
+    items = report["logical_groups"]
+    assert len(items) == len(role_a) + len(role_b)
+    assert not any(item["outlier_corrected"] for item in items)
+    # Unclamped ordinary gains multiply to exactly 1 across the family, so the
+    # redistribution neither strengthens nor weakens the adapter in log space.
+    assert _geomean(item["ratio_raw"] for item in items) == pytest.approx(1.0)
+
+
+def test_clamping_is_applied_after_gain_normalization(dora_modules):
+    nodes, _ = dora_modules
+    role_a = (1.0, 2.0, 3.0, 4.0, 5.0)
+    role_b = (0.5, 1.0, 1.5, 2.0, 2.5)
+    lora_sd, key_map, model_state = _two_role_imbalanced_lora(role_a, role_b)
+
+    _, free_report = _analyze(
+        nodes, lora_sd, key_map, model_state,
+        ratio_floor=0.0, ratio_ceiling=1e6, residual_beta=0.5,
+    )
+    targets, report = _analyze(
+        nodes, lora_sd, key_map, model_state,
+        ratio_floor=0.8, ratio_ceiling=1.2, residual_beta=0.5,
+    )
+
+    free_raw = {item["logical_id"]: item["ratio_raw"] for item in free_report["logical_groups"]}
+    clipped_any = False
+    for item in report["logical_groups"]:
+        # The ratio window only clips; it never renormalizes the remaining members.
+        assert item["ratio_raw"] == pytest.approx(free_raw[item["logical_id"]])
+        assert item["ratio_applied"] == pytest.approx(min(1.2, max(0.8, item["ratio_raw"])))
+        assert targets[item["logical_id"]] == pytest.approx(item["ratio_applied"])
+        clipped_any = clipped_any or not (0.8 < item["ratio_raw"] < 1.2)
+    assert clipped_any
+
+
+def test_isolated_outlier_correction_is_outside_gain_normalization(dora_modules):
+    nodes, _ = dora_modules
+    lora_sd = {}
+    key_map = {}
+    model_state = {}
+    magnitudes = (0.9, 1.0, 1.05, 1.1, 0.2)
+    for block, magnitude in enumerate(magnitudes):
+        _add_linear(
+            lora_sd,
+            key_map,
+            model_state,
+            f"block_{block}",
+            f"diffusion_model.blocks.{block}.mlp.fc2.weight",
+            magnitude,
+        )
+
+    _, report = _analyze(
+        nodes, lora_sd, key_map, model_state,
+        ratio_floor=0.0, ratio_ceiling=1e6, residual_beta=0.5,
+    )
+
+    outlier = _logical_report(report, "block_4")
+    assert outlier["outlier_corrected"] is True
+    assert outlier["residual_exponent_applied"] == pytest.approx(1.0)
+    # Ordinary composition (exponent beta for everyone) is what is normalized; the
+    # outlier's promotion to exponent 1 multiplies its gain on top of that.
+    ordinary = [
+        item["depth_gain_raw"] * item["residual_gain_raw"] ** (0.5 / item["residual_exponent_applied"])
+        for item in report["logical_groups"]
+    ]
+    assert _geomean(ordinary) == pytest.approx(1.0)
+    assert outlier["ratio_raw"] == pytest.approx(outlier["depth_gain_raw"] * (1.0 / 0.2))
+
+
+def _five_fc1_bases(extra=None):
+    lora_sd = {}
+    key_map = {}
+    model_state = {}
+    for block, magnitude in enumerate((0.8, 1.0, 1.2, 1.0, 0.9)):
+        base = f"fc1_{block}"
+        _add_linear(
+            lora_sd,
+            key_map,
+            model_state,
+            base,
+            f"diffusion_model.blocks.{block}.mlp.fc1.weight",
+            magnitude,
+        )
+        if extra is not None:
+            extra(lora_sd, base, block)
+    return lora_sd, key_map, model_state
+
+
+@pytest.mark.parametrize("bias_blocks", [(2,), (0, 1, 2, 3, 4)])
+def test_bias_patches_do_not_change_weight_shape_scores_or_targets(dora_modules, bias_blocks):
+    nodes, _ = dora_modules
+    baseline_targets, baseline_report = _analyze(
+        nodes, *_five_fc1_bases(), residual_beta=0.5
+    )
+
+    def add_bias(lora_sd, base, block):
+        if block in bias_blocks:
+            lora_sd[f"{base}.diff_b"] = torch.full((2,), 7.0, dtype=torch.float32)
+
+    targets, report = _analyze(nodes, *_five_fc1_bases(add_bias), residual_beta=0.5)
+
+    assert report["shape_mismatch_bases"] == []
+    assert report["measured_bases"] == 5
+    assert targets == pytest.approx(baseline_targets)
+    for item in report["logical_groups"]:
+        base = item["logical_id"]
+        block = int(base.split("_")[-1])
+        assert item["destination_shape"] == "2x2"
+        assert item["score"] == pytest.approx(_logical_report(baseline_report, base)["score"])
+        bias = item["bases"][0]["bias_update_rms"]
+        assert bias == (pytest.approx(7.0) if block in bias_blocks else None)
+
+
+def test_direct_diff_requires_exact_destination_shape(dora_modules):
+    nodes, _ = dora_modules
+
+    def build(diff_shape):
+        lora_sd = {}
+        key_map = {}
+        model_state = {}
+        for block in range(5):
+            base = f"diff_{block}"
+            destination = f"diffusion_model.blocks.{block}.attn.out_proj.weight"
+            key_map[base] = destination
+            model_state[destination] = torch.ones((4, 4), dtype=torch.float32)
+            lora_sd[f"{base}.diff"] = torch.full(diff_shape, 1.0 if block else 0.2)
+        return _analyze(nodes, lora_sd, key_map, model_state)
+
+    targets, report = build((2, 8))
+    assert report["shape_mismatch_bases"] == sorted(f"diff_{block}" for block in range(5))
+    assert all(value == pytest.approx(1.0) for value in targets.values())
+
+    targets, report = build((4, 4))
+    assert report["shape_mismatch_bases"] == []
+    assert targets["diff_0"] > 1.0
+
+
+def test_factorized_update_is_applicable_when_element_counts_match(dora_modules):
+    nodes, _ = dora_modules
+    lora_sd = {}
+    key_map = {}
+    model_state = {}
+    for block in range(5):
+        base = f"lora_{block}"
+        destination = f"diffusion_model.blocks.{block}.attn.out_proj.weight"
+        _add_linear(
+            lora_sd, key_map, model_state, base, destination,
+            1.0 if block else 0.2, shape=(2, 8),
+        )
+        # ComfyUI reshapes a factorized update to the destination shape.
+        model_state[destination] = torch.ones((4, 4), dtype=torch.float32)
+
+    targets, report = _analyze(nodes, lora_sd, key_map, model_state)
+
+    assert report["shape_mismatch_bases"] == []
+    assert targets["lora_0"] > 1.0
 
 
 def test_updates_that_cannot_patch_their_destination_do_not_shift_references(dora_modules):

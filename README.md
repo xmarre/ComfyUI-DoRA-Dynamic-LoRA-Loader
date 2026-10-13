@@ -95,19 +95,19 @@ then enabling auto-strength is a true no-op.
 
 - scores ordinary LoRA with `RMS(ΔW)` after LoRA alpha/rank scaling
 - scores DoRA with the RMS of its actual post-normalization weight update
-- for linear destinations, converts that RMS into the update's output gain for unit-RMS input, `RMS(ΔW) * sqrt(fan_in)`, so projections with different input widths are compared on one scale
+- for linear destinations, converts that RMS into the update's output gain for unit-RMS input, `RMS(ΔW) * sqrt(fan_in)`, so projections with different input widths are compared on one scale; the linear score describes the weight patch only, and a separate `.diff_b` bias patch is reported as `bias_update_rms` (it is the score only for bias-only bases)
 - separates model and CLIP and keeps tensor families isolated
 - infers repeated-block projection roles structurally from mapped destination paths; there is no MiniMax-H3 role table
 - derives linear cohort shape from the adapter's logical update matrix when possible, so packed/quantized checkpoint storage does not split an otherwise identical role
-- uses a broad **family geometric-mean reference** across eligible linear logical sources
-- excludes linear updates whose element count cannot match their dense destination (ComfyUI skips those patches), so they never shift the references used for other layers
+- uses one broad **family reference** across eligible linear logical sources, defined as the scalar that makes the unclamped ordinary gains (below) multiply to exactly 1 for the configured β
+- excludes linear weight patches that ComfyUI would reject on a dense floating-point destination, so they never shift the references used for other layers: `.set_weight` / `.diff` need the exact destination shape, factorized LoRA updates need an equal element count
 - for ordered repeated-block roles, builds a robust **local depth reference** with a centered 7-member moving log-median
 - applies `family_reference / local_depth_reference` as the robust regional baseline, so a coherently weak depth region can still receive the large boosts that made the original Auto-strength useful
 - restores a configurable fraction of the remaining per-layer residual in log space: `final_gain = depth_gain * (local_depth_reference / layer_score)^β`
 - exposes **Auto-strength residual β** in the node and State Manager, clamped to `0…1`, with default `0.50`
 - `β = 0` is the local-depth-only behavior; `β = 1` is the direct family/per-layer gain; intermediate values are geometric/log-space blends rather than linear ratio interpolation
 - uses one role-wide geometric-mean gain only as a fallback when a reliable depth profile cannot be inferred
-- isolated statistical outliers are promoted to residual exponent `1.0` regardless of β, preserving the conservative full correction already used for a single clearly broken member
+- isolated statistical outliers are promoted to residual exponent `1.0` regardless of β, preserving the conservative full correction already used for a single clearly broken member; that extra correction is deliberately excluded from the family normalization, so fixing one member does not shift the others
 - multiple anomaly candidates suppress only the isolated-member correction; they do not suppress coherent depth redistribution
 - requires at least five ordered logical sources for depth profiling and at least five for isolated-outlier inference
 - leaves unclassifiable linear destinations at their normal global strength
@@ -141,10 +141,14 @@ Two properties keep linear redistribution from reshaping a balanced adapter:
   systematically strong, independent of how the adapter was trained. The output-gain
   score removes that bias. Within one role every member has the same shape, so depth
   redistribution inside a role is unchanged by it.
-- **Gain neutrality.** With the geometric family reference, the unclamped per-layer
-  gains multiply to 1 across the family, so redistribution does not strengthen or
-  weaken the adapter overall. An arithmetic-mean reference raises the average gain
-  above 1, increasingly so the wider the spread of scores.
+- **Log-space gain neutrality.** For every β, the unclamped ordinary per-layer gains
+  `family_reference / local_reference * (local_reference / score)^β` have a geometric
+  mean of exactly 1 across the family, so the redistribution is centred on the row's
+  own strength instead of drifting with the spread of scores (an arithmetic-mean
+  reference pushes the mean gain above 1). This is a property of the gains in log
+  space only: it does not guarantee an unchanged arithmetic mean gain or an
+  unchanged model output, isolated-outlier correction sits outside it, and the
+  ratio floor/ceiling clip gains afterwards without renormalizing the rest.
 
 Ordinary LoRA scoring remains independent of destination weight numeric values; the
 output-gain conversion uses only the update's shape.
