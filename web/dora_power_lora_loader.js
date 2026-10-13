@@ -557,12 +557,18 @@ function setStateSlot(node, value) {
   return slot;
 }
 
+// Which saved stack the loader holds, recorded only by explicit State Manager
+// actions: applying a preset stack to the loader, or a confirmed save of the
+// loader into a preset. Selecting a preset does not bind the loader.
+//   { characterId, slot }
+const BINDING_PROPERTY = "dora_state_binding";
+
 // A user State slot rename is tracked in the workflow until a State Manager
 // save of it is confirmed by the library, or a preset is applied:
 //   from      - the slot the library last confirmed for this loader's stack
-//   fromIn    - the character id that slot belongs to: the preset selected by
-//               the connected State Manager at rename time, then the preset
-//               of each committed save ("" when unknown)
+//   fromIn    - the character that slot belongs to: the loader's binding when
+//               the rename started on its bound slot, then the preset of each
+//               committed save ("" when unknown)
 //   savedTo   - where the latest save put the stack (pending or committed)
 //   savedToIn - the persistent character id that latest save wrote into
 //   seq       - counter of saves made under this rename
@@ -573,6 +579,19 @@ const SLOT_RENAME_PROPERTY = "dora_state_slot_rename";
 
 function makeSlotRenameId() {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function getBinding(node) {
+  const value = node?.properties?.[BINDING_PROPERTY];
+  if (!value || typeof value !== "object" || typeof value.characterId !== "string" || !value.characterId) return null;
+  const slot = normalizeStateSlot(value.slot, "");
+  return slot ? { characterId: value.characterId, slot } : null;
+}
+
+function setBinding(node, characterId, slot) {
+  if (typeof characterId !== "string" || !characterId) return;
+  node.properties = node.properties || {};
+  node.properties[BINDING_PROPERTY] = { characterId, slot: normalizeStateSlot(slot, "default") };
 }
 
 function getSlotRename(node) {
@@ -597,10 +616,19 @@ function clearSlotRename(node) {
   if (node?.properties) delete node.properties[SLOT_RENAME_PROPERTY];
 }
 
-// Applying a preset settles a rename unless a save made under it is still
-// unconfirmed; that save's record is needed if its write is rejected.
-function settleSlotRenameOnApply(node) {
-  if (!getSlotRename(node)?.savedTo) clearSlotRename(node);
+function hasPendingSlotRenameSave(rename) {
+  return !!rename && !!globalThis.__doraStateManagerLoaderSaveApi?.hasPendingSave?.(rename.id);
+}
+
+// An explicit preset application settles the rename: the loader now holds the
+// applied stack. Only a save into that same preset whose library write is
+// still in flight keeps the rename, since the applied stack is that save's
+// local result and the write may still be rejected.
+function settleSlotRenameOnApply(node, characterId) {
+  const rename = getSlotRename(node);
+  if (!rename) return;
+  if (hasPendingSlotRenameSave(rename) && (!characterId || rename.savedToIn === characterId)) return;
+  clearSlotRename(node);
 }
 
 function renameStateSlot(node, value) {
@@ -609,17 +637,18 @@ function renameStateSlot(node, value) {
   if (slot === current) return slot;
   const rename = getSlotRename(node);
   if (!rename) {
-    const fromIn = globalThis.__doraStateManagerLoaderSelectionApi?.selectedCharacterIdForLoader?.(node);
+    const binding = getBinding(node);
     setSlotRename(node, {
       from: current,
-      fromIn: typeof fromIn === "string" ? fromIn : "",
+      fromIn: binding?.slot === current ? binding.characterId : "",
       id: makeSlotRenameId(),
       savedTo: "",
       savedToIn: "",
       seq: 0,
     });
+  } else if (rename.from === slot && !rename.savedTo) {
+    clearSlotRename(node);
   }
-  else if (rename.from === slot && !rename.savedTo) clearSlotRename(node);
   return slot;
 }
 
@@ -631,12 +660,18 @@ function recordSlotRenameSave(node, slot, characterId) {
   return { id: next.id, seq: next.seq };
 }
 
-function commitSlotRenameSave(node, id, seq, slot, characterId) {
-  const rename = getSlotRename(node);
-  if (!rename || rename.id !== id) return;
+// A save of this loader into characterId at slot is now held by the library.
+function commitLoaderSave(node, { id, seq, slot, characterId }) {
   const committed = normalizeStateSlot(slot, "default");
+  const rename = getSlotRename(node);
+  if (!id) {
+    if (!rename && getStateSlot(node) === committed) setBinding(node, characterId, committed);
+    return;
+  }
+  if (!rename || rename.id !== id) return;
   if (rename.seq === seq && rename.savedTo === committed && getStateSlot(node) === committed) {
     clearSlotRename(node);
+    setBinding(node, characterId, committed);
     return;
   }
   if (seq <= rename.seq) setSlotRename(node, { ...rename, from: committed, fromIn: characterId });
@@ -771,13 +806,15 @@ function installGlobalStateApi() {
       const state = getState(node);
       return { ...state, slot: getStateSlot(node), label: String(node?.title || getStateSlot(node)) };
     },
-    setState(node, externalState) {
+    // options.characterId: the preset whose saved stack is being applied.
+    setState(node, externalState, options = {}) {
       if (!node) return false;
       const next = normalizeExternalDoraState(externalState);
       if (externalState && Object.prototype.hasOwnProperty.call(externalState, "slot")) {
         setStateSlot(node, externalState.slot);
       }
-      settleSlotRenameOnApply(node);
+      settleSlotRenameOnApply(node, options?.characterId);
+      setBinding(node, options?.characterId, getStateSlot(node));
       setState(node, next);
       node._doraRows = next.rows;
       node._doraGlobals = next.globals;
@@ -800,8 +837,8 @@ function installGlobalStateApi() {
     recordSlotRenameSave(node, slot, characterId) {
       return recordSlotRenameSave(node, slot, characterId);
     },
-    commitSlotRenameSave(node, id, seq, slot, characterId) {
-      commitSlotRenameSave(node, id, seq, slot, characterId);
+    commitLoaderSave(node, commit) {
+      commitLoaderSave(node, commit);
     },
     // Moves the loader back onto the slot its saved stack occupies without
     // dropping rename tracking that a pending save still depends on.

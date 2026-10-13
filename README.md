@@ -681,7 +681,7 @@ Renaming a loader's **State slot** is remembered until a save of it has been com
 
 A renamed loader never overwrites a different stack already saved under its new slot. If the preset holds the loader's previous slot, the save keeps the loader on that slot and saves there; otherwise the loader is not saved and the status says why.
 
-A rename belongs to the preset the connected State Manager had selected when the slot was renamed. Until a save of it has been committed, saving that loader into a different preset is refused, so another preset's stacks are never taken over by slot name alone. Save it into its own preset, apply the other preset, or rename the slot back.
+A loader is bound to a preset only by an explicit action: applying that preset's stack to it (**Load connected**, **Apply selected**, **Apply connected loaders**, clicking a character tile) or a confirmed save of it into that preset. Selecting a preset does not bind it. A rename belongs to the preset the loader was bound to on its previous slot. Until a save of it has been committed, saving that loader into a different preset is refused, so another preset's stacks are never taken over by slot name alone; applying the other preset or renaming the slot back lets it save there. A loader that was never bound (for example, from a workflow saved by an earlier version) is refused when renamed onto a preset that holds its previous slot until it is saved once on that slot or a preset is applied.
 
 ### Save / load / apply workflow
 

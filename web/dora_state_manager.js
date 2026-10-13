@@ -1314,7 +1314,7 @@ async function writePendingLibrary() {
         }
         if (canonicalJson(merged.characters) === stateLibraryClient.canonical) {
           stateLibraryClient.lastAppliedNode = pending.node;
-          commitDoraLoaderSlotRenames(pending.renameCommits);
+          commitDoraLoaderSaves(pending.loaderCommits);
           continue;
         }
         try {
@@ -1330,7 +1330,7 @@ async function writePendingLibrary() {
           });
           installLibrarySnapshot(snapshot);
           stateLibraryClient.lastAppliedNode = pending.node;
-          commitDoraLoaderSlotRenames(pending.renameCommits);
+          commitDoraLoaderSaves(pending.loaderCommits);
           refreshAllNodesFromLibrary();
         } catch (error) {
           if (error.status === 409) {
@@ -1427,10 +1427,11 @@ async function prepareStateManagerQueuePayload(promptPayload, queueIndex, total)
   return mutatePromptForStateManagers(promptPayload, queueIndex, total);
 }
 
-// renameCommits acknowledge loader State slot renames only once the library
-// holds the saved state: immediately when it already does, otherwise after the
-// scheduled write commits. Blocked or failed writes drop them unacknowledged.
-function scheduleLibraryPersist(node, state, renameCommits = []) {
+// loaderCommits acknowledge loader saves (and State slot renames) only once
+// the library holds the saved state: immediately when it already does,
+// otherwise after the scheduled write commits. Blocked or failed writes drop
+// them unacknowledged.
+function scheduleLibraryPersist(node, state, loaderCommits = []) {
   const desiredCharacters = persistentCharacters(state);
   const canonical = canonicalJson(desiredCharacters);
   if (stateLibraryClient.blocked) {
@@ -1445,14 +1446,14 @@ function scheduleLibraryPersist(node, state, renameCommits = []) {
   const ownInFlight = stateLibraryClient.inFlight?.node === node ? stateLibraryClient.inFlight : null;
   const expectedCharacters = ownInFlight ? ownInFlight.desiredCharacters : stateLibraryClient.state.characters;
   if (last?.node !== node && !stateLibraryClient.inFlight && canonical === stateLibraryClient.canonical) {
-    commitDoraLoaderSlotRenames(renameCommits);
+    commitDoraLoaderSaves(loaderCommits);
     return;
   }
   const scheduled = {
     node,
     baseCharacters: structuredCloneCompat(last?.node === node ? last.baseCharacters : expectedCharacters),
     desiredCharacters: structuredCloneCompat(desiredCharacters),
-    renameCommits: [...(last?.node === node ? last.renameCommits || [] : []), ...renameCommits],
+    loaderCommits: [...(last?.node === node ? last.loaderCommits || [] : []), ...loaderCommits],
   };
   if (last?.node === node) stateLibraryClient.pending[stateLibraryClient.pending.length - 1] = scheduled;
   else stateLibraryClient.pending.push(scheduled);
@@ -2022,8 +2023,8 @@ function updateState(node, state, uiState, opts = {}) {
   if (materialized.characterId && materialized.characterId !== currentCharacterId) {
     materializedCharacterIds.set(currentCharacterId, materialized.characterId);
   }
-  const renameCommits = recordDoraLoaderRenameSaves(opts.renameSaves, materializedCharacterIds);
-  if (opts.persist !== false) scheduleLibraryPersist(node, normalizedState, renameCommits);
+  const loaderCommits = recordDoraLoaderSaves(opts.loaderSaves, materializedCharacterIds);
+  if (opts.persist !== false) scheduleLibraryPersist(node, normalizedState, loaderCommits);
   const workflowPersistenceChanged = workflowPersistenceBefore
     !== stateManagerWorkflowPersistenceSignature(node);
   if (opts.dirty !== false) {
@@ -2265,7 +2266,7 @@ function applyLoraStackToNode(targetNode, character) {
   };
   const loaderApi = globalThis.__doraPowerLoraLoaderApi;
   if (loaderApi?.setState) {
-    return !!loaderApi.setState(targetNode, payload);
+    return !!loaderApi.setState(targetNode, payload, { characterId: character.id });
   }
 
   const rows = (payload.loras || []).map((row) => ({
@@ -2406,9 +2407,9 @@ function restoreDoraLoaderSlot(loader, slot) {
   loader.properties.dora_state_slot = slot;
 }
 
-function commitDoraLoaderSlotRenames(renameCommits) {
-  for (const { loader, id, seq, slot, characterId } of renameCommits || []) {
-    doraLoaderApiFor(loader)?.commitSlotRenameSave?.(loader, id, seq, slot, characterId);
+function commitDoraLoaderSaves(loaderCommits) {
+  for (const { loader, ...commit } of loaderCommits || []) {
+    doraLoaderApiFor(loader)?.commitLoaderSave?.(loader, commit);
   }
 }
 
@@ -2432,14 +2433,14 @@ function sameLoaderStackContent(a, b) {
 // another preset's stack. Saving moves the loader's own stack to its current
 // slot. A renamed loader never overwrites a different stack saved under its
 // new slot: it returns to its own stack's slot when the preset holds one, and
-// is otherwise not saved. The returned renameSaves are recorded on the loaders by
+// is otherwise not saved. The returned loaderSaves are recorded on the loaders by
 // updateState and acknowledged only after the library write that holds them
 // commits, so pending, rejected, and reloaded saves resolve the same way from
 // the preset contents.
 function saveLoadersIntoCharacter(character, loaders) {
   let saved = 0;
   const notes = [];
-  const renameSaves = [];
+  const loaderSaves = [];
   loaders.forEach((loader, index) => {
     const stack = extractLoraStackFromNode(loader, index);
     if (!stack) return;
@@ -2449,7 +2450,11 @@ function saveLoadersIntoCharacter(character, loaders) {
     const stacks = getCharacterLoaderStacks(character);
     const slotIndex = (slot) => (slot ? stacks.findIndex((item) => normalizeLoaderSlot(item?.slot, "default") === slot) : -1);
 
-    if (rename) {
+    // Back on its original slot, the loader saves into other presets like any
+    // loader that was not renamed; only the preset its rename saved into
+    // still resolves the pending rename.
+    const tracksRename = rename && !(incoming.slot === rename.from && rename.savedToIn !== character.id);
+    if (tracksRename) {
       const savedToIndex = rename.savedToIn === character.id ? slotIndex(rename.savedTo) : -1;
       const fromIndex = rename.fromIn === character.id ? slotIndex(rename.from) : -1;
       if (savedToIndex < 0 && rename.fromIn !== character.id) {
@@ -2458,7 +2463,7 @@ function saveLoadersIntoCharacter(character, loaders) {
           return;
         }
         if (slotIndex(rename.from) >= 0) {
-          notes.push(`Not saved: cannot tell whether this preset's "${rename.from}" stack belongs to the renamed loader. Apply this preset or rename the loader back to "${rename.from}" first.`);
+          notes.push(`Not saved: cannot tell whether this preset's "${rename.from}" stack belongs to the renamed loader. Rename the loader back to "${rename.from}" and save it once, or apply this preset, first.`);
           return;
         }
       }
@@ -2484,24 +2489,29 @@ function saveLoadersIntoCharacter(character, loaders) {
         saveLoaderStackIntoCharacter(character, incoming, index);
       }
       syncLegacyLoaderMirror(character);
-      renameSaves.push({ loader, slot: incoming.slot, characterId: character.id });
     } else {
       saveLoaderStackIntoCharacter(character, incoming, index);
     }
+    loaderSaves.push({ loader, slot: incoming.slot, characterId: character.id, renamed: !!tracksRename });
     saved += 1;
   });
-  return { saved, notes, renameSaves };
+  return { saved, notes, loaderSaves };
 }
 
-// Records renamed-loader saves on the loaders once the saved character's
-// persistent id is final (an edited built-in default gets a new id), and
-// returns the acknowledgments for the library write that will hold them.
-function recordDoraLoaderRenameSaves(renameSaves, materializedCharacterIds) {
+// Records loader saves once the saved character's persistent id is final (an
+// edited built-in default gets a new id), and returns the acknowledgments for
+// the library write that will hold them: renamed loaders record where the save
+// went; every acknowledged save binds the loader to that preset slot.
+function recordDoraLoaderSaves(loaderSaves, materializedCharacterIds) {
   const commits = [];
-  for (const { loader, slot, characterId } of renameSaves || []) {
+  for (const { loader, slot, characterId, renamed } of loaderSaves || []) {
     const finalCharacterId = materializedCharacterIds.get(characterId) || characterId;
-    const record = doraLoaderApiFor(loader)?.recordSlotRenameSave?.(loader, slot, finalCharacterId);
-    if (record) commits.push({ loader, ...record, slot, characterId: finalCharacterId });
+    if (renamed) {
+      const record = doraLoaderApiFor(loader)?.recordSlotRenameSave?.(loader, slot, finalCharacterId);
+      if (record) commits.push({ loader, ...record, slot, characterId: finalCharacterId });
+    } else {
+      commits.push({ loader, slot, characterId: finalCharacterId });
+    }
   }
   return commits;
 }
@@ -3119,7 +3129,7 @@ function applySettingsToNodes(nodes, settings) {
   return changedNodes;
 }
 
-function saveConnectedState(targetNode, character, prompt, outcome = { notes: [], renameSaves: [] }) {
+function saveConnectedState(targetNode, character, prompt, outcome = { notes: [], loaderSaves: [] }) {
   const changes = [];
   const controlledNodes = getControlledNodes(targetNode).filter((node) => node && node !== targetNode);
 
@@ -3130,7 +3140,7 @@ function saveConnectedState(targetNode, character, prompt, outcome = { notes: []
   const loaderSave = saveLoadersIntoCharacter(character, loaderTargets);
   const savedLoaders = loaderSave.saved;
   outcome.notes.push(...loaderSave.notes);
-  outcome.renameSaves.push(...loaderSave.renameSaves);
+  outcome.loaderSaves.push(...loaderSave.loaderSaves);
   if (savedLoaders) changes.push(`${savedLoaders} LoRA loader${savedLoaders === 1 ? "" : "s"}`);
 
   const controlledTextNodes = controlledNodes.filter(isStateTextNode);
@@ -3263,14 +3273,14 @@ function classifySelectedTextNodes(nodes) {
   return { positive, negative: fallbackNegative, used: [positive?.node, fallbackNegative?.node].filter(Boolean) };
 }
 
-function saveSelectedState(targetNode, character, prompt, outcome = { notes: [], renameSaves: [] }) {
+function saveSelectedState(targetNode, character, prompt, outcome = { notes: [], loaderSaves: [] }) {
   const selected = getSelectedGraphNodes().filter((node) => node && node !== targetNode);
   const changes = [];
   const loaders = selected.filter(isDoraLoaderNode);
   const loaderSave = saveLoadersIntoCharacter(character, loaders);
   const savedLoaders = loaderSave.saved;
   outcome.notes.push(...loaderSave.notes);
-  outcome.renameSaves.push(...loaderSave.renameSaves);
+  outcome.loaderSaves.push(...loaderSave.loaderSaves);
   if (savedLoaders) changes.push(`${savedLoaders} LoRA loader${savedLoaders === 1 ? "" : "s"}`);
 
   const selectedStateTextNodes = selected.filter(isStateTextNode);
@@ -3753,14 +3763,14 @@ function renderHeader(node, state, uiState, character, prompt) {
   });
 
   const saveConnected = makeButton("Save connected", () => {
-    const outcome = { notes: [], renameSaves: [] };
+    const outcome = { notes: [], loaderSaves: [] };
     const changes = saveConnectedState(node, character, prompt, outcome);
     const summary = changes.length ? `Saved ${changes.join(", ")} from connected nodes.` : "No connected downstream nodes had capturable state.";
     updateState(node, state, uiState, {
       characterId: character.id,
       promptId: prompt.id,
       status: [summary, ...outcome.notes].join(" "),
-      renameSaves: outcome.renameSaves,
+      loaderSaves: outcome.loaderSaves,
     });
   }, "Capture current values from nodes connected to this manager's outputs");
   saveConnected.classList.add("dsm-primary");
@@ -3780,14 +3790,14 @@ function renderHeader(node, state, uiState, character, prompt) {
     saveConnected,
     loadConnected,
     makeButton("Save selected", () => {
-      const outcome = { notes: [], renameSaves: [] };
+      const outcome = { notes: [], loaderSaves: [] };
       const changes = saveSelectedState(node, character, prompt, outcome);
       const summary = changes.length ? `Saved ${changes.join(", ")} from selected nodes.` : "Select a loader, text, seed, or settings node first.";
       updateState(node, state, uiState, {
         characterId: character.id,
         promptId: prompt.id,
         status: [summary, ...outcome.notes].join(" "),
-        renameSaves: outcome.renameSaves,
+        loaderSaves: outcome.loaderSaves,
       });
     }, "Capture selected graph nodes into the current character/preset"),
     makeButton("Apply selected", () => {
@@ -4554,9 +4564,9 @@ function renderLoraPanelContent(section, node, state, uiState, character, prompt
     makeButton("Save connected loaders", () => {
       const controlledLoaders = getControlledNodes(node).filter(isDoraLoaderNode);
       const loaders = controlledLoaders.length ? controlledLoaders : uniqueNodes(getOutputTargets(node, OUTPUT_NAMES.lora)).filter(isDoraLoaderNode);
-      const { saved: count, notes, renameSaves } = saveLoadersIntoCharacter(character, loaders);
+      const { saved: count, notes, loaderSaves } = saveLoadersIntoCharacter(character, loaders);
       const summary = count ? `Saved ${count} connected DoRA loader${count === 1 ? "" : "s"}.` : "No connected DoRA loader found.";
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: [summary, ...notes].join(" "), renameSaves });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: [summary, ...notes].join(" "), loaderSaves });
     }),
     makeButton("Apply connected loaders", () => {
       const controlledLoaders = getControlledNodes(node).filter(isDoraLoaderNode);
@@ -5834,13 +5844,12 @@ function maybeInjectWidgetInput(nodeData) {
   nodeData.input.required = { ...required, [CUSTOM_WIDGET_INPUT]: [CUSTOM_WIDGET_TYPE, {}] };
 }
 
-// Lets a loader record which preset its State slot belonged to when renamed:
-// the selected character of the single State Manager that manages it.
-globalThis.__doraStateManagerLoaderSelectionApi = {
-  selectedCharacterIdForLoader(loader) {
-    const owners = [...stateLibraryClient.nodes].filter((managerNode) => getManagedLoaderNodes(managerNode).includes(loader));
-    if (owners.length !== 1) return "";
-    return String(widgetValue(getWidgets(owners[0]).characterWidget, "") || "");
+// Lets a loader tell whether a save made under its State slot rename is still
+// queued or in flight to the library.
+globalThis.__doraStateManagerLoaderSaveApi = {
+  hasPendingSave(renameId) {
+    const writes = [stateLibraryClient.inFlight, ...stateLibraryClient.pending].filter(Boolean);
+    return writes.some((write) => (write.loaderCommits || []).some((commit) => commit.id === renameId));
   },
 };
 

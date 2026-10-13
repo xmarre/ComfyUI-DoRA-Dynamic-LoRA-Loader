@@ -118,6 +118,9 @@ const WORKFLOW_A = {
     { stack_enabled: true, auto_strength_enabled: true, auto_strength_device: "cpu", auto_strength_ratio_floor: 0.4 },
   ),
 };
+// Workflow A's loader was saved into character A with this version, so it
+// carries that binding.
+WORKFLOW_A.loader.dora_state_binding = { characterId: "character-a", slot: "face" };
 const WORKFLOW_B = {
   loader: loaderProperties(
     "face",
@@ -237,7 +240,7 @@ function startSaveConnectedLoaders(manager, tab, characterId = "character-a") {
   manager.updateState(managerNode, state, managerNode.__dsm.uiState, {
     characterId,
     promptId: character.prompts[0].id,
-    renameSaves: result.renameSaves,
+    loaderSaves: result.loaderSaves,
     render: false,
   });
   return { result, written: manager.flushPendingLibraryWrites().catch(() => {}) };
@@ -669,4 +672,117 @@ test("a rename of unknown origin never consumes a same-named stack", async () =>
   await saveConnectedLoaders(manager, tab);
   assert.deepEqual(savedSlots(harness.library.characters), ["face"]);
   harness.leave(tab);
+});
+
+const otherCharacter = (slots) => ({
+  id: "character-b",
+  name: "Character B",
+  loader_stacks: slots.map((slot) => ({
+    slot,
+    label: slot,
+    loras: [{ enabled: true, name: `b-${slot}.safetensors`, strength_model: 0.9, strength_clip: 0.7 }],
+    loader_globals: {},
+  })),
+  prompts: [{ id: "prompt-b", name: "Prompt B", positive: "b", negative: "", settings: {} }],
+});
+const characterStacks = (characters, id) => JSON.stringify(characters.find((character) => character.id === id).loader_stacks);
+const selectPreset = (manager, tab, characterId, promptId) => {
+  const state = structuredClone(tab.managerNode.__dsm.state);
+  manager.updateState(tab.managerNode, state, tab.managerNode.__dsm.uiState, { characterId, promptId, render: false });
+};
+
+test("selecting a preset never makes it the owner of a loader's renamed slot", async () => {
+  for (const workflow of ["bound to A", "unbound"]) {
+    const extensions = await loadExtensions();
+    const { manager } = extensions;
+    const harness = makeHarness(extensions, { revision: 1, characters: [presetCharacter(), otherCharacter(["face"])], putOutcomes: [] });
+    const fixture = structuredClone(WORKFLOW_A);
+    if (workflow === "unbound") delete fixture.loader.dora_state_binding;
+    const tab = await harness.open(fixture);
+    const bBefore = characterStacks(harness.library.characters, "character-b");
+    const aBefore = characterStacks(harness.library.characters, "character-a");
+
+    selectPreset(manager, tab, "character-b", "prompt-b");
+    renameSlot(tab.loader, "hair");
+    const loaderBefore = JSON.stringify(tab.loader.properties);
+    const intoB = await saveConnectedLoaders(manager, tab, "character-b");
+    assert.equal(intoB.saved, 0, workflow);
+    assert.match(intoB.notes[0], /Not saved/, workflow);
+    assert.equal(characterStacks(harness.library.characters, "character-b"), bBefore, `${workflow}: B's face stack is untouched`);
+    assert.equal(JSON.stringify(tab.loader.properties), loaderBefore, workflow);
+
+    selectPreset(manager, tab, "character-a", "prompt-a");
+    const intoA = await saveConnectedLoaders(manager, tab, "character-a");
+    if (workflow === "bound to A") {
+      assert.deepEqual(savedSlots(harness.library.characters), ["hair"], "the bound preset still moves its own stack");
+      assert.equal(renameOf(tab.loader), undefined);
+    } else {
+      assert.match(intoA.notes[0], /cannot tell/, "an unbound loader cannot claim A's face either");
+      assert.equal(characterStacks(harness.library.characters, "character-a"), aBefore);
+    }
+    assert.equal(characterStacks(harness.library.characters, "character-b"), bBefore, workflow);
+    harness.leave(tab);
+  }
+});
+
+test("an unbound loader binds through an explicit save, then renames normally", async () => {
+  const extensions = await loadExtensions();
+  const { manager } = extensions;
+  const harness = makeHarness(extensions);
+  const fixture = structuredClone(WORKFLOW_A);
+  delete fixture.loader.dora_state_binding;
+  const tab = await harness.open(fixture);
+
+  await saveConnectedLoaders(manager, tab);
+  assert.deepEqual(tab.loader.properties.dora_state_binding, { characterId: "character-a", slot: "face" });
+  renameSlot(tab.loader, "hair");
+  await saveConnectedLoaders(manager, tab);
+  assert.deepEqual(savedSlots(harness.library.characters), ["hair"]);
+  assert.deepEqual(tab.loader.properties.dora_state_binding, { characterId: "character-a", slot: "hair" });
+  harness.leave(tab);
+});
+
+test("after a rejected rename save, applying another preset or renaming back lets the loader save there", async () => {
+  for (const recovery of ["apply B", "rename back"]) {
+    const extensions = await loadExtensions();
+    const { manager } = extensions;
+    const bSlots = recovery === "apply B" ? ["hair"] : ["face"];
+    const harness = makeHarness(extensions, { revision: 1, characters: [presetCharacter(), otherCharacter(bSlots)], putOutcomes: [] });
+    const tab = await harness.open(WORKFLOW_A);
+    const aBefore = characterStacks(harness.library.characters, "character-a");
+
+    renameSlot(tab.loader, "hair");
+    harness.library.putOutcomes.push("conflict");
+    await saveConnectedLoaders(manager, tab);
+    await manager.reloadStateLibrary(tab.managerNode);
+    assert.equal(renameOf(tab.loader)?.savedToIn, "character-a");
+
+    selectPreset(manager, tab, "character-b", "prompt-b");
+    if (recovery === "apply B") {
+      const characterB = tab.managerNode.__dsm.state.characters.find((item) => item.id === "character-b");
+      assert.equal(manager.syncCharacterLoaderStacksToConnectedNodes(tab.managerNode, characterB), 1);
+      assert.equal(renameOf(tab.loader), undefined, "the explicit apply settles the obsolete rename");
+      assert.deepEqual(tab.loader.properties.dora_state_binding, { characterId: "character-b", slot: "hair" });
+      assert.deepEqual(tab.loader.properties.dora_power_lora.rows.map((row) => row.name), ["b-hair.safetensors"]);
+    } else {
+      renameSlot(tab.loader, "face");
+    }
+    tab.loader.properties.dora_power_lora.rows[0].strengthModel = 0.25;
+    tab.loader._doraRows = tab.loader.properties.dora_power_lora.rows;
+
+    const intoB = await saveConnectedLoaders(manager, tab, "character-b");
+    assert.deepEqual(intoB.notes, [], recovery);
+    const slot = recovery === "apply B" ? "hair" : "face";
+    assert.deepEqual(savedSlots(harness.library.characters, "character-b"), [slot], recovery);
+    assert.equal(savedStack(harness.library.characters, slot, "character-b").loras[0].strength_model, 0.25, `${recovery}: B is updated`);
+    assert.equal(characterStacks(harness.library.characters, "character-a"), aBefore, `${recovery}: A is unchanged`);
+
+    if (recovery === "rename back") {
+      selectPreset(manager, tab, "character-a", "prompt-a");
+      await saveConnectedLoaders(manager, tab, "character-a");
+      assert.deepEqual(savedSlots(harness.library.characters), ["face"], "A's own rename resolves back onto face");
+      assert.equal(renameOf(tab.loader), undefined);
+    }
+    harness.leave(tab);
+  }
 });
