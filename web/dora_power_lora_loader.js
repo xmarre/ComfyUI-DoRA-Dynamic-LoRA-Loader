@@ -590,6 +590,12 @@ function clearSlotRename(node) {
   if (node?.properties) delete node.properties[SLOT_RENAME_PROPERTY];
 }
 
+// Applying a preset settles a rename unless a save made under it is still
+// unconfirmed; that save's record is needed if its write is rejected.
+function settleSlotRenameOnApply(node) {
+  if (!getSlotRename(node)?.savedTo) clearSlotRename(node);
+}
+
 function renameStateSlot(node, value) {
   const current = getStateSlot(node);
   const slot = setStateSlot(node, value);
@@ -754,7 +760,7 @@ function installGlobalStateApi() {
       if (externalState && Object.prototype.hasOwnProperty.call(externalState, "slot")) {
         setStateSlot(node, externalState.slot);
       }
-      clearSlotRename(node);
+      settleSlotRenameOnApply(node);
       setState(node, next);
       node._doraRows = next.rows;
       node._doraGlobals = next.globals;
@@ -791,7 +797,7 @@ function installGlobalStateApi() {
     },
     setSlot(node, value) {
       const slot = setStateSlot(node, value);
-      clearSlotRename(node);
+      settleSlotRenameOnApply(node);
       try { rebuild(node); } catch (_) {}
       node?.setDirtyCanvas?.(true, true);
       node?.graph?.change?.();

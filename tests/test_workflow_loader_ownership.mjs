@@ -547,3 +547,27 @@ test("a renamed loader never overwrites a different stack when its previous slot
   assert.equal(renameOf(tab.loader)?.from, "new");
   harness.leave(tab);
 });
+
+test("applying a preset while a renamed loader's save is in flight keeps the rename if that write is rejected", async () => {
+  const extensions = await loadExtensions();
+  const { manager } = extensions;
+  const harness = makeHarness(extensions);
+  const tab = await harness.open(WORKFLOW_A);
+
+  renameSlot(tab.loader, "hair");
+  let release;
+  harness.library.putOutcomes.push({ deferred: new Promise((resolve) => { release = resolve; }), then: "conflict" });
+  const pendingSave = saveConnectedLoaders(manager, tab);
+  const localCharacter = tab.managerNode.__dsm.state.characters.find((item) => item.id === "character-a");
+  assert.equal(manager.syncCharacterLoaderStacksToConnectedNodes(tab.managerNode, localCharacter), 1);
+  assert.equal(renameOf(tab.loader)?.savedTo, "hair", "the unconfirmed save record survives the apply");
+  release();
+  await pendingSave;
+
+  assert.deepEqual(savedSlots(harness.library.characters), ["face"]);
+  await manager.reloadStateLibrary(tab.managerNode);
+  await saveConnectedLoaders(manager, tab);
+  assert.deepEqual(savedSlots(harness.library.characters), ["hair"]);
+  assert.equal(renameOf(tab.loader), undefined);
+  harness.leave(tab);
+});
