@@ -1472,6 +1472,8 @@ test("connected loader edits replace the selected State Manager stack immediatel
           auto_strength_device: "cpu",
           auto_strength_ratio_floor: 0.44,
           auto_strength_ratio_ceiling: 1.91,
+          auto_strength_residual_beta: 0.35,
+          auto_strength_depth_trend: 0.6,
         },
       };
     },
@@ -1491,6 +1493,8 @@ test("connected loader edits replace the selected State Manager stack immediatel
     assert.equal(savedStack.loader_globals.auto_strength_device, "cpu");
     assert.equal(savedStack.loader_globals.auto_strength_ratio_floor, 0.44);
     assert.equal(savedStack.loader_globals.auto_strength_ratio_ceiling, 1.91);
+    assert.equal(savedStack.loader_globals.auto_strength_residual_beta, 0.35);
+    assert.equal(savedStack.loader_globals.auto_strength_depth_trend, 0.6);
     assert.equal(savedStack.loras[0].name, "h3-character.safetensors");
     assert.equal(savedStack.loras[0].strength_model, 0.82);
     assert.equal(savedStack.loras[0].strength_clip, 0.61);

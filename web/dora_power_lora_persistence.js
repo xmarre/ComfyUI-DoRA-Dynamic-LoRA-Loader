@@ -15,6 +15,8 @@ const GLOBAL_WIDGET_KEYS = [
   "auto_strength_device",
   "auto_strength_ratio_floor",
   "auto_strength_ratio_ceiling",
+  "auto_strength_residual_beta",
+  "auto_strength_depth_trend",
   "dora_decompose_debug",
   "dora_decompose_debug_n",
   "dora_decompose_debug_stack_depth",
