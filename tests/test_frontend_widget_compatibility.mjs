@@ -232,3 +232,92 @@ test("frontend normalization and rebuilds preserve live DoRA custom widget behav
     cleanup();
   }
 });
+
+
+function makeConfigurableNodeType() {
+  const NodeType = makeNodeType();
+  NodeType.prototype.configure = function (info) {
+    for (const [key, value] of Object.entries(info?.properties || {})) this.properties[key] = value;
+  };
+  return NodeType;
+}
+
+function legacyRowsOf(node) {
+  return node.properties.dora_power_lora.rows.map((row) => ({ ...row }));
+}
+
+const LEGACY_ROWS = [
+  { enabled: true, name: "face.safetensors", strengthModel: 0.7, strengthClip: 0.6 },
+  { enabled: false, name: "style.safetensors", strengthModel: 1.25, strengthClip: 0.5 },
+];
+const LEGACY_GLOBALS = { stack_enabled: false, verbose: true, log_unloaded_keys: false };
+const rowValues = (row) => [row.enabled, row.name, row.strengthModel, row.strengthClip];
+const legacyGlobalValues = [false, true, false];
+
+// Widget-only workflows came from the first two loader builds, saved by
+// frontends that either skipped non-serialized buttons or kept null holes.
+const LEGACY_WIDGET_FIXTURES = {
+  "compact rows": [...LEGACY_ROWS.flatMap(rowValues), ...legacyGlobalValues],
+  "first build with button holes": [...LEGACY_ROWS.flatMap((row) => [...rowValues(row), null]), null, ...legacyGlobalValues],
+  "second build with button holes": [null, ...LEGACY_ROWS.flatMap((row) => [...rowValues(row), null]), null, ...legacyGlobalValues],
+};
+
+test("legacy widget-only workflows survive configure, serialize, and reopen", async () => {
+  const { cleanup, extension } = await loadLoaderExtension();
+  try {
+    const NodeType = makeConfigurableNodeType();
+    await extension.beforeRegisterNodeDef(NodeType, { display_name: NODE_CLASS, name: NODE_CLASS });
+
+    for (const [label, widgetsValues] of Object.entries(LEGACY_WIDGET_FIXTURES)) {
+      const node = new NodeType();
+      node.properties = {};
+      node.configure({ properties: {}, widgets_values: structuredClone(widgetsValues) });
+      assert.deepEqual(legacyRowsOf(node), LEGACY_ROWS, label);
+      for (const [key, value] of Object.entries(LEGACY_GLOBALS)) {
+        assert.equal(node.properties.dora_power_lora.globals[key], value, `${label}: ${key}`);
+      }
+
+      const serialized = { properties: structuredClone(node.properties) };
+      node.onSerialize(serialized);
+      assert.deepEqual(serialized.widgets_values, [], label);
+
+      const reopened = new NodeType();
+      reopened.properties = {};
+      reopened.configure(JSON.parse(JSON.stringify(serialized)));
+      assert.deepEqual(legacyRowsOf(reopened), LEGACY_ROWS, `${label} after reopen`);
+      assert.deepEqual(reopened.properties.dora_power_lora.globals, node.properties.dora_power_lora.globals, `${label} after reopen`);
+      assert.equal(reopened.properties.dora_power_lora_unrecognized_widgets_values, undefined, label);
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test("unrecognized legacy widget values are kept instead of being reinterpreted", async () => {
+  const { cleanup, extension } = await loadLoaderExtension();
+  const previousWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const NodeType = makeConfigurableNodeType();
+    await extension.beforeRegisterNodeDef(NodeType, { display_name: NODE_CLASS, name: NODE_CLASS });
+
+    // One row followed by seven settings: no loader build wrote this, and the
+    // old decoder misread it as two rows plus three toggles.
+    const unknown = [true, "face.safetensors", 0.7, 0.7, false, false, false, true, 30, 10, true];
+    const node = new NodeType();
+    node.properties = {};
+    node.configure({ properties: {}, widgets_values: structuredClone(unknown) });
+    assert.deepEqual(node.properties.dora_power_lora.rows.map((row) => row.name), ["None"]);
+    assert.deepEqual(node.properties.dora_power_lora_unrecognized_widgets_values, unknown);
+
+    const serialized = { properties: structuredClone(node.properties) };
+    node.onSerialize(serialized);
+    const reopened = new NodeType();
+    reopened.properties = {};
+    reopened.configure(JSON.parse(JSON.stringify(serialized)));
+    assert.deepEqual(reopened.properties.dora_power_lora_unrecognized_widgets_values, unknown);
+  } finally {
+    console.warn = previousWarn;
+    cleanup();
+  }
+});

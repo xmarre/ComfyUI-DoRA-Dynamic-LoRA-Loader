@@ -9,6 +9,12 @@ This release makes each DoRA Power LoRA Loader's rows and settings belong to its
 - Opening a workflow no longer captures loader state into a newly materialized preset when the State Manager is on the built-in default selection.
 - Legacy embedded State Manager libraries are still imported automatically on load; the import no longer rewrites connected loaders.
 - Clicking a character tile, **Load connected**, **Apply selected**, **Apply connected loaders**, and State Manager LoRA tab edits still copy the preset's stacks into connected loaders.
+- A loader's State slot rename is remembered until the next save or preset application. **Save connected**, **Save selected**, and **Save connected loaders** move the renamed loader's saved stack to its new slot; when the new slot already holds another saved stack, the loader stays on its previous slot and the status reports it instead of overwriting that stack.
+
+## Legacy widget-only workflows
+
+- Workflows saved before the loader stored its state in node properties are decoded only against the two layouts those builds wrote (with or without placeholders for button widgets), and every field is type-checked. A one-row layout with extra settings is no longer misread as two rows.
+- Values that match no known layout load as a default loader and are kept in the workflow under `properties.dora_power_lora_unrecognized_widgets_values` instead of being discarded.
 
 ## Execution
 
