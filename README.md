@@ -93,23 +93,25 @@ then enabling auto-strength is a true no-op.
 
 ### Current auto-strength behavior
 
-- scores ordinary LoRA with absolute `RMS(ΔW)` after LoRA alpha/rank scaling
+- scores ordinary LoRA with `RMS(ΔW)` after LoRA alpha/rank scaling
 - scores DoRA with the RMS of its actual post-normalization weight update
+- for linear destinations, converts that RMS into the update's output gain for unit-RMS input, `RMS(ΔW) * sqrt(fan_in)`, so projections with different input widths are compared on one scale
 - separates model and CLIP and keeps tensor families isolated
 - infers repeated-block projection roles structurally from mapped destination paths; there is no MiniMax-H3 role table
 - derives linear cohort shape from the adapter's logical update matrix when possible, so packed/quantized checkpoint storage does not split an otherwise identical role
-- retains the legacy broad **family arithmetic reference** across eligible linear logical sources
+- uses a broad **family geometric-mean reference** across eligible linear logical sources
+- excludes linear updates whose element count cannot match their dense destination (ComfyUI skips those patches), so they never shift the references used for other layers
 - for ordered repeated-block roles, builds a robust **local depth reference** with a centered 7-member moving log-median
 - applies `family_reference / local_depth_reference` as the robust regional baseline, so a coherently weak depth region can still receive the large boosts that made the original Auto-strength useful
 - restores a configurable fraction of the remaining per-layer residual in log space: `final_gain = depth_gain * (local_depth_reference / layer_score)^β`
 - exposes **Auto-strength residual β** in the node and State Manager, clamped to `0…1`, with default `0.50`
-- `β = 0` reproduces the local-depth-only behavior; `β = 1` reproduces the original direct family/per-layer gain; intermediate values are geometric/log-space blends rather than linear ratio interpolation
-- uses one role-wide arithmetic-mean gain only as a fallback when a reliable depth profile cannot be inferred
+- `β = 0` is the local-depth-only behavior; `β = 1` is the direct family/per-layer gain; intermediate values are geometric/log-space blends rather than linear ratio interpolation
+- uses one role-wide geometric-mean gain only as a fallback when a reliable depth profile cannot be inferred
 - isolated statistical outliers are promoted to residual exponent `1.0` regardless of β, preserving the conservative full correction already used for a single clearly broken member
 - multiple anomaly candidates suppress only the isolated-member correction; they do not suppress coherent depth redistribution
 - requires at least five ordered logical sources for depth profiling and at least five for isolated-outlier inference
 - leaves unclassifiable linear destinations at their normal global strength
-- preserves arithmetic-mean redistribution for non-linear families such as convolution cohorts
+- preserves absolute-RMS, arithmetic-mean redistribution for non-linear families such as convolution cohorts
 - keeps Flux / Flux2 compat-broadcasted logical sources from being over-counted during measurement
 - preserves the normal outer patch strength during final application
 - `auto` resolves to CPU-safe analysis
@@ -126,10 +128,26 @@ The current policy keeps the original family target but estimates a robust local
 inside each semantic role. It then restores a controlled fraction of the remaining
 layer-to-layer residual in multiplicative/log space. This makes the behavior explicitly
 testable between the two useful endpoints instead of hard-coding another smoothing
-choice: β=0 is the current regional correction, β=1 is the old direct per-layer
-correction, and the default β=0.5 is their geometric midpoint for ordinary members.
+choice: β=0 is the regional correction, β=1 is the direct per-layer correction, and
+the default β=0.5 is their geometric midpoint for ordinary members.
 
-Ordinary LoRA scoring remains independent of destination weight numeric values.
+Two properties keep linear redistribution from reshaping a balanced adapter:
+
+- **Input-width neutrality.** For a fixed effect on a projection's output, the element
+  RMS of `ΔW` scales with `1/sqrt(fan_in)`. Comparing raw element RMS across roles
+  therefore treats wide-input projections (for example an MLP down-projection with a
+  2.7× wider input than the attention projections) as systematically weak and
+  narrow-input projections (for example AdaLN modulation projections) as
+  systematically strong, independent of how the adapter was trained. The output-gain
+  score removes that bias. Within one role every member has the same shape, so depth
+  redistribution inside a role is unchanged by it.
+- **Gain neutrality.** With the geometric family reference, the unclamped per-layer
+  gains multiply to 1 across the family, so redistribution does not strengthen or
+  weaken the adapter overall. An arithmetic-mean reference raises the average gain
+  above 1, increasingly so the wider the spread of scores.
+
+Ordinary LoRA scoring remains independent of destination weight numeric values; the
+output-gain conversion uses only the update's shape.
 A base-relative score such as `RMS(ΔW) / RMS(W0)` would make the same LoRA
 redistribute differently across base checkpoints. DoRA remains the exception because
 its update is defined by normalization against the live effective destination weight.

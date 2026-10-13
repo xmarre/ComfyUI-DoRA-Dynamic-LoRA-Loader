@@ -1929,6 +1929,7 @@ _AUTO_STRENGTH_LINEAR_ROLE_MIN_SAMPLE = 2
 _AUTO_STRENGTH_LINEAR_DEPTH_MIN_SAMPLE = 5
 _AUTO_STRENGTH_LINEAR_DEPTH_WINDOW = 7
 _AUTO_STRENGTH_LINEAR_RESIDUAL_BETA = 0.50
+_AUTO_STRENGTH_LINEAR_SCORING_BASIS = "fan_in_normalized_update_rms"
 _AUTO_STRENGTH_LINEAR_MAD_Z = 3.5
 _AUTO_STRENGTH_LINEAR_MIN_FACTOR = 1.5
 _AUTO_STRENGTH_LINEAR_MAX_CANDIDATES = 1
@@ -3492,6 +3493,89 @@ def _auto_strength_projection_metadata(
     return result
 
 
+def _auto_strength_fan_in(shape: Any) -> Optional[int]:
+    """Return the input width of a matrix-shaped update (``numel / out_features``)."""
+    try:
+        dims = [int(dim) for dim in shape]
+    except Exception:
+        return None
+    if len(dims) < 2 or dims[0] <= 0:
+        return None
+    numel = 1
+    for dim in dims:
+        numel *= dim
+    fan_in = numel // dims[0]
+    return fan_in if fan_in > 0 else None
+
+
+def _auto_strength_shape_text_numel(shape_text: Optional[str]) -> Optional[int]:
+    try:
+        dims = [int(dim) for dim in str(shape_text).split("x")]
+    except Exception:
+        return None
+    if not dims or any(dim <= 0 for dim in dims):
+        return None
+    numel = 1
+    for dim in dims:
+        numel *= dim
+    return numel
+
+
+def _auto_strength_update_cannot_apply(
+    weight: Optional[torch.Tensor],
+    logical_shape: Optional[str],
+    shape_source: Optional[str],
+) -> bool:
+    """Return True when an adapter update provably cannot be patched onto its destination.
+
+    ComfyUI reshapes a LoRA/diff update to the destination shape and skips the patch
+    when the element counts differ (for example full-width AdaLN LoRAs on checkpoints
+    whose AdaLN projection was reduced to a small basis). Such updates have no effect
+    on the model and must not shift the references used for other layers.
+
+    Only plain dense floating-point destinations are checked. Quantized or packed
+    storage may report a physical shape that differs from the logical one. Callers
+    must not use this for adapters carrying ``.reshape_weight`` metadata, which makes
+    ComfyUI pad the destination to the update shape instead of skipping it.
+    """
+    if shape_source != "adapter_update":
+        return False
+    if type(weight) not in (torch.Tensor, torch.nn.Parameter):
+        return False
+    try:
+        if not weight.dtype.is_floating_point:
+            return False
+        destination_numel = int(weight.numel())
+    except Exception:
+        return False
+    update_numel = _auto_strength_shape_text_numel(logical_shape)
+    if update_numel is None or destination_numel <= 0:
+        return False
+    return update_numel != destination_numel
+
+
+def _auto_strength_log_mean(values: Iterable[float]) -> Optional[float]:
+    """Return the geometric mean of positive magnitude scores.
+
+    Used as a redistribution reference, it makes the unclamped gains ``reference /
+    score`` multiply to exactly 1 across the reference members, so redistribution
+    neither strengthens nor weakens the adapter as a whole. An arithmetic-mean
+    reference does not have that property: by Jensen's inequality the mean gain
+    exceeds 1 and grows with the spread of scores.
+    """
+    logs: List[float] = []
+    for value in values:
+        try:
+            value_f = float(value)
+        except Exception:
+            continue
+        if value_f > _AUTO_STRENGTH_EPS and math.isfinite(value_f):
+            logs.append(math.log(value_f))
+    if not logs:
+        return None
+    return float(math.exp(sum(logs) / len(logs)))
+
+
 def _auto_strength_log_median(values: Iterable[float]) -> Optional[float]:
     """Return a robust multiplicative center for positive magnitude scores."""
     logs: List[float] = []
@@ -3742,6 +3826,7 @@ def _auto_strength_measure_base_delta_on_device(
     analysis_device: Optional[torch.device],
     current_model: Any = None,
     current_clip: Any = None,
+    fan_in_normalize: bool = False,
 ) -> Optional[float]:
     """
     Return a comparable magnitude score for a single base's update.
@@ -3756,10 +3841,26 @@ def _auto_strength_measure_base_delta_on_device(
     which over-boosts smaller spatial layers in mixed architectures like SDXL. We
     therefore compare RMS update magnitude (scaled Frobenius / sqrt(numel)).
 
+    With ``fan_in_normalize`` every matrix term is reported as its output RMS gain
+    for unit-RMS input, ``RMS(delta) * sqrt(fan_in)``. Element RMS alone is not
+    comparable across projections with different input widths: a delta with the
+    same per-output effect has an element RMS proportional to ``1/sqrt(fan_in)``,
+    so wide-input projections (for example MLP down-projections) would otherwise
+    always look weak and narrow-input ones (for example AdaLN projections) strong.
+    Vector terms (``.diff_b``) are already output-space quantities and stay as-is.
+
     Returns None when the base has no measurable linear delta representation.
     """
     prefix = base + "."
     direct_norms: List[float] = []
+
+    def _output_gain(value: Optional[float], shape: Any) -> Optional[float]:
+        if value is None or not fan_in_normalize:
+            return value
+        fan_in = _auto_strength_fan_in(shape)
+        if fan_in is None:
+            return value
+        return float(value) * math.sqrt(float(fan_in))
     dora_scale = lora_sd.get(base + ".dora_scale")
     has_dora = isinstance(dora_scale, torch.Tensor)
     dest_weight = None
@@ -3782,11 +3883,11 @@ def _auto_strength_measure_base_delta_on_device(
         if has_dora and isinstance(dest_weight, torch.Tensor):
             dora_rms = _auto_strength_measure_dora_effect(dest_weight, tensor, dora_scale, analysis_device=analysis_device)
             if dora_rms is not None:
-                direct_norms.append(dora_rms)
+                direct_norms.append(_output_gain(dora_rms, tensor.shape))
                 continue
         rms = _auto_strength_tensor_rms(tensor, analysis_device=analysis_device)
         if rms is not None:
-            direct_norms.append(rms)
+            direct_norms.append(_output_gain(rms, tensor.shape))
 
     for up_suffix, down_suffix in _LORA_DIRECTION_SUFFIX_PAIRS:
         up = lora_sd.get(base + up_suffix)
@@ -3835,12 +3936,12 @@ def _auto_strength_measure_base_delta_on_device(
         if has_dora and isinstance(dest_weight, torch.Tensor):
             dora_rms = _auto_strength_measure_dora_effect(dest_weight, delta, dora_scale, analysis_device=analysis_device)
             if dora_rms is not None:
-                direct_norms.append(dora_rms)
+                direct_norms.append(_output_gain(dora_rms, delta.shape))
                 continue
 
         delta_rms = _auto_strength_tensor_rms(delta, analysis_device=analysis_device)
         if delta_rms is not None:
-            direct_norms.append(delta_rms)
+            direct_norms.append(_output_gain(delta_rms, delta.shape))
 
     if not direct_norms:
         # Best-effort fallback for exotic exports that still expose one-side linear tensors.
@@ -3870,6 +3971,7 @@ def _auto_strength_measure_base_delta(
     verbose: bool = False,
     current_model: Any = None,
     current_clip: Any = None,
+    fan_in_normalize: bool = False,
 ) -> Optional[float]:
     dest_weight = _auto_strength_get_destination_weight(base, key_map, model_state_dict, clip_state_dict)
     analysis_device = _auto_strength_resolve_analysis_device(analysis_device_mode, analysis_load_device, dest_weight)
@@ -3883,6 +3985,7 @@ def _auto_strength_measure_base_delta(
             analysis_device=analysis_device,
             current_model=current_model,
             current_clip=current_clip,
+            fan_in_normalize=fan_in_normalize,
         )
     except _AutoStrengthAnalysisDeviceError:
         if analysis_device is None or analysis_device.type == "cpu":
@@ -3902,6 +4005,7 @@ def _auto_strength_measure_base_delta(
             analysis_device=torch.device("cpu"),
             current_model=current_model,
             current_clip=current_clip,
+            fan_in_normalize=fan_in_normalize,
         )
 
 
@@ -3927,13 +4031,18 @@ def _auto_strength_analyze_base_targets(
 
     Linear adapters use two independent layers of inference:
 
-    1. Role redistribution projects the legacy broad family equalization onto one
-       uniform gain per structural role/shape/slice cohort. The arithmetic mean of
-       each role is moved toward the legacy family arithmetic reference while every
-       within-role block-to-block ratio is preserved.
+    1. Depth redistribution moves each role's local depth trend (centered moving
+       log-median) toward the family reference, the geometric mean of fan-in
+       normalized output-gain scores across eligible linear logical sources, and
+       restores ``residual_beta`` of each member's remaining per-layer residual in
+       log space. Without an ordered depth profile one uniform role gain (family
+       over role geometric mean) is used instead.
     2. A conservative log-median/MAD gate may additionally correct one isolated
        member inside a role. Coherent tails or multimodal depth regimes are never
        flattened by this secondary correction.
+
+    Linear updates that cannot be patched onto their dense destination are excluded
+    from every reference and keep the global strength.
 
     Model/CLIP groups, logical fanout, tensor families, sliced mappings, outer patch
     strength, LoRA alpha semantics, and DoRA post-normalization measurement remain
@@ -3953,6 +4062,8 @@ def _auto_strength_analyze_base_targets(
     base_cohorts: Dict[str, Tuple[str, str, str]] = {}
     base_metadata: Dict[str, Dict[str, Any]] = {}
     base_measurement_kinds: Dict[str, str] = {}
+    base_scoring_bases: Dict[str, str] = {}
+    unapplicable_bases: Set[str] = set()
     base_norms: Dict[str, float] = {}
     base_logical_ids: Dict[str, str] = {}
     base_logical_scales: Dict[str, float] = {}
@@ -3982,6 +4093,13 @@ def _auto_strength_analyze_base_targets(
                 destination_shape=logical_shape,
                 destination_shape_source=shape_source,
             )
+            if (
+                (base + ".reshape_weight") not in lora_sd
+                and _auto_strength_update_cannot_apply(dest_weight, logical_shape, shape_source)
+            ):
+                unapplicable_bases.add(base)
+                metadata["cohort_eligible"] = False
+                metadata["fallback_reason"] = "destination_shape_mismatch"
         else:
             dest, sl = _unwrap_key_map_target(key_map.get(base))
             metadata = {
@@ -4004,6 +4122,9 @@ def _auto_strength_analyze_base_targets(
             "dora_post_normalization_update_rms"
             if isinstance(lora_sd.get(base + ".dora_scale"), torch.Tensor)
             else "update_rms"
+        )
+        base_scoring_bases[base] = (
+            _AUTO_STRENGTH_LINEAR_SCORING_BASIS if family == "linear" else "absolute_update_rms"
         )
         global_strength = float(strength_model if group == "model" else strength_clip)
         targets[base] = global_strength
@@ -4031,6 +4152,10 @@ def _auto_strength_analyze_base_targets(
 
         logical_members.setdefault(logical_key, []).append(base)
 
+        if base in unapplicable_bases:
+            # ComfyUI will skip this patch; it must not influence any reference.
+            continue
+
         norm = _auto_strength_measure_base_delta(
             lora_sd=lora_sd,
             base=base,
@@ -4042,6 +4167,7 @@ def _auto_strength_analyze_base_targets(
             verbose=verbose,
             current_model=current_model,
             current_clip=current_clip,
+            fan_in_normalize=(family == "linear"),
         )
         if norm is None or not math.isfinite(float(norm)) or not (norm > _AUTO_STRENGTH_EPS):
             continue
@@ -4086,11 +4212,7 @@ def _auto_strength_analyze_base_targets(
             cohort_anomaly_references[cohort] = anomaly_model.get("reference")
             cohort_reference_statistics[cohort] = "log_median"
 
-            role_reference = (
-                float(sum(logical_vals) / len(logical_vals))
-                if logical_vals
-                else None
-            )
+            role_reference = _auto_strength_log_mean(logical_vals)
             role_eligible = (
                 cohort_is_eligible
                 and role_reference is not None
@@ -4154,9 +4276,7 @@ def _auto_strength_analyze_base_targets(
 
     family_references: Dict[Tuple[str, str], Optional[float]] = {}
     for family_key, values in family_values.items():
-        family_references[family_key] = (
-            float(sum(values) / len(values)) if values else None
-        )
+        family_references[family_key] = _auto_strength_log_mean(values)
 
     cohort_role_gains: Dict[Tuple[str, str, str], Optional[float]] = {}
     cohort_role_gain_reasons: Dict[Tuple[str, str, str], Optional[str]] = {}
@@ -4344,12 +4464,14 @@ def _auto_strength_analyze_base_targets(
                     int(model.get("candidate_limit", 0)) if is_linear else None
                 ),
                 "corrected_logical_count": len(model.get("candidate_ids", set())) if is_linear else len(model.get("candidate_ids", set())),
-                "scoring_basis": "absolute_update_rms",
+                "scoring_basis": (
+                    _AUTO_STRENGTH_LINEAR_SCORING_BASIS if is_linear else "absolute_update_rms"
+                ),
                 "reference_statistic": cohort_reference_statistics.get(cohort),
                 "reference_score": _auto_strength_safe_number(anomaly_reference),
-                "role_reference_statistic": "arithmetic_mean" if is_linear else None,
+                "role_reference_statistic": "geometric_mean" if is_linear else None,
                 "role_reference_score": _auto_strength_safe_number(role_reference),
-                "family_reference_statistic": "arithmetic_mean" if is_linear else None,
+                "family_reference_statistic": "geometric_mean" if is_linear else None,
                 "family_reference_score": _auto_strength_safe_number(family_reference),
                 "role_gain_raw": _auto_strength_safe_number(role_gain),
                 "depth_profile_eligible": bool(depth_model.get("eligible")) if is_linear else None,
@@ -4416,7 +4538,9 @@ def _auto_strength_analyze_base_targets(
         fallback_reason = None
         anomaly_fallback_reason = None
 
-        if logical_norm is None or not (logical_norm > _AUTO_STRENGTH_EPS):
+        if members and all(base in unapplicable_bases for base in members):
+            fallback_reason = "destination_shape_mismatch"
+        elif logical_norm is None or not (logical_norm > _AUTO_STRENGTH_EPS):
             fallback_reason = "unmeasurable_update"
         elif family == "linear":
             if role_gain is None:
@@ -4521,8 +4645,14 @@ def _auto_strength_analyze_base_targets(
                     "destination_shape_source": base_meta.get("destination_shape_source"),
                     "destination_slice": base_meta.get("destination_slice"),
                     "measurement_kind": base_measurement_kinds.get(base, "update_rms"),
+                    "scoring_basis": base_scoring_bases.get(base, "absolute_update_rms"),
                     "norm": _auto_strength_safe_number(base_norms.get(base)),
-                    "update_rms": _auto_strength_safe_number(base_norms.get(base)),
+                    "score": _auto_strength_safe_number(base_norms.get(base)),
+                    "update_rms": (
+                        _auto_strength_safe_number(base_norms.get(base))
+                        if base_scoring_bases.get(base) == "absolute_update_rms"
+                        else None
+                    ),
                     "base_weight_rms": None,
                     "relative_perturbation": None,
                     "logical_scale": _auto_strength_safe_number(base_logical_scales.get(base, 1.0)),
@@ -4560,6 +4690,9 @@ def _auto_strength_analyze_base_targets(
         measurement_kinds = sorted(
             {base_measurement_kinds.get(base, "update_rms") for base in members}
         )
+        logical_scoring_basis = (
+            _AUTO_STRENGTH_LINEAR_SCORING_BASIS if family == "linear" else "absolute_update_rms"
+        )
         log_deviation = None
         if (
             logical_norm is not None
@@ -4595,10 +4728,14 @@ def _auto_strength_analyze_base_targets(
                 "measurement_kind": (
                     measurement_kinds[0] if len(measurement_kinds) == 1 else "mixed_update_rms"
                 ),
-                "scoring_basis": "absolute_update_rms",
+                "scoring_basis": logical_scoring_basis,
                 "fanout": len(members),
                 "measured_base_count": measured_base_count,
-                "update_rms": _auto_strength_safe_number(logical_norm),
+                "update_rms": (
+                    _auto_strength_safe_number(logical_norm)
+                    if logical_scoring_basis == "absolute_update_rms"
+                    else None
+                ),
                 "base_weight_rms": None,
                 "relative_perturbation": None,
                 "score": _auto_strength_safe_number(logical_norm),
@@ -4661,16 +4798,16 @@ def _auto_strength_analyze_base_targets(
         "kind": "dora_auto_strength_report",
         "analysis_device_mode": str(analysis_device_mode),
         "analysis_load_device": _auto_strength_describe_device(analysis_load_device),
-        "scoring_basis": "absolute_update_rms",
+        "scoring_basis": f"linear={_AUTO_STRENGTH_LINEAR_SCORING_BASIS};other=absolute_update_rms",
         "base_relative_scoring": False,
         "cohort_reference_policy": {
-            "repeated_block_linear": "family_arithmetic_local_depth_log_median_plus_single_outlier_gate",
+            "repeated_block_linear": "family_geometric_local_depth_log_median_plus_single_outlier_gate",
             "other_tensor_families": "arithmetic_mean",
         },
         "linear_cohorting": "repeated_block_semantic_role_logical_shape_and_slice",
         "linear_role_redistribution_policy": {
-            "family_reference": "arithmetic_mean_of_eligible_logical_sources",
-            "role_reference": "arithmetic_mean_fallback",
+            "family_reference": "geometric_mean_of_eligible_logical_sources",
+            "role_reference": "geometric_mean_fallback",
             "minimum_role_sample": _AUTO_STRENGTH_LINEAR_ROLE_MIN_SAMPLE,
             "fallback_gain": "family_reference_divided_by_role_reference",
         },
@@ -4711,6 +4848,7 @@ def _auto_strength_analyze_base_targets(
         "cohorts": cohorts_report,
         "logical_groups": logical_reports,
         "skipped_zero_strength_bases": sorted(skipped_zero_strength_bases),
+        "shape_mismatch_bases": sorted(unapplicable_bases),
         "unmeasured_bases": sorted(
             base
             for base in base_groups.keys()
@@ -4773,11 +4911,12 @@ def _auto_strength_analyze_base_targets(
             }
 
         _LOG.info(
-            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (%s/%s logical groups) (scoring=absolute_update_rms linear_policy=family_local_depth_plus_log_residual_hybrid family_references=%s cohorts=%s ratio_floor=%s ratio_ceiling=%s residual_beta=%s)",
+            "[DoRA Power LoRA Loader] auto-strength: measured %s/%s mapped bases (%s/%s logical groups) (scoring=%s linear_policy=family_local_depth_plus_log_residual_hybrid family_references=%s cohorts=%s ratio_floor=%s ratio_ceiling=%s residual_beta=%s)",
             measured,
             total,
             measured_logical,
             len(logical_members),
+            report["scoring_basis"],
             report["family_references"],
             cohort_summary,
             ratio_floor,
@@ -4786,7 +4925,7 @@ def _auto_strength_analyze_base_targets(
         )
         for item in logical_reports[:20]:
             _LOG.info(
-                "[DoRA Power LoRA Loader] auto-strength: logical=%s group=%s family=%s role=%s block=%s fanout=%s update_rms=%s role_reference=%s family_reference=%s role_gain=%s depth_reference=%s depth_gain=%s direct_gain=%s residual_beta=%s residual_exp=%s residual_gain=%s anomaly_gain=%s robust_z=%s outlier=%s corrected=%s ratio_raw=%s ratio_applied=%s target=%s decision=%s fallback=%s anomaly_fallback=%s",
+                "[DoRA Power LoRA Loader] auto-strength: logical=%s group=%s family=%s role=%s block=%s fanout=%s score=%s role_reference=%s family_reference=%s role_gain=%s depth_reference=%s depth_gain=%s direct_gain=%s residual_beta=%s residual_exp=%s residual_gain=%s anomaly_gain=%s robust_z=%s outlier=%s corrected=%s ratio_raw=%s ratio_applied=%s target=%s decision=%s fallback=%s anomaly_fallback=%s",
                 item.get("logical_id"),
                 item.get("group"),
                 item.get("family"),
@@ -5531,7 +5670,7 @@ def _auto_strength_report_line_for_group(item: Dict[str, Any]) -> str:
     return (
         f"    - {item.get('group')}/{item.get('family')}/{role} :: {logical_id} "
         f"(fanout={fanout}{block_text}, ratio={ratio_text}, target={target_text}, "
-        f"update_rms={norm_text}, cohort_{reference_statistic}={cohort_text}{decision_text}{fallback_text})"
+        f"score={norm_text}, cohort_{reference_statistic}={cohort_text}{decision_text}{fallback_text})"
     )
 
 
