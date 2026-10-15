@@ -140,6 +140,24 @@ def test_legacy_migration_keeps_an_existing_persistent_uuid_selection(configured
     assert prompt["id"] == selected["prompts"][0]["id"]
 
 
+def test_fixed_live_queue_seed_prevents_random_saved_seed_cache_invalidation(configured_nodes):
+    nodes = configured_nodes
+    character = persistent_character()
+    character["prompts"][0]["settings"]["seed"] = -1
+    nodes._get_state_manager_store().replace([character], 0)
+    args = (
+        json.dumps(nodes._state_manager_default_binding()),
+        json.dumps({"__dsm_runtime_seed": 444444}),
+        character["id"],
+        character["prompts"][0]["id"],
+    )
+    first = nodes.StateManager.IS_CHANGED(*args)
+    second = nodes.StateManager.IS_CHANGED(*args)
+    assert first == second
+    assert "runtime_seed_nonce" not in json.loads(first)
+    assert nodes.StateManager().resolve_state(*args)[6] == 444444
+
+
 def test_is_changed_returns_stable_marker_for_missing_preset(configured_nodes):
     nodes = configured_nodes
     marker = json.loads(nodes.StateManager.IS_CHANGED(

@@ -5226,16 +5226,19 @@ function serializeQueuedUiStateIdentity(uiState, characterId, promptId) {
   }, null, 0);
 }
 
-function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, queueIndex, total) {
+function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, _queueIndex, _total) {
+  // ComfyUI hashes literal inputs of every ancestor when deciding whether to
+  // reuse a sampler's cached result. Queue position and a per-request nonce do
+  // not describe generation state: changing only Video Combine would otherwise
+  // invalidate State Manager and every downstream sampler on every submission.
+  //
+  // The selected character/prompt IDs, tenant, and actual runtime seed DO
+  // describe the state; the backend additionally snapshots the resolved preset
+  // and library revision. Changes in those values legitimately invalidate the
+  // cache. A deliberately randomized seed still changes __dsm_runtime_seed.
   return JSON.stringify({
     ...safeJsonParse(serializeQueuedUiStateIdentity(uiState, characterId, promptId), {}),
     ...(runtimeSeed == null ? {} : { __dsm_runtime_seed: runtimeSeed }),
-    __dsm_queued_runtime_queue_index: Math.max(0, Number(queueIndex) || 0),
-    __dsm_queued_runtime_queue_total: Math.max(1, Number(total) || 1),
-    // The runtime override must differ per queued prompt even if the same prompt
-    // is selected again after a prompt-pool reshuffle. This prevents executor
-    // cache reuse from keeping a stale STATE_MANAGER_CONTROL payload alive.
-    __dsm_queued_runtime_nonce: `${Date.now()}:${Math.random()}:${queueIndex}`,
   }, null, 0);
 }
 
@@ -5537,15 +5540,23 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
       || uiState.queue_character_wildcard
       || uiState.queue_randomize_saved_seed
     );
+    // Even without queue wildcarding, the live, explicitly fixed State Manager
+    // Seed can override a saved -1/-2/-3 in the manager's preset. The backend
+    // IS_CHANGED key must use that effective seed, not regenerate a nonce from
+    // the now-irrelevant special saved seed on every postprocess-only queue.
+    const liveStateSeed = firstControlledStateSeed(node, promptPayload);
     if (!hasQueueOverrides) {
-      // Backend prompt handlers execute outside the originating HTTP request.
-      // Preserve the exact persistent-library tenant and selected preset in the
-      // request-local queue payload even for an ordinary queue.
+      // A resolved positive live seed is meaningful; queue it on the manager
+      // as well as the dedicated seed node. Other ordinary queues keep the
+      // stable tenant/selection identity; genuine special seeds remain random.
+      const queuedUiState = liveStateSeed
+        ? serializeQueuedUiStateOverride(uiState, character.id, prompt.id, liveStateSeed.seed, queueIndex, total)
+        : serializeQueuedUiStateIdentity(uiState, character.id, prompt.id);
       changed += setQueuedInput(
         promptPayload,
         node,
         UI_STATE_WIDGET,
-        serializeQueuedUiStateIdentity(uiState, character.id, prompt.id),
+        queuedUiState,
         { addIfMissing: true, syncWidget: false },
       );
       continue;
@@ -5553,7 +5564,6 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
 
     let payload = buildQueuedDoraStatePayload(character, prompt);
     let runtimeSeed = null;
-    const liveStateSeed = firstControlledStateSeed(node, promptPayload);
     if (liveStateSeed) {
       runtimeSeed = liveStateSeed.seed;
       payload = withRuntimeSeed(payload, runtimeSeed);

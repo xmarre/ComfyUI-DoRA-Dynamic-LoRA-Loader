@@ -973,6 +973,78 @@ test("ordinary queues preserve Impact links and carry request-local persistent i
 });
 
 
+test("ordinary queue honors a connected fixed State Manager Seed over saved -1 without cache misses", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const previousUser = helpers.stateLibraryClient.userId;
+  helpers.stateLibraryClient.userId = "cache-test-user";
+  const state = {
+    version: 3,
+    characters: [{
+      id: "character-a",
+      name: "Character",
+      prompts: [{ id: "prompt-a", name: "Prompt", positive: "unchanged", negative: "", settings: { seed: -1 } }],
+    }],
+  };
+  const manager = {
+    id: 1, type: "State Manager", comfyClass: "State Manager",
+    inputs: [], outputs: [{ name: "state_control", type: "STATE_MANAGER_CONTROL", links: [22] }],
+    widgets: [
+      { name: "state_json", value: helpers.serializeBinding() },
+      { name: "ui_state_json", value: helpers.serializeWorkflowUiState({}) },
+      { name: "selected_character_id", value: "character-a" },
+      { name: "selected_prompt_id", value: "prompt-a" },
+    ],
+    __dsm: { state, uiState: {} },
+  };
+  const seedNode = {
+    id: 2, type: "State Manager Seed", comfyClass: "State Manager Seed",
+    inputs: [{ name: "state_control", type: "STATE_MANAGER_CONTROL", link: 22 }],
+    outputs: [{ name: "SEED", type: "INT", links: [] }],
+    widgets: [{ name: "seed", value: 444444 }],
+  };
+  const nodes = [manager, seedNode];
+  const graph = {
+    _nodes: nodes,
+    links: { 22: { origin_id: 1, origin_slot: 7, target_id: 2, target_slot: 0 } },
+    getNodeById(id) { return nodes.find((node) => node.id === id) || null; },
+  };
+  nodes.forEach((node) => { node.graph = graph; });
+  helpers.app.graph = graph;
+  const queue = (seed) => ({
+    output: {
+      "1": { class_type: "StateManager", inputs: {
+        state_json: helpers.serializeBinding(),
+        ui_state_json: helpers.serializeWorkflowUiState({}),
+        selected_character_id: "character-a", selected_prompt_id: "prompt-a",
+      } },
+      "2": { class_type: "StateManagerSeed", inputs: { seed, state_control: ["1", 7] } },
+    },
+    workflow: { nodes: [] },
+  });
+  try {
+    const first = queue(444444);
+    assert.ok(helpers.mutatePromptForStateManagers(first, 0, 1) > 0);
+    const firstUi = first.output["1"].inputs.ui_state_json;
+    assert.equal(JSON.parse(firstUi).__dsm_runtime_seed, 444444);
+    assert.equal(Object.hasOwn(JSON.parse(firstUi), "__dsm_queued_runtime_nonce"), false);
+    const again = queue(444444);
+    helpers.mutatePromptForStateManagers(again, 1, 20);
+    assert.equal(again.output["1"].inputs.ui_state_json, firstUi);
+    const changedSeed = queue(444445);
+    helpers.mutatePromptForStateManagers(changedSeed, 0, 1);
+    assert.equal(JSON.parse(changedSeed.output["1"].inputs.ui_state_json).__dsm_runtime_seed, 444445);
+    assert.notEqual(changedSeed.output["1"].inputs.ui_state_json, firstUi);
+
+    // A special -1 remains genuinely random; never substitute a fake stable seed.
+    const randomSeed = queue(-1);
+    helpers.mutatePromptForStateManagers(randomSeed, 0, 1);
+    assert.equal(Object.hasOwn(JSON.parse(randomSeed.output["1"].inputs.ui_state_json), "__dsm_runtime_seed"), false);
+  } finally {
+    helpers.stateLibraryClient.userId = previousUser;
+  }
+});
+
+
 test("workflow binding contains IDs/configuration only and no private library payload", async () => {
   const helpers = await loadStateManagerHelpers();
   const binding = JSON.parse(helpers.serializeBinding());
@@ -1302,6 +1374,42 @@ test("queued manager override carries a runtime seed and selection metadata only
   assert.equal(parsed.__dsm_frontend_prompt_contract_revision, "backend-document-write-v1");
   assert.equal(Object.prototype.hasOwnProperty.call(parsed, "__dsm_queued_runtime_state"), false);
   assert.equal(serialized.includes("Private Character"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, "__dsm_queued_runtime_nonce"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, "__dsm_queued_runtime_queue_index"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, "__dsm_queued_runtime_queue_total"), false);
+});
+
+
+test("same effective State Manager queue inputs preserve ComfyUI sampler cache signatures", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const config = {
+    queue_prompt_wildcard: true,
+    queue_character_wildcard: true,
+    queue_randomize_saved_seed: true,
+  };
+  const make = (promptId, seed, queueIndex, total) => helpers.serializeQueuedUiStateOverride(
+    config, "character-1", promptId, seed, queueIndex, total,
+  );
+
+  // Even with queue wildcard controls enabled, submitting an unchanged
+  // selection and seed (e.g. after editing only Video Combine) is cacheable.
+  const first = make("prompt-1", 123456, 0, 1);
+  assert.equal(first, make("prompt-1", 123456, 8, 40));
+  assert.equal(first, make("prompt-1", 123456, 0, 1));
+
+  // Real prompt, seed, or user changes must still invalidate the ancestor key.
+  assert.notEqual(first, make("prompt-2", 123456, 0, 1));
+  assert.notEqual(first, make("prompt-1", 123457, 0, 1));
+  const previousUser = helpers.stateLibraryClient.userId;
+  try {
+    helpers.stateLibraryClient.userId = "another-user";
+    assert.notEqual(first, make("prompt-1", 123456, 0, 1));
+  } finally {
+    helpers.stateLibraryClient.userId = previousUser;
+  }
+  // A queue with a random choice but the *same resolved effective state*
+  // must not be forced to regenerate just because a fresh prompt was queued.
+  assert.equal(make("prompt-1", null, 1, 2), make("prompt-1", null, 0, 1));
 });
 
 
