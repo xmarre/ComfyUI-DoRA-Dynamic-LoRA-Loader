@@ -593,7 +593,7 @@ The State Manager opens with the saved-state library as its largest pane:
 - Search matches character names, preset names, `fileimage_prefix` values, and saved LoRA filenames.
 - The result count updates while typing, and the search is applied in place without dirtying the workflow.
 - Library scroll position and search text survive selection changes.
-- Preset, character, LoRA, settings/seed, and queue editing live in tabs in the detail pane.
+- Preset, character, LoRA, settings, and queue editing live in tabs in the detail pane.
 - Resizing the node gives the library the additional space; the collection has no fixed-height cap.
 
 The storage redesign keeps node class names, widget order, selection widgets, outputs, connected save/load behavior, and the legacy **DoRA State Manager** alias. Existing schema-v3 embedded libraries are imported into persistent storage on first load. Migration is fingerprinted and idempotent, preserves valid collision-free UUIDs, remaps unsafe/colliding IDs, and never overwrites an unrelated local preset.
@@ -696,21 +696,20 @@ The manager outputs:
 
 - `settings_json` — selected prompt preset settings as JSON text
 - `state_settings` — typed `DORA_STATE_SETTINGS` payload
-- `seed` — integer seed extracted from saved settings / rgthree seed snapshots
+- `seed` — deprecated compatibility output (always `0`); use the independent **State Manager Seed** node or another explicit seed node
 - `state_control` — typed `STATE_MANAGER_CONTROL` payload used only by the frontend to discover connected nodes for Save connected / Load connected
 - `character_image` — original uploaded character image as an `IMAGE` tensor
 
-Future or external nodes can add optional inputs for `settings_json`, `state_settings`, or `seed` to consume saved state deterministically during execution. `state_control` is reserved for editor save/load association.
+Future or external nodes can consume `settings_json` and `state_settings`, but seed values are no longer managed or stored by State Manager. Use the standalone **State Manager Seed** node for fixed or random seeds. `state_control` is reserved for editor save/load association.
 
 ### Pattern 2: frontend apply/capture
 
 For existing nodes that do not have settings inputs, use the UI actions:
 
 - save selected/connected AutoGuidance or Scale-Locked Guidance nodes into the prompt preset
-- save selected/connected rgthree seed nodes into the prompt preset
 - load/apply the preset back into those graph nodes later
 
-The settings snapshot stores widget values by node identity and class/title fallback. This is intended for controlled workflows where the same downstream nodes remain in the graph.
+The settings snapshot stores non-seed widget values by node identity and class/title fallback. Legacy preset `seed`, `noise_seed`, `rgthree_seed`, and per-node seed widgets are ignored and omitted on future saves. Standalone seed nodes retain their own values. This is intended for controlled workflows where the same downstream nodes remain in the graph.
 
 ### Outputs
 
@@ -720,7 +719,7 @@ The settings snapshot stores widget values by node identity and class/title fall
 - `settings_json` — selected prompt preset settings serialized as JSON
 - `selected_lora_stack` — selected character's LoRA stack as a typed `DORA_LORA_STACK` payload
 - `state_settings` — typed `DORA_STATE_SETTINGS` payload for future compatible nodes
-- `seed` — integer seed extracted from saved settings / rgthree seed snapshots
+- `seed` — deprecated compatibility output (always `0`); use the independent **State Manager Seed** node or another explicit seed node
 - `state_control` — typed `STATE_MANAGER_CONTROL` payload for editor/control-only save/load association
 - `character_image` — original uploaded character image as an `IMAGE` tensor. The manager uploads the original image to ComfyUI's input folder and only scales it visually in the browser.
 

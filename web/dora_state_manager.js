@@ -699,7 +699,7 @@ function defaultState() {
 }
 
 function defaultUiState() {
-  return { version: 1, panel: "prompts", status: "", queue_randomize_saved_seed: false };
+  return { version: 1, panel: "prompts", status: "" };
 }
 
 function stripBackupRestoreStatus(uiState) {
@@ -751,9 +751,28 @@ function normalizeDevice(value) {
 }
 
 function normalizeSettings(value) {
-  if (value && typeof value === "object" && !Array.isArray(value)) return structuredCloneCompat(value);
-  const parsed = safeJsonParse(value, {});
-  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  const parsed = value && typeof value === "object" && !Array.isArray(value)
+    ? structuredCloneCompat(value) : safeJsonParse(value, {});
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  // Ignore legacy saved seeds: independent seed nodes own all randomness.
+  for (const key of ["seed", "noise_seed", "rgthree_seed"]) delete parsed[key];
+  if (Array.isArray(parsed.nodes)) {
+    parsed.nodes = parsed.nodes.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const snap = structuredCloneCompat(item);
+      if (!snap.widgets || typeof snap.widgets !== "object") return [];
+      for (const key of Object.keys(snap.widgets)) {
+        if (/seed/i.test(key)) delete snap.widgets[key];
+      }
+      const identity = snap.identity || {};
+      if (/\bseed\b/i.test([identity.comfyClass, identity.type, identity.title].join(" "))) delete snap.widgets.value;
+      delete snap.seed;
+      delete snap.seed_widgets;
+      delete snap.is_seed_node;
+      return Object.keys(snap.widgets).length ? [snap] : [];
+    });
+  }
+  return parsed;
 }
 
 function normalizeThumbnail(value) {
@@ -1082,7 +1101,6 @@ function normalizeUiState(raw) {
     status: String(parsed.status ?? ""),
     queue_prompt_wildcard: normalizeBoolean(parsed.queue_prompt_wildcard ?? parsed.prompt_wildcard_enabled, false),
     queue_character_wildcard: normalizeBoolean(parsed.queue_character_wildcard ?? parsed.character_wildcard_enabled, false),
-    queue_randomize_saved_seed: normalizeBoolean(parsed.queue_randomize_saved_seed ?? parsed.randomize_saved_seed, false),
     queue_character_ids: normalizeIdList(parsed.queue_character_ids ?? parsed.selected_character_ids),
   };
 }
@@ -1101,7 +1119,6 @@ function serializeWorkflowUiState(uiState) {
     version: 2,
     queue_prompt_wildcard: normalized.queue_prompt_wildcard,
     queue_character_wildcard: normalized.queue_character_wildcard,
-    queue_randomize_saved_seed: normalized.queue_randomize_saved_seed,
     queue_character_ids: normalized.queue_character_ids,
   });
 }
@@ -2984,28 +3001,21 @@ function isPromptLikeNode(node) {
 function captureNodeSnapshot(node) {
   if (!node || isStateManagerNode(node) || isDoraLoaderNode(node)) return null;
   const widgets = {};
-  const seedWidgets = {};
   for (const widget of node.widgets || []) {
     if (!widget?.name) continue;
     if (widget.serialize === false) continue;
     if (String(widget.type ?? "").toLowerCase() === "button") continue;
     if (!isJsonSafeWidgetValue(widget.value)) continue;
+    if (/seed/i.test(widget.name)) continue;
     widgets[widget.name] = structuredCloneCompat(widget.value);
-    if (SEED_HINT_RE.test(`${widget.name ?? ""} ${widget.label ?? ""}`)) {
-      seedWidgets[widget.name] = structuredCloneCompat(widget.value);
-    }
   }
   if (!Object.keys(widgets).length) return null;
   const identity = nodeIdentity(node);
-  const seed = normalizeSeedFromWidgets(widgets, null);
   return {
     version: 1,
     identity,
     key: nodeIdentityKey(identity),
-    is_seed_node: isSeedNode(node),
     widgets,
-    seed_widgets: seedWidgets,
-    seed,
   };
 }
 
@@ -3038,12 +3048,6 @@ function mergeCapturedSettings(prompt, nodes, { replaceNodes = true } = {}) {
     }
   }
 
-  const seedSnapshot = snapshots.find((snap) => snap.is_seed_node || snap.seed != null || Object.keys(snap.seed_widgets || {}).length);
-  if (seedSnapshot) {
-    const seed = normalizeSeedInteger(seedSnapshot.seed ?? normalizeSeedFromWidgets(seedSnapshot.widgets, 0), 0);
-    settings.seed = seed;
-    settings.rgthree_seed = seedSnapshot;
-  }
   prompt.settings = settings;
   return snapshots;
 }
@@ -3063,7 +3067,6 @@ function nodeMatchesSnapshot(node, snapshot) {
 
 function findSnapshotForNode(settings, node) {
   const normalized = normalizeSettings(settings);
-  if (isSeedNode(node) && normalized.rgthree_seed) return normalized.rgthree_seed;
   const snapshots = normalizeNodeSnapshots(normalized.nodes);
   return snapshots.find((snap) => nodeMatchesSnapshot(node, snap)) || null;
 }
@@ -3080,51 +3083,11 @@ function applySnapshotToNode(node, snapshot) {
   return changed;
 }
 
-function extractSeedFromSettings(settings) {
-  const normalized = normalizeSettings(settings);
-  if (normalized.seed != null) {
-    return normalizeSeedInteger(normalized.seed, 0);
-  }
-  if (normalized.rgthree_seed?.seed != null) {
-    return normalizeSeedInteger(normalized.rgthree_seed.seed, 0);
-  }
-  const widgets = normalized.rgthree_seed?.widgets;
-  const fromWidgets = normalizeSeedFromWidgets(widgets, null);
-  if (fromWidgets != null) return fromWidgets;
-  for (const snap of normalizeNodeSnapshots(normalized.nodes)) {
-    const seed = normalizeSeedFromWidgets(snap.widgets, null);
-    if (seed != null) return seed;
-  }
-  return null;
-}
-
-function applySeedToNode(node, settings) {
-  const seed = extractSeedFromSettings(settings);
-  if (seed == null) return 0;
-  const widgetMap = getWidgetMap(node);
-  let changed = 0;
-  for (const name of ["seed", "noise_seed", "value"]) {
-    const widget = widgetMap.get(name);
-    if (widget && typeof widget.value !== "boolean") {
-      if (setNodeWidget(node, widget, seed)) changed += 1;
-      return changed;
-    }
-  }
-  for (const widget of node.widgets || []) {
-    if (SEED_HINT_RE.test(`${widget?.name ?? ""} ${widget?.label ?? ""}`) && typeof widget.value !== "boolean") {
-      if (setNodeWidget(node, widget, seed)) changed += 1;
-      break;
-    }
-  }
-  return changed;
-}
-
 function applySettingsToNodes(nodes, settings) {
   let changedNodes = 0;
   for (const node of nodes) {
     const snapshot = findSnapshotForNode(settings, node);
     let changed = snapshot ? applySnapshotToNode(node, snapshot) : 0;
-    if (isSeedNode(node)) changed += applySeedToNode(node, settings);
     if (changed > 0) changedNodes += 1;
   }
   return changedNodes;
@@ -3190,12 +3153,10 @@ function saveConnectedState(targetNode, character, prompt) {
   );
   const legacySettingTargets = controlledSettingTargets.length ? [] : uniqueNodes([
     ...getOutputTargets(targetNode, OUTPUT_NAMES.settings),
-    ...getOutputTargets(targetNode, OUTPUT_NAMES.seed),
   ]).filter((node) => node !== targetNode && !isDoraLoaderNode(node) && !isStateTextNode(node));
   const settingTargets = controlledSettingTargets.length ? controlledSettingTargets : legacySettingTargets;
   const snapshots = mergeCapturedSettings(prompt, settingTargets, { replaceNodes: true });
   if (snapshots.length) changes.push(`settings from ${snapshots.length} node${snapshots.length === 1 ? "" : "s"}`);
-  if (prompt.settings?.seed != null) changes.push("seed");
   return [...new Set(changes)];
 }
 
@@ -3253,11 +3214,10 @@ function applyConnectedState(targetNode, character, prompt) {
   );
   const legacySettingTargets = controlledSettingTargets.length ? [] : uniqueNodes([
     ...getOutputTargets(targetNode, OUTPUT_NAMES.settings),
-    ...getOutputTargets(targetNode, OUTPUT_NAMES.seed),
   ]).filter((node) => node !== targetNode && !isDoraLoaderNode(node) && !isStateTextNode(node));
   const settingTargets = controlledSettingTargets.length ? controlledSettingTargets : legacySettingTargets;
   const settingsChanged = applySettingsToNodes(settingTargets, prompt.settings);
-  if (settingsChanged) changes.push(`settings/seed to ${settingsChanged} node${settingsChanged === 1 ? "" : "s"}`);
+  if (settingsChanged) changes.push(`settings to ${settingsChanged} node${settingsChanged === 1 ? "" : "s"}`);
   return changes;
 }
 
@@ -3318,7 +3278,6 @@ function saveSelectedState(targetNode, character, prompt) {
   const settingNodes = selected.filter((node) => !used.has(node));
   const snapshots = mergeCapturedSettings(prompt, settingNodes, { replaceNodes: true });
   if (snapshots.length) changes.push(`settings from ${snapshots.length} node${snapshots.length === 1 ? "" : "s"}`);
-  if (prompt.settings?.seed != null) changes.push("seed");
   return [...new Set(changes)];
 }
 
@@ -3354,7 +3313,7 @@ function applySelectedState(targetNode, character, prompt) {
   const used = new Set([...loaderTargets, ...selectedStateTextNodes, ...(classified.used || [])].filter(Boolean));
   const settingNodes = selected.filter((node) => !used.has(node));
   const settingsChanged = applySettingsToNodes(settingNodes, prompt.settings);
-  if (settingsChanged) changes.push(`settings/seed to ${settingsChanged} node${settingsChanged === 1 ? "" : "s"}`);
+  if (settingsChanged) changes.push(`settings to ${settingsChanged} node${settingsChanged === 1 ? "" : "s"}`);
   return changes;
 }
 
@@ -3495,7 +3454,7 @@ function characterNamesForIds(state, ids) {
 function queueSettingsSummary(state, uiState, currentCharacterId) {
   const explicitIds = queueCharacterIdsExplicit(state, uiState);
   const runtimeIds = validQueueCharacterIds(state, uiState, currentCharacterId);
-  if (!uiState.queue_prompt_wildcard && !uiState.queue_character_wildcard && !uiState.queue_randomize_saved_seed) {
+  if (!uiState.queue_prompt_wildcard && !uiState.queue_character_wildcard) {
     return "Queue wildcarding is off. Queued jobs use the selected character and selected prompt preset.";
   }
 
@@ -3513,9 +3472,6 @@ function queueSettingsSummary(state, uiState, currentCharacterId) {
   lines.push(uiState.queue_prompt_wildcard
     ? "Prompts: each queued job randomly selects one saved prompt preset from the active character."
     : "Prompts: selected prompt preset only.");
-  if (uiState.queue_randomize_saved_seed) {
-    lines.push("Saved prompt preset seeds randomize only when no connected State Seed provides a fixed live seed.");
-  }
   return lines.join(" ");
 }
 
@@ -3668,9 +3624,8 @@ function renderPresetTile(node, character, prompt, selectedCharacterId, selected
   name.title = prompt.name;
   const meta = document.createElement("div");
   meta.className = "dsm-muted dsm-preset-meta";
-  const seed = extractSeedFromSettings(prompt.settings);
   const textBoxCount = normalizePromptTextBoxes(prompt).length;
-  meta.textContent = `${textBoxCount} text box${textBoxCount === 1 ? "" : "es"}${seed == null ? "" : ` · seed ${seed}`}`;
+  meta.textContent = `${textBoxCount} text box${textBoxCount === 1 ? "" : "es"}`;
   body.append(name, meta);
   tile.append(thumb, body);
 
@@ -4017,15 +3972,6 @@ function renderQueuePanelContent(section, node, state, uiState, character, promp
       "Each queued job samples one saved prompt preset from the active character."
     ),
     makeInlineCheckbox(
-      "Randomize saved prompt seed when live seed is random",
-      uiState.queue_randomize_saved_seed,
-      (checked) => {
-        const nextUiState = { ...uiState, queue_randomize_saved_seed: checked };
-        updateState(node, state, nextUiState, { characterId: character.id, promptId: prompt.id, status: queueSettingsSummary(state, nextUiState, character.id) });
-      },
-      "A fixed connected State Seed keeps precedence."
-    ),
-    makeInlineCheckbox(
       "Split queued images into contiguous character chunks",
       uiState.queue_character_wildcard,
       (checked) => {
@@ -4196,7 +4142,7 @@ function renderPromptPanel(node, state, uiState, character, prompt) {
     ["prompts", "Preset"],
     ["character", "Character"],
     ["loras", "LoRA stacks"],
-    ["settings", "Settings / seed"],
+    ["settings", "Settings"],
     ["queue", "Queue"],
   ]) {
     const btn = makeButton(label, () => setPanel(node, panel));
@@ -4655,26 +4601,15 @@ function renderSettingsPanelContent(section, node, state, uiState, character, pr
     labelledControl("AdaLN swap fix", adalnFix)
   );
 
-  const seedValue = extractSeedFromSettings(prompt.settings) ?? 0;
-  const seedInput = makeInput(seedValue, (value) => {
-    const settings = normalizeSettings(prompt.settings);
-    settings.seed = normalizeSeedInteger(value, -1);
-    if (settings.rgthree_seed?.widgets) settings.rgthree_seed.widgets.seed = settings.seed;
-    if (settings.rgthree_seed) settings.rgthree_seed.seed = settings.seed;
-    prompt.settings = settings;
-    syncLegacyLoaderMirror(character);
-    updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
-  }, { type: "number", step: "1", min: String(STATE_SEED_MIN), max: String(STATE_SEED_MAX) });
-
   const settingsJson = makeTextarea(JSON.stringify(prompt.settings || {}, null, 2), (value) => {
     const parsed = safeJsonParse(value, null);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      prompt.settings = parsed;
+      prompt.settings = normalizeSettings(parsed);
       updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, render: false });
     }
   }, { placeholder: "Saved node settings JSON. Save connected/selected nodes to populate this." });
   settingsJson.addEventListener("change", () => {
-    settingsJson.value = JSON.stringify(prompt.settings || {}, null, 2);
+    settingsJson.value = JSON.stringify(normalizeSettings(prompt.settings), null, 2);
     syncLegacyLoaderMirror(character);
     updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id });
   });
@@ -4682,36 +4617,33 @@ function renderSettingsPanelContent(section, node, state, uiState, character, pr
   const snapshots = normalizeNodeSnapshots(prompt.settings?.nodes);
   const summary = document.createElement("div");
   summary.className = "dsm-lora-summary";
-  const seed = extractSeedFromSettings(prompt.settings);
   const lines = [];
-  if (seed != null) lines.push(`Seed: ${seed}`);
-  if (prompt.settings?.rgthree_seed) lines.push("rgthree seed snapshot: yes");
   if (snapshots.length) {
     lines.push(`Captured settings nodes: ${snapshots.length}`);
     lines.push(...snapshots.slice(0, 12).map((snap) => `- ${snap.identity?.title || snap.identity?.comfyClass || snap.identity?.type || snap.key || "node"}`));
   }
-  summary.textContent = lines.length ? lines.join("\n") : "No saved settings/seed snapshots. Use Save connected or Save selected.";
+  summary.textContent = lines.length ? lines.join("\n") : "No saved settings snapshots. Use Save connected or Save selected.";
 
   const settingsToolbar = document.createElement("div");
   settingsToolbar.className = "dsm-toolbar";
   settingsToolbar.append(
     makeButton("Clear settings", () => {
       prompt.settings = {};
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: "Cleared prompt settings and seed." });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: "Cleared prompt settings." });
     }),
     makeButton("Save selected settings", () => {
       const selected = getSelectedGraphNodes().filter((target) => target && target !== node && !isDoraLoaderNode(target) && !isPromptLikeNode(target));
       const snapshots = mergeCapturedSettings(prompt, selected, { replaceNodes: true });
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: snapshots.length ? `Saved ${snapshots.length} selected settings node${snapshots.length === 1 ? "" : "s"}.` : "No selected settings/seed nodes found." });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: snapshots.length ? `Saved ${snapshots.length} selected settings node${snapshots.length === 1 ? "" : "s"}.` : "No selected settings nodes found." });
     }),
     makeButton("Apply selected settings", () => {
       const selected = getSelectedGraphNodes().filter((target) => target && target !== node && !isDoraLoaderNode(target));
       const count = applySettingsToNodes(selected, prompt.settings);
-      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: count ? `Applied settings/seed to ${count} selected node${count === 1 ? "" : "s"}.` : "No selected node matched the saved settings." });
+      updateState(node, state, uiState, { characterId: character.id, promptId: prompt.id, status: count ? `Applied settings to ${count} selected node${count === 1 ? "" : "s"}.` : "No selected node matched the saved settings." });
     })
   );
 
-  section.append(grid, labelledControl("Seed output / saved seed", seedInput), settingsToolbar, labelledControl("Settings summary", summary), labelledControl("Settings JSON", settingsJson));
+  section.append(grid, settingsToolbar, labelledControl("Settings summary", summary), labelledControl("Settings JSON", settingsJson));
 }
 
 function libraryRenderKey(node, state, uiState, mode) {
@@ -5226,16 +5158,17 @@ function serializeQueuedUiStateIdentity(uiState, characterId, promptId) {
   }, null, 0);
 }
 
-function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, queueIndex, total) {
+function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, _queueIndex, _total) {
+  // ComfyUI hashes literal inputs of every ancestor when deciding whether to
+  // reuse a sampler's cached result. Queue position and a per-request nonce do
+  // not describe generation state: changing only Video Combine would otherwise
+  // invalidate State Manager and every downstream sampler on every submission.
+  //
+  // Only selected preset and tenant identity belong in this manager's key.
+  // Seed values belong to the independent seed node. The backend snapshots the
+  // selected preset and library revision for cache-safe execution.
   return JSON.stringify({
     ...safeJsonParse(serializeQueuedUiStateIdentity(uiState, characterId, promptId), {}),
-    ...(runtimeSeed == null ? {} : { __dsm_runtime_seed: runtimeSeed }),
-    __dsm_queued_runtime_queue_index: Math.max(0, Number(queueIndex) || 0),
-    __dsm_queued_runtime_queue_total: Math.max(1, Number(total) || 1),
-    // The runtime override must differ per queued prompt even if the same prompt
-    // is selected again after a prompt-pool reshuffle. This prevents executor
-    // cache reuse from keeping a stale STATE_MANAGER_CONTROL payload alive.
-    __dsm_queued_runtime_nonce: `${Date.now()}:${Math.random()}:${queueIndex}`,
   }, null, 0);
 }
 
@@ -5385,46 +5318,6 @@ function buildQueuedDoraLoaderControlPayload(character, loader = null, fallbackI
   };
 }
 
-function applyRuntimeSeedToSettings(settings, seed) {
-  const normalized = normalizeSettings(settings);
-  normalized.seed = seed;
-  if (normalized.rgthree_seed) {
-    normalized.rgthree_seed = structuredCloneCompat(normalized.rgthree_seed);
-    normalized.rgthree_seed.seed = seed;
-    if (normalized.rgthree_seed.widgets && typeof normalized.rgthree_seed.widgets === "object") {
-      for (const name of ["seed", "noise_seed", "value"]) {
-        if (Object.prototype.hasOwnProperty.call(normalized.rgthree_seed.widgets, name)) {
-          normalized.rgthree_seed.widgets[name] = seed;
-        }
-      }
-    }
-  }
-  if (Array.isArray(normalized.nodes)) {
-    normalized.nodes = normalizeNodeSnapshots(normalized.nodes).map((snapshot) => {
-      const next = structuredCloneCompat(snapshot);
-      if (!next.widgets || typeof next.widgets !== "object") return next;
-      for (const name of ["seed", "noise_seed", "value"]) {
-        if (Object.prototype.hasOwnProperty.call(next.widgets, name)) next.widgets[name] = seed;
-      }
-      if (next.is_seed_node || next.seed != null || Object.keys(next.seed_widgets || {}).length) {
-        next.seed = seed;
-        if (next.seed_widgets && typeof next.seed_widgets === "object") {
-          for (const name of Object.keys(next.seed_widgets)) next.seed_widgets[name] = seed;
-        }
-      }
-      return next;
-    });
-  }
-  return normalized;
-}
-
-function withRuntimeSeed(payload, seed) {
-  return {
-    ...structuredCloneCompat(payload),
-    settings: applyRuntimeSeedToSettings(payload?.settings, seed),
-  };
-}
-
 function mutateQueuedDoraLoaders(promptPayload, managerNode, character) {
   const controlled = getControlledNodes(managerNode).filter((node) => node && node !== managerNode);
   const controlledLoaders = controlled.filter(isDoraLoaderNode);
@@ -5485,28 +5378,15 @@ function mutateQueuedSettingsNodes(promptPayload, managerNode, settingsSource) {
   const controlled = getControlledNodes(managerNode).filter((node) => node && node !== managerNode && !isDoraLoaderNode(node) && !isStateTextNode(node));
   const legacy = controlled.length ? [] : uniqueNodes([
     ...getOutputTargets(managerNode, OUTPUT_NAMES.settings),
-    ...getOutputTargets(managerNode, OUTPUT_NAMES.seed),
   ]).filter((node) => node && node !== managerNode && !isDoraLoaderNode(node) && !isStateTextNode(node));
   const targets = controlled.length ? controlled : legacy;
   const settings = normalizeSettings(settingsSource || {});
   let changed = 0;
   for (const node of targets) {
-    const preserveLiveStateSeed = isStateSeedNode(node) && readQueuedStateSeed(promptPayload, node) != null;
     const snapshot = findSnapshotForNode(settings, node);
     if (snapshot?.widgets) {
       for (const [name, value] of Object.entries(snapshot.widgets)) {
-        if (preserveLiveStateSeed && String(name) === "seed") continue;
         changed += setQueuedInput(promptPayload, node, String(name), value, { addIfMissing: false, syncWidget: false });
-      }
-    }
-    if (isSeedNode(node) && !preserveLiveStateSeed) {
-      const seed = extractSeedFromSettings(settings);
-      if (seed != null) {
-        for (const name of ["seed", "noise_seed", "value"]) {
-          const before = changed;
-          changed += setQueuedInput(promptPayload, node, name, seed, { addIfMissing: false, syncWidget: false });
-          if (changed !== before) break;
-        }
       }
     }
   }
@@ -5535,12 +5415,8 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
     const hasQueueOverrides = !!(
       uiState.queue_prompt_wildcard
       || uiState.queue_character_wildcard
-      || uiState.queue_randomize_saved_seed
     );
     if (!hasQueueOverrides) {
-      // Backend prompt handlers execute outside the originating HTTP request.
-      // Preserve the exact persistent-library tenant and selected preset in the
-      // request-local queue payload even for an ordinary queue.
       changed += setQueuedInput(
         promptPayload,
         node,
@@ -5551,16 +5427,6 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
       continue;
     }
 
-    let payload = buildQueuedDoraStatePayload(character, prompt);
-    let runtimeSeed = null;
-    const liveStateSeed = firstControlledStateSeed(node, promptPayload);
-    if (liveStateSeed) {
-      runtimeSeed = liveStateSeed.seed;
-      payload = withRuntimeSeed(payload, runtimeSeed);
-    } else if (uiState.queue_randomize_saved_seed) {
-      runtimeSeed = generateStateManagerRuntimeSeed();
-      payload = withRuntimeSeed(payload, runtimeSeed);
-    }
     changed += setQueuedStateManagerSelection(promptPayload, node, character.id, prompt.id);
     changed += setQueuedStateManagerRuntimeState(
       promptPayload,
@@ -5568,13 +5434,13 @@ function mutatePromptForStateManagers(promptPayload, queueIndex, total) {
       uiState,
       character.id,
       prompt.id,
-      runtimeSeed,
+      null,
       queueIndex,
       total,
     );
     changed += mutateQueuedDoraLoaders(promptPayload, node, character);
     changed += mutateQueuedLegacyTextTargets(promptPayload, node, prompt);
-    changed += mutateQueuedSettingsNodes(promptPayload, node, payload.settings);
+    changed += mutateQueuedSettingsNodes(promptPayload, node, normalizeSettings(prompt.settings));
   }
   return changed;
 }
