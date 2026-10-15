@@ -5226,16 +5226,19 @@ function serializeQueuedUiStateIdentity(uiState, characterId, promptId) {
   }, null, 0);
 }
 
-function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, queueIndex, total) {
+function serializeQueuedUiStateOverride(uiState, characterId, promptId, runtimeSeed, _queueIndex, _total) {
+  // ComfyUI hashes literal inputs of every ancestor when deciding whether to
+  // reuse a sampler's cached result. Queue position and a per-request nonce do
+  // not describe generation state: changing only Video Combine would otherwise
+  // invalidate State Manager and every downstream sampler on every submission.
+  //
+  // The selected character/prompt IDs, tenant, and actual runtime seed DO
+  // describe the state; the backend additionally snapshots the resolved preset
+  // and library revision. Changes in those values legitimately invalidate the
+  // cache. A deliberately randomized seed still changes __dsm_runtime_seed.
   return JSON.stringify({
     ...safeJsonParse(serializeQueuedUiStateIdentity(uiState, characterId, promptId), {}),
     ...(runtimeSeed == null ? {} : { __dsm_runtime_seed: runtimeSeed }),
-    __dsm_queued_runtime_queue_index: Math.max(0, Number(queueIndex) || 0),
-    __dsm_queued_runtime_queue_total: Math.max(1, Number(total) || 1),
-    // The runtime override must differ per queued prompt even if the same prompt
-    // is selected again after a prompt-pool reshuffle. This prevents executor
-    // cache reuse from keeping a stale STATE_MANAGER_CONTROL payload alive.
-    __dsm_queued_runtime_nonce: `${Date.now()}:${Math.random()}:${queueIndex}`,
   }, null, 0);
 }
 

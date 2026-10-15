@@ -1302,6 +1302,42 @@ test("queued manager override carries a runtime seed and selection metadata only
   assert.equal(parsed.__dsm_frontend_prompt_contract_revision, "backend-document-write-v1");
   assert.equal(Object.prototype.hasOwnProperty.call(parsed, "__dsm_queued_runtime_state"), false);
   assert.equal(serialized.includes("Private Character"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, "__dsm_queued_runtime_nonce"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, "__dsm_queued_runtime_queue_index"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, "__dsm_queued_runtime_queue_total"), false);
+});
+
+
+test("same effective State Manager queue inputs preserve ComfyUI sampler cache signatures", async () => {
+  const helpers = await loadStateManagerHelpers();
+  const config = {
+    queue_prompt_wildcard: true,
+    queue_character_wildcard: true,
+    queue_randomize_saved_seed: true,
+  };
+  const make = (promptId, seed, queueIndex, total) => helpers.serializeQueuedUiStateOverride(
+    config, "character-1", promptId, seed, queueIndex, total,
+  );
+
+  // Even with queue wildcard controls enabled, submitting an unchanged
+  // selection and seed (e.g. after editing only Video Combine) is cacheable.
+  const first = make("prompt-1", 123456, 0, 1);
+  assert.equal(first, make("prompt-1", 123456, 8, 40));
+  assert.equal(first, make("prompt-1", 123456, 0, 1));
+
+  // Real prompt, seed, or user changes must still invalidate the ancestor key.
+  assert.notEqual(first, make("prompt-2", 123456, 0, 1));
+  assert.notEqual(first, make("prompt-1", 123457, 0, 1));
+  const previousUser = helpers.stateLibraryClient.userId;
+  try {
+    helpers.stateLibraryClient.userId = "another-user";
+    assert.notEqual(first, make("prompt-1", 123456, 0, 1));
+  } finally {
+    helpers.stateLibraryClient.userId = previousUser;
+  }
+  // A queue with a random choice but the *same resolved effective state*
+  // must not be forced to regenerate just because a fresh prompt was queued.
+  assert.equal(make("prompt-1", null, 1, 2), make("prompt-1", null, 0, 1));
 });
 
 
