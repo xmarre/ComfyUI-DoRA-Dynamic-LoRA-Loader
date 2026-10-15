@@ -1004,7 +1004,7 @@ def _normalize_manager_prompt(prompt: Any, index: int) -> Optional[Dict[str, Any
         return None
     prompt_id = _clean_state_id(prompt.get("id"), _state_manager_make_id("prompt", index))
     name = str(prompt.get("name") or f"Prompt {index + 1}").strip() or f"Prompt {index + 1}"
-    settings = _normalize_settings_with_canonical_seed(prompt.get("settings", {}))
+    settings = _normalize_settings_without_saved_seed(prompt.get("settings", {}))
     reference_image = _normalize_manager_thumbnail(prompt.get("reference_image", prompt.get("referenceImage", prompt.get("prompt_image", prompt.get("image", {})))))
     fileimage_prefix = str(prompt.get("fileimage_prefix", prompt.get("filename_prefix", prompt.get("file_image_prefix", ""))) or "").strip()
     text_boxes = _normalize_manager_text_boxes(prompt)
@@ -1130,7 +1130,7 @@ def _resolve_dora_state_payload_from_state(
     character = _pick_state_manager_character(state, selected_character_id)
     prompt = _pick_state_manager_prompt(character, selected_prompt_id)
 
-    settings = _normalize_settings_with_canonical_seed(prompt.get("settings", {}))
+    settings = _normalize_settings_without_saved_seed(prompt.get("settings", {}))
     loader_stacks = _normalize_manager_loader_stacks(character)
     default_stack = _pick_loader_stack(loader_stacks, "default")
     loras = default_stack.get("loras", character.get("loras", []))
@@ -1259,15 +1259,13 @@ def _resolve_dora_state_payload(
 
 
 def _build_state_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    settings = _normalize_settings_with_canonical_seed(payload.get("settings", {}))
-    seed = _extract_seed_from_settings(settings)
+    settings = _normalize_settings_without_saved_seed(payload.get("settings", {}))
     return {
         "version": _DORA_STATE_MANAGER_SCHEMA_VERSION,
         "kind": _DORA_STATE_SETTINGS_KIND,
         "character": payload.get("character") if isinstance(payload.get("character"), dict) else {},
         "prompt": payload.get("prompt") if isinstance(payload.get("prompt"), dict) else {},
         "settings": settings,
-        "seed": seed,
     }
 
 
@@ -1298,71 +1296,11 @@ def _queued_state_manager_snapshot(ui_state_json: Any) -> Optional[Dict[str, Any
     }
 
 
-def _queued_runtime_seed_from_ui_state(ui_state_json: Any) -> Optional[int]:
-    parsed = _safe_json_load(ui_state_json, {})
-    if not isinstance(parsed, dict):
-        return None
-    if "__dsm_runtime_seed" not in parsed:
-        return None
-    seed = _coerce_state_manager_seed(parsed.get("__dsm_runtime_seed"), -1)
-    return None if seed in _STATE_SEED_SPECIALS else seed
-
-
 def _queued_library_user_from_ui_state(ui_state_json: Any) -> str:
     parsed = _safe_json_load(ui_state_json, {})
     if not isinstance(parsed, dict):
         return "default"
     return str(parsed.get("__dsm_library_user_id", "default") or "default").strip() or "default"
-
-
-def _settings_with_runtime_seed(settings: Any, seed: int) -> Dict[str, Any]:
-    normalized = dict(_normalize_manager_settings(settings))
-    normalized["seed"] = seed
-    rgthree_seed = normalized.get("rgthree_seed")
-    if isinstance(rgthree_seed, dict):
-        rgthree_seed = dict(rgthree_seed)
-        rgthree_seed["seed"] = seed
-        widgets = rgthree_seed.get("widgets")
-        if isinstance(widgets, dict):
-            widgets = dict(widgets)
-            for key in ("seed", "noise_seed", "value"):
-                if key in widgets:
-                    widgets[key] = seed
-            rgthree_seed["widgets"] = widgets
-        normalized["rgthree_seed"] = rgthree_seed
-    nodes = normalized.get("nodes")
-    if isinstance(nodes, list):
-        updated_nodes = []
-        for node in nodes:
-            if not isinstance(node, dict):
-                updated_nodes.append(node)
-                continue
-            updated_node = dict(node)
-            widgets = updated_node.get("widgets")
-            if isinstance(widgets, dict):
-                widgets = dict(widgets)
-                for key in ("seed", "noise_seed", "value"):
-                    if key in widgets:
-                        widgets[key] = seed
-                updated_node["widgets"] = widgets
-            if updated_node.get("is_seed_node") or updated_node.get("seed") is not None or updated_node.get("seed_widgets"):
-                updated_node["seed"] = seed
-                seed_widgets = updated_node.get("seed_widgets")
-                if isinstance(seed_widgets, dict):
-                    updated_node["seed_widgets"] = {key: seed for key in seed_widgets}
-            updated_nodes.append(updated_node)
-        normalized["nodes"] = updated_nodes
-    return normalized
-
-
-def _resolve_state_manager_runtime_seed(payload: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = _normalize_runtime_dora_state_payload(payload) or dict(payload)
-    settings = _normalize_settings_with_canonical_seed(normalized.get("settings", {}))
-    seed = _extract_seed_from_settings(settings)
-    if seed in _STATE_SEED_SPECIALS:
-        settings = _settings_with_runtime_seed(settings, _state_manager_new_random_seed())
-    normalized["settings"] = settings
-    return normalized
 
 
 def _build_state_control_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1466,59 +1404,38 @@ def _load_state_manager_prompt_or_character_image(character: Dict[str, Any], pro
     return _load_state_manager_character_image(character)
 
 
-def _extract_seed_from_settings(settings: Any, fallback: int = 0) -> int:
-    settings_dict = _normalize_manager_settings(settings)
-
-    def _coerce(value: Any) -> Optional[int]:
-        try:
-            if isinstance(value, bool):
-                return None
-            if isinstance(value, float) and not math.isfinite(value):
-                return None
-            if isinstance(value, str) and not value.strip():
-                return None
-            return _coerce_state_manager_seed(value, fallback)
-        except Exception:
-            return None
-
+def _normalize_settings_without_saved_seed(settings: Any) -> Dict[str, Any]:
+    """Remove historical preset seeds without touching other saved node settings."""
+    cleaned = dict(_normalize_manager_settings(settings))
     for key in ("seed", "noise_seed", "rgthree_seed"):
-        value = settings_dict.get(key)
-        if isinstance(value, dict):
-            for nested_key in ("seed", "value", "noise_seed"):
-                coerced = _coerce(value.get(nested_key))
-                if coerced is not None:
-                    return coerced
-            widgets = value.get("widgets")
-            if isinstance(widgets, dict):
-                for nested_key in ("seed", "noise_seed", "value"):
-                    coerced = _coerce(widgets.get(nested_key))
-                    if coerced is not None:
-                        return coerced
-        else:
-            coerced = _coerce(value)
-            if coerced is not None:
-                return coerced
-
-    nodes = settings_dict.get("nodes")
-    if isinstance(nodes, list):
-        for node in nodes:
-            if not isinstance(node, dict):
+        cleaned.pop(key, None)
+    snapshots = cleaned.get("nodes")
+    if isinstance(snapshots, list):
+        retained = []
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
                 continue
-            widgets = node.get("widgets")
+            widgets = snapshot.get("widgets")
             if not isinstance(widgets, dict):
                 continue
-            for key in ("seed", "noise_seed", "value"):
-                coerced = _coerce(widgets.get(key))
-                if coerced is not None:
-                    return coerced
+            filtered = {key: value for key, value in widgets.items() if "seed" not in str(key).lower()}
+            identity = snapshot.get("identity")
+            if isinstance(identity, dict) and re.search(
+                r"\bseed\b",
+                " ".join(str(identity.get(key, "")) for key in ("comfyClass", "type", "title")),
+                re.IGNORECASE,
+            ):
+                filtered.pop("value", None)
+            if not filtered:
+                continue
+            copied = dict(snapshot)
+            copied["widgets"] = filtered
+            for key in ("seed", "seed_widgets", "is_seed_node"):
+                copied.pop(key, None)
+            retained.append(copied)
+        cleaned["nodes"] = retained
+    return cleaned
 
-    return _coerce_state_manager_seed(fallback, 0)
-
-
-def _normalize_settings_with_canonical_seed(settings: Any) -> Dict[str, Any]:
-    settings_dict = dict(_normalize_manager_settings(settings))
-    settings_dict["seed"] = _extract_seed_from_settings(settings_dict)
-    return settings_dict
 
 def _normalize_runtime_dora_state_payload(raw: Any) -> Optional[Dict[str, Any]]:
     payload = _safe_json_load(raw, None)
@@ -1556,7 +1473,7 @@ def _normalize_runtime_dora_state_payload(raw: Any) -> Optional[Dict[str, Any]]:
         "loader_stacks": loader_stacks,
         "loras": loras,
         "loader_globals": globals_out,
-        "settings": _normalize_settings_with_canonical_seed(payload.get("settings", {})),
+        "settings": _normalize_settings_without_saved_seed(payload.get("settings", {})),
         "text_boxes": text_boxes,
         "positive_prompt": str(positive_box.get("text", "") if positive_box else payload.get("positive_prompt", "") or ""),
         "negative_prompt": str(negative_box.get("text", "") if negative_box else payload.get("negative_prompt", "") or ""),
@@ -1581,11 +1498,9 @@ def _state_payload_text_for_box(state_payload: Optional[Dict[str, Any]], role: A
 
 
 def _state_payload_seed(state_payload: Optional[Dict[str, Any]]) -> Optional[int]:
-    if not isinstance(state_payload, dict):
-        return None
-    if "settings" not in state_payload:
-        return None
-    return _extract_seed_from_settings(state_payload.get("settings", {}), None)
+    # Deprecated State Manager saved seeds must not override State Manager Seed.
+    # The dedicated seed node owns its own fixed/random value.
+    return None
 
 
 def _select_state_loader_stack(state_payload: Optional[Dict[str, Any]], state_slot: Any = "default") -> Optional[Dict[str, Any]]:
@@ -4844,14 +4759,9 @@ class StateManager:
                 )
                 resolved = dict(resolved_snapshot["payload"])
                 payload["library_revision"] = resolved_snapshot["library_revision"]
-            queued_seed = _queued_runtime_seed_from_ui_state(ui_state_json)
-            if queued_seed is not None:
-                resolved["settings"] = _settings_with_runtime_seed(resolved.get("settings", {}), queued_seed)
         except (InvalidStateLibrary, StatePresetNotFound, OSError) as exc:
             resolved = {}
             payload["library_error"] = type(exc).__name__
-        if _extract_seed_from_settings(resolved.get("settings", {})) in _STATE_SEED_SPECIALS:
-            payload["runtime_seed_nonce"] = _state_manager_new_random_seed()
         return json.dumps(payload, sort_keys=True, default=str)
 
     @classmethod
@@ -4908,12 +4818,7 @@ class StateManager:
             )
             state = {"version": _DORA_STATE_MANAGER_SCHEMA_VERSION, "characters": [character]}
             payload = _resolve_dora_state_payload_from_state(state, character.get("id"), prompt.get("id"))
-        queued_seed = _queued_runtime_seed_from_ui_state(ui_state_json)
-        if queued_seed is not None:
-            payload = dict(payload)
-            payload["settings"] = _settings_with_runtime_seed(payload.get("settings", {}), queued_seed)
-        payload = _resolve_state_manager_runtime_seed(payload)
-        settings = _normalize_settings_with_canonical_seed(payload.get("settings", {}))
+        settings = _normalize_settings_without_saved_seed(payload.get("settings", {}))
         settings_json = json.dumps(settings, ensure_ascii=False, sort_keys=True, indent=2)
         lora_stack_payload = _build_lora_stack_payload(
             _manager_rows_to_lora_entries(payload.get("loras", [])),
@@ -4921,7 +4826,7 @@ class StateManager:
         )
         state_settings_payload = _build_state_settings_payload(payload)
         state_control_payload = _build_state_control_payload(payload)
-        seed = _extract_seed_from_settings(settings)
+        seed = 0  # Retain legacy output socket index; seed authority moved to State Manager Seed.
         character_image = _load_state_manager_prompt_or_character_image(character, prompt)
         return (
             payload,

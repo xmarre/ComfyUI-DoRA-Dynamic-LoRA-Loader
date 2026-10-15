@@ -605,7 +605,8 @@ def test_queue_snapshot_and_direct_continuum_sidecar_share_one_revision(
     assert frozen["library_revision"] == persisted["library_revision"]
     assert frozen["character_id"] == character["id"]
     assert frozen["prompt_id"] == character["prompts"][0]["id"]
-    assert frozen["payload"]["settings"]["seed"] == 77
+    assert "seed" not in frozen["payload"]["settings"]
+    assert frozen["payload"]["settings"]["sampler"] == "keep"
     assert frozen["payload"]["reference_image"]["filename"] == "ref.png"
     assert "private" not in frozen["payload"]
 

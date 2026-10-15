@@ -62,7 +62,7 @@ def test_runtime_resolves_persistent_library_payload(configured_nodes):
     assert payload["positive_prompt"] == "runtime positive"
     assert payload["negative_prompt"] == "runtime negative"
     assert payload["loras"][0]["name"] == "runtime.safetensors"
-    assert payload["settings"]["seed"] == 42
+    assert "seed" not in payload["settings"]
     assert payload["fileimage_prefix"] == "runtime/output"
 
 
@@ -80,7 +80,7 @@ def test_runtime_missing_uuid_is_explicit(configured_nodes):
     assert "not available locally" in result
 
 
-def test_queued_runtime_seed_changes_seed_without_embedded_payload(configured_nodes):
+def test_legacy_queue_seed_no_longer_changes_manager_seed_output(configured_nodes):
     nodes = configured_nodes
     character = persistent_character()
     nodes._get_state_manager_store().replace([character], 0)
@@ -91,12 +91,12 @@ def test_queued_runtime_seed_changes_seed_without_embedded_payload(configured_no
         character["id"],
         character["prompts"][0]["id"],
     )
-    assert result[6] == 987654
+    assert result[6] == 0
     assert result[0]["positive_prompt"] == "runtime positive"
 
 
 @pytest.mark.parametrize("special_seed", [-1, -2, -3])
-def test_special_seed_semantics_remain_randomized(configured_nodes, special_seed):
+def test_old_special_seed_is_ignored_by_manager(configured_nodes, special_seed):
     nodes = configured_nodes
     character = persistent_character()
     character["prompts"][0]["settings"]["seed"] = special_seed
@@ -107,7 +107,8 @@ def test_special_seed_semantics_remain_randomized(configured_nodes, special_seed
         character["id"],
         character["prompts"][0]["id"],
     )
-    assert 1 <= result[6] <= nodes._STATE_SEED_MAX
+    assert result[6] == 0
+    assert "seed" not in result[0]["settings"]
 
 
 def test_two_managers_can_resolve_same_library_selection(configured_nodes):
@@ -138,6 +139,24 @@ def test_legacy_migration_keeps_an_existing_persistent_uuid_selection(configured
     )
     assert character["id"] == selected["id"]
     assert prompt["id"] == selected["prompts"][0]["id"]
+
+
+def test_fixed_live_queue_seed_prevents_random_saved_seed_cache_invalidation(configured_nodes):
+    nodes = configured_nodes
+    character = persistent_character()
+    character["prompts"][0]["settings"]["seed"] = -1
+    nodes._get_state_manager_store().replace([character], 0)
+    args = (
+        json.dumps(nodes._state_manager_default_binding()),
+        json.dumps({"__dsm_runtime_seed": 444444}),
+        character["id"],
+        character["prompts"][0]["id"],
+    )
+    first = nodes.StateManager.IS_CHANGED(*args)
+    second = nodes.StateManager.IS_CHANGED(*args)
+    assert first == second
+    assert "runtime_seed_nonce" not in json.loads(first)
+    assert nodes.StateManager().resolve_state(*args)[6] == 0
 
 
 def test_is_changed_returns_stable_marker_for_missing_preset(configured_nodes):
@@ -219,7 +238,7 @@ def test_request_local_queue_snapshot_prevents_mid_execution_library_mixing(conf
     )
     assert frozen["library_revision"] == first["revision"]
     assert frozen["payload"]["positive_prompt"] == "runtime positive"
-    assert frozen["payload"]["settings"]["seed"] == 42
+    assert "seed" not in frozen["payload"]["settings"]
 
     store.update_prompt_text_box(
         character["id"],
@@ -240,7 +259,7 @@ def test_request_local_queue_snapshot_prevents_mid_execution_library_mixing(conf
         character["prompts"][0]["id"],
     )
     assert result[0]["positive_prompt"] == "runtime positive"
-    assert result[6] == 42
+    assert result[6] == 0
 
     marker = json.loads(nodes.StateManager.IS_CHANGED(
         json.dumps(nodes._state_manager_default_binding()),
