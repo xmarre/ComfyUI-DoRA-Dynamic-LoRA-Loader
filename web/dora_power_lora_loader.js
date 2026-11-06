@@ -1283,6 +1283,21 @@ class DoraLoraRowWidget {
   }
 }
 
+// Canvas transforms map widget-local coordinates to backing-store pixels.
+// Skip cards completely outside the viewport; a tall node can be partially
+// visible while containing hundreds of offscreen report entries.
+function visibleWidgetYRange(ctx) {
+  const height = ctx?.canvas?.height;
+  const transform = ctx?.getTransform?.();
+  if (!Number.isFinite(height) || height <= 0 ||
+      !transform || !Number.isFinite(transform.d) || transform.d <= 0 ||
+      !Number.isFinite(transform.f) ||
+      Math.abs(transform.b) > 1e-8 || Math.abs(transform.c) > 1e-8) {
+    return null;
+  }
+  return { top: -transform.f / transform.d, bottom: (height - transform.f) / transform.d };
+}
+
 class DoraAutoStrengthReportWidget {
   constructor(name, parentNode) {
     this.name = name;
@@ -1308,22 +1323,35 @@ class DoraAutoStrengthReportWidget {
   }
 
   _displayRows() {
-    return this._rows().filter((row) => row && typeof row === "object");
+    // Reports are replaced on execution/clear, not modified by rendering.
+    // Share the expensive grouping/sorting across computeSize and draw calls.
+    const report = this.parentNode?._doraAutoStrengthReport;
+    if (!this._cachedRows || this._cachedReport !== report) {
+      this._cachedReport = report;
+      this._cachedRows = this._rows().filter((row) => row && typeof row === "object");
+      this._cachedLayouts = new Map();
+    }
+    return this._cachedRows;
   }
 
   _rowLayout(row) {
+    const expanded = !!this.parentNode?._doraAutoStrengthExpanded?.[row.row_index];
+    const cached = this._cachedLayouts?.get(row);
+    if (cached && cached.expanded === expanded) return cached;
+
     const analyzed = row.status === "analyzed" && Array.isArray(row.report?.logical_groups);
     const logicalGroups = analyzed ? row.report.logical_groups : [];
-    const expanded = !!this.parentNode?._doraAutoStrengthExpanded?.[row.row_index];
     const grouped = analyzed ? buildDisplayGroupSections(logicalGroups, expanded) : { groups: [], sections: [], hasMore: false };
-    return {
+    const layout = {
       analyzed,
       expanded,
-      logicalGroups,
       displayGroups: grouped.groups,
       sections: grouped.sections,
       hasMore: grouped.hasMore,
     };
+    layout.height = this._estimateRowHeight(layout);
+    this._cachedLayouts.set(row, layout);
+    return layout;
   }
 
   _estimateRowHeight(layout) {
@@ -1344,7 +1372,7 @@ class DoraAutoStrengthReportWidget {
     if (!rows.length) return [width || 320, height];
     for (const row of rows) {
       const layout = this._rowLayout(row);
-      height += this._estimateRowHeight(layout);
+      height += layout.height;
       height += 10;
     }
     return [width || 320, height];
@@ -1359,7 +1387,7 @@ class DoraAutoStrengthReportWidget {
     const cardWidth = width - HORIZ_MARGIN * 2;
     const report = this.parentNode?._doraAutoStrengthReport;
     const rows = this._displayRows();
-    const analyzedRows = rows.filter((row) => row?.status === "analyzed" && Array.isArray(row.report?.logical_groups));
+    const analyzedCount = rows.reduce((count, row) => count + (row?.status === "analyzed" && Array.isArray(row.report?.logical_groups) ? 1 : 0), 0);
 
     ctx.save();
     ctx.font = "12px Arial";
@@ -1391,16 +1419,21 @@ class DoraAutoStrengthReportWidget {
 
     const summary = [
       `rows ${rows.length}`,
-      `analyzed ${analyzedRows.length}`,
+      `analyzed ${analyzedCount}`,
       `device ${report.auto_strength_device ?? "auto"}`,
       `window ${formatNumber(report.ratio_floor, 2)}–${formatNumber(report.ratio_ceiling, 2)}`,
     ].join("  ·  ");
     ctx.fillText(summary, x + 12, posY + 40);
 
+    const visibleY = visibleWidgetYRange(ctx);
     let y = posY + 68;
     for (const row of rows) {
       const layout = this._rowLayout(row);
-      const cardHeight = this._estimateRowHeight(layout);
+      const cardHeight = layout.height;
+      if (visibleY && (y + cardHeight < visibleY.top || y > visibleY.bottom)) {
+        y += cardHeight + 10;
+        continue;
+      }
 
       drawRoundedRect(ctx, x, y, cardWidth, cardHeight, 8);
       ctx.fillStyle = "#101318";

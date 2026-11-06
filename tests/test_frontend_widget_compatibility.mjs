@@ -288,3 +288,123 @@ test("loader-owned settings debounce continuous edits while discrete slot change
     cleanup();
   }
 });
+
+function makeReportFixture(loraCount = 4, groupCount = 60) {
+  return {
+    auto_strength_device: "gpu",
+    ratio_floor: 0.5,
+    ratio_ceiling: 1.5,
+    rows: Array.from({ length: loraCount }, (_, rowIndex) => ({
+      row_index: rowIndex,
+      status: "analyzed",
+      lora_name: `test-lora-${rowIndex}.safetensors`,
+      strength_model: 1,
+      strength_clip: 1,
+      report: {
+        logical_groups: Array.from({ length: groupCount }, (_, groupIndex) => ({
+          logical_id: `model.layers.${groupIndex}.attention`,
+          ratio_applied: groupIndex % 3 === 0 ? 1.2 : groupIndex % 3 === 1 ? 0.8 : 1,
+          fanout: 1,
+        })),
+        logical_groups_measured: groupCount,
+        logical_groups_total: groupCount,
+        measured_bases: groupCount,
+        mapped_bases: groupCount,
+        ratio_floor: 0.5,
+        ratio_ceiling: 1.5,
+        analysis_load_device: "cpu",
+        cohorts: [],
+      },
+    })),
+  };
+}
+
+function makeReportCanvas(height = 10000) {
+  const labels = [];
+  const noop = () => {};
+  return {
+    labels,
+    canvas: { height },
+    getTransform() { return { b: 0, c: 0, d: 1, f: 0 }; },
+    beginPath: noop, closePath: noop, roundRect: noop,
+    arc: noop, moveTo: noop, lineTo: noop, fill: noop, stroke: noop,
+    save: noop, restore: noop,
+    fillText(text) { labels.push(String(text)); },
+    measureText(text) { return { width: String(text).length * 7 }; },
+  };
+}
+
+test("auto-strength report groups are reused across layout and redraw, invalidated on toggle and replacement", async () => {
+  const { cleanup, extension } = await loadLoaderExtension();
+  const originalSort = Array.prototype.sort;
+  try {
+    const NodeType = makeNodeType();
+    await extension.beforeRegisterNodeDef(NodeType, { name: NODE_CLASS });
+    const node = new NodeType();
+    node.onNodeCreated();
+    await new Promise((resolve) => setImmediate(resolve));
+    const reportWidget = node.widgets.find((widget) => widget.name === "auto_strength_visualization");
+    const report = makeReportFixture();
+    node._doraAutoStrengthReport = report;
+    node._doraAutoStrengthExpanded = {};
+    let sortCount = 0;
+    Array.prototype.sort = function (...args) {
+      sortCount += 1;
+      return originalSort.apply(this, args);
+    };
+
+    const initialHeight = reportWidget.computeSize(360)[1];
+    const firstSorts = sortCount;
+    assert.ok(firstSorts >= report.rows.length, "first layout must group the logical projections");
+    const context = makeReportCanvas();
+    for (let i = 0; i < 8; i++) {
+      assert.equal(reportWidget.computeSize(360)[1], initialHeight);
+      reportWidget.draw(context, node, 360, 0, initialHeight);
+    }
+    assert.equal(sortCount, firstSorts, "redrawing unchanged analysis must not regroup logical projections");
+
+    // Row header click expands the report; only that row should be recomputed.
+    assert.equal(reportWidget.mouse({ type: "pointerdown" }, [25, 90]), true);
+    const expandedHeight = reportWidget.computeSize(360)[1];
+    assert.ok(expandedHeight > initialHeight);
+    assert.equal(sortCount, firstSorts + 4, "expanding one row regroups only that row");
+    reportWidget.draw(context, node, 360, 0, expandedHeight);
+    assert.equal(sortCount, firstSorts + 4);
+
+    node._doraAutoStrengthReport = makeReportFixture(2, 20);
+    const replacedHeight = reportWidget.computeSize(360)[1];
+    assert.ok(replacedHeight > 0 && replacedHeight < expandedHeight);
+    assert.equal(sortCount, firstSorts + 4 + 8, "replacement report must rebuild both row layouts");
+  } finally {
+    Array.prototype.sort = originalSort;
+    cleanup();
+  }
+});
+
+test("auto-strength report skips offscreen card painting without changing layout height", async () => {
+  const { cleanup, extension } = await loadLoaderExtension();
+  try {
+    const NodeType = makeNodeType();
+    await extension.beforeRegisterNodeDef(NodeType, { name: NODE_CLASS });
+    const node = new NodeType();
+    node.onNodeCreated();
+    const reportWidget = node.widgets.find((widget) => widget.name === "auto_strength_visualization");
+    node._doraAutoStrengthReport = makeReportFixture(12, 60);
+    node._doraAutoStrengthExpanded = {};
+    const height = reportWidget.computeSize(360)[1];
+
+    const context = makeReportCanvas(180);
+    reportWidget.draw(context, node, 360, 0, height);
+    assert.ok(context.labels.some((v) => v.includes("test-lora-0.safetensors")));
+    assert.ok(!context.labels.some((v) => v.includes("test-lora-1.safetensors")));
+    assert.equal(reportWidget.hitAreas.length, 1, "only visible row headers should be interactive");
+
+    const allRowsContext = makeReportCanvas();
+    delete allRowsContext.getTransform;
+    reportWidget.draw(allRowsContext, node, 360, 0, height);
+    assert.equal(reportWidget.hitAreas.length, 12, "unsupported transforms fall back to full rendering");
+    assert.ok(allRowsContext.labels.some((v) => v.includes("test-lora-11.safetensors")));
+  } finally {
+    cleanup();
+  }
+});
