@@ -399,6 +399,13 @@ test("auto-strength report skips offscreen card painting without changing layout
     assert.ok(!context.labels.some((v) => v.includes("test-lora-1.safetensors")));
     assert.equal(reportWidget.hitAreas.length, 1, "only visible row headers should be interactive");
 
+    node._doraAutoStrengthExpanded[0] = true;
+    const expandedHeight = reportWidget.computeSize(360)[1];
+    const expandedContext = makeReportCanvas(180);
+    reportWidget.draw(expandedContext, node, 360, 0, expandedHeight);
+    assert.ok(expandedContext.labels.length < 30, "expanded cards must not paint offscreen logical-group bars");
+    assert.equal(reportWidget.hitAreas.length, 1);
+
     const allRowsContext = makeReportCanvas();
     delete allRowsContext.getTransform;
     reportWidget.draw(allRowsContext, node, 360, 0, height);

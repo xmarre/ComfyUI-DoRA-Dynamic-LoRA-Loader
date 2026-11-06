@@ -1528,6 +1528,12 @@ class DoraAutoStrengthReportWidget {
 
         ctx.font = "11px Arial";
         for (const item of section.items) {
+          // Expanded cards may contain thousands of group bars. Advance
+          // layout for hidden entries without painting or measuring text.
+          if (visibleY && (rowY + 8 < visibleY.top || rowY - 8 > visibleY.bottom)) {
+            rowY += 20;
+            continue;
+          }
           const ratio = toFiniteNumberOrNull(item?.ratio_applied);
           const validRatio = ratio !== null;
           const ratioText = validRatio ? `${ratio.toFixed(2)}×` : "global";
