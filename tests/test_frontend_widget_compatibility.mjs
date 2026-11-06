@@ -457,8 +457,9 @@ test("auto-strength report bounds the Vue legacy canvas backing bitmap regardles
     assert.equal(widget.mouse({ type: "pointerdown" }, [25, 84]), true);
     const expandedHeight = widget.computeSize(width)[1];
     assert.ok(expandedHeight < 550, "expansion must not make the report canvas grow with logical-group count");
-    // Current WidgetLegacy.vue allocates width*2 × (height+2)*2 backing pixels on draw.
-    const maxBackingPixels = (width * 2) * ((expandedHeight + 2) * 2);
+    assert.equal(widget.computedHeight, expandedHeight + 4, "Vue must receive updated report geometry");
+    // Current WidgetLegacy.vue prefers computedHeight and allocates 2× backing pixels.
+    const maxBackingPixels = (width * 2) * ((widget.computedHeight + 2) * 2);
     assert.ok(maxBackingPixels < 800_000, "legacy backing-store allocation must remain bounded");
 
     const detailContext = makeReportCanvas();
@@ -478,7 +479,8 @@ test("auto-strength report bounds the Vue legacy canvas backing bitmap regardles
     // A report replacement resets selection, including stale per-row page indexes.
     node._doraAutoStrengthReport = makeReportFixture(2, 6);
     node._doraAutoStrengthExpanded = {};
-    widget.computeSize(width);
+    const replacementHeight = widget.computeSize(width)[1];
+    assert.equal(widget.computedHeight, replacementHeight + 4);
     assert.equal(widget._reportPage, 0);
     assert.equal(widget._groupPages.size, 0);
   } finally {

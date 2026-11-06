@@ -1420,12 +1420,14 @@ class DoraAutoStrengthReportWidget {
   computeSize(width) {
     const rows = this._visibleRows();
     let height = 72;
-    if (!rows.length) return [width || 320, height];
     for (const row of rows) {
       const layout = this._rowLayout(row);
       height += layout.height;
       height += 10;
     }
+    // WidgetLegacy prioritizes computedHeight over computeSize. Refresh the
+    // value when report paging changes instead of drawing into stale geometry.
+    this.computedHeight = height + 4;
     return [width || 320, height];
   }
 
