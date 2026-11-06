@@ -1395,9 +1395,6 @@ class DoraAutoStrengthReportWidget {
       displayGroups: grouped.groups,
       sections: paged?.sections ?? grouped.sections,
       hasMore: grouped.hasMore && !expanded,
-      cohortNames: Array.isArray(row.report?.cohorts)
-        ? row.report.cohorts.map((cohort) => `${cohort.group}/${cohort.family}`).join("  ·  ")
-        : "",
     };
     layout.height = this._estimateRowHeight(layout);
     this._cachedLayouts.set(row, layout);
@@ -1585,7 +1582,10 @@ class DoraAutoStrengthReportWidget {
       ].join("  ·  ");
       ctx.fillText(fitText(ctx, topLine, cardWidth - 24), x + 12, y + 48);
 
-      ctx.fillText(fitText(ctx, layout.cohortNames, cardWidth - 24), x + 12, y + 66);
+      const cohortNames = Array.isArray(row.report?.cohorts)
+        ? row.report.cohorts.map((cohort) => `${cohort.group}/${cohort.family}`).join("  ·  ")
+        : "";
+      ctx.fillText(fitText(ctx, cohortNames, cardWidth - 24), x + 12, y + 66);
 
       let rowY = y + 88;
       ctx.font = "bold 11px Arial";

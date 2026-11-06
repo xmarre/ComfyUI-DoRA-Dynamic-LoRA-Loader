@@ -1,0 +1,62 @@
+# Temporary preflight for the active PR overlay sequence. Removed after verification.
+name: PR overlay stack preflight
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  patcher-stack:
+    if: github.event.pull_request.number == 86
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the integration repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Apply PR 74, 85, 86 in Patcher order
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            +refs/pull/74/head:refs/patcher-test/pr74 \
+            +refs/pull/85/head:refs/patcher-test/pr85 \
+            +refs/pull/86/head:refs/patcher-test/pr86
+          git switch --detach refs/remotes/origin/main
+          for pr in 74 85 86; do
+            # Mirrors Patcher: diff from the PR branch point, not the current stack.
+            branch_point="$(git merge-base refs/remotes/origin/main "refs/patcher-test/pr${pr}")"
+            patch="${RUNNER_TEMP}/overlay-pr${pr}.patch"
+            git diff --binary --full-index --find-renames \
+              "${branch_point}" "refs/patcher-test/pr${pr}" -- > "${patch}"
+            git apply --3way --index -- "${patch}"
+            git -c user.name='ComfyUI Patcher CI' \
+              -c user.email='patcher-ci@local.invalid' \
+              commit --no-verify --allow-empty -m "Apply PR #${pr} overlay"
+          done
+          test -z "$(git diff --name-only --diff-filter=U)"
+          grep -Fq 'auto_strength_residual_beta' web/dora_power_lora_loader.js
+          grep -Fq 'cohort.semantic_role' web/dora_power_lora_loader.js
+          grep -Fq 'REPORT_GROUP_PAGE_SIZE' web/dora_power_lora_loader.js
+          grep -Fq 'fitText(ctx, cohortNames' web/dora_power_lora_loader.js
+
+      - name: Validate combined source and frontend regressions
+        shell: bash
+        run: |
+          node --check web/dora_power_lora_loader.js
+          node --check web/dora_state_manager.js
+          node --test \
+            tests/test_frontend_state_persistence.mjs \
+            tests/test_frontend_widget_compatibility.mjs \
+            tests/test_state_manager_frontend.mjs \
+            tests/test_state_manager_distribution_safe_frontend.mjs
