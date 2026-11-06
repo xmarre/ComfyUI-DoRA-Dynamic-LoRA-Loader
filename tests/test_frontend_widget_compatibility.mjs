@@ -373,7 +373,7 @@ test("auto-strength report groups are reused across layout and redraw, invalidat
 
     node._doraAutoStrengthReport = makeReportFixture(2, 20);
     const replacedHeight = reportWidget.computeSize(360)[1];
-    assert.ok(replacedHeight > 0 && replacedHeight < expandedHeight);
+    assert.ok(replacedHeight > 0 && replacedHeight < 550, "replacement must keep the fixed report canvas budget");
     assert.equal(sortCount, firstSorts + 4 + 4, "replacement report must rebuild only its first visible row");
   } finally {
     Array.prototype.sort = originalSort;
