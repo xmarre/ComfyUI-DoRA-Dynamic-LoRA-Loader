@@ -374,7 +374,7 @@ test("auto-strength report groups are reused across layout and redraw, invalidat
     node._doraAutoStrengthReport = makeReportFixture(2, 20);
     const replacedHeight = reportWidget.computeSize(360)[1];
     assert.ok(replacedHeight > 0 && replacedHeight < expandedHeight);
-    assert.equal(sortCount, firstSorts + 4 + 8, "replacement report must rebuild both row layouts");
+    assert.equal(sortCount, firstSorts + 4 + 4, "replacement report must rebuild only its first visible row");
   } finally {
     Array.prototype.sort = originalSort;
     cleanup();
@@ -409,8 +409,78 @@ test("auto-strength report skips offscreen card painting without changing layout
     const allRowsContext = makeReportCanvas();
     delete allRowsContext.getTransform;
     reportWidget.draw(allRowsContext, node, 360, 0, height);
-    assert.equal(reportWidget.hitAreas.length, 12, "unsupported transforms fall back to full rendering");
+    assert.equal(reportWidget.hitAreas.length, 1, "even without a usable transform, only one LoRA card is drawn");
+    assert.ok(!allRowsContext.labels.some((v) => v.includes("test-lora-11.safetensors")));
+
+    // The remaining rows must remain accessible, not dropped from the report.
+    for (let index = 1; index < 12; index++) {
+      assert.equal(reportWidget.mouse({ type: "pointerdown" }, [327, 20]), true);
+      reportWidget.draw(allRowsContext, node, 360, 0, reportWidget.computeSize(360)[1]);
+    }
+    assert.equal(reportWidget._reportPage, 11);
     assert.ok(allRowsContext.labels.some((v) => v.includes("test-lora-11.safetensors")));
+  } finally {
+    cleanup();
+  }
+});
+
+
+test("auto-strength report bounds the Vue legacy canvas backing bitmap regardless of report size", async () => {
+  const { cleanup, extension } = await loadLoaderExtension();
+  try {
+    const NodeType = makeNodeType();
+    await extension.beforeRegisterNodeDef(NodeType, { name: NODE_CLASS });
+    const node = new NodeType();
+    node.onNodeCreated();
+    const widget = node.widgets.find((item) => item.name === "auto_strength_visualization");
+    const report = makeReportFixture(48, 480);
+    report.rows[0].report.cohorts = Array.from({ length: 800 }, (_, i) => ({
+      group: `very-long-cohort-name-${i}`, family: "linear",
+    }));
+    node._doraAutoStrengthReport = report;
+    node._doraAutoStrengthExpanded = {};
+
+    const width = 360;
+    const collapsedHeight = widget.computeSize(width)[1];
+    assert.ok(collapsedHeight < 400, "48-row collapsed report must not increase the canvas backing height");
+
+    const context = makeReportCanvas();
+    let measures = 0;
+    const originalMeasureText = context.measureText;
+    context.measureText = (text) => {
+      measures += 1;
+      return originalMeasureText(text);
+    };
+    widget.draw(context, node, width, 0, collapsedHeight);
+    assert.ok(measures < 200, "long cohort labels must be truncated with logarithmic text measurement");
+
+    assert.equal(widget.mouse({ type: "pointerdown" }, [25, 84]), true);
+    const expandedHeight = widget.computeSize(width)[1];
+    assert.ok(expandedHeight < 550, "expansion must not make the report canvas grow with logical-group count");
+    // Current WidgetLegacy.vue allocates width*2 × (height+2)*2 backing pixels on draw.
+    const maxBackingPixels = (width * 2) * ((expandedHeight + 2) * 2);
+    assert.ok(maxBackingPixels < 800_000, "legacy backing-store allocation must remain bounded");
+
+    const detailContext = makeReportCanvas();
+    widget.draw(detailContext, node, width, 0, expandedHeight);
+    assert.ok(detailContext.labels.some((v) => v.includes("Groups 1/")));
+    assert.equal(widget.groupNavAreas.length, 2);
+    const firstPage = widget._rowLayout(report.rows[0]);
+    assert.ok(firstPage.sections.reduce((n, section) => n + section.items.length, 0) <= 12);
+
+    const next = widget.groupNavAreas.find((area) => area.direction === 1);
+    assert.ok(next);
+    assert.equal(widget.mouse({ type: "pointerdown" }, [next.x + 10, next.y + 10]), true);
+    widget.draw(detailContext, node, width, 0, widget.computeSize(width)[1]);
+    assert.ok(detailContext.labels.some((v) => v.includes("Groups 2/")));
+    assert.equal(widget._rowLayout(report.rows[0]).groupPage, 1);
+
+    // A report replacement resets selection, including stale per-row page indexes.
+    node._doraAutoStrengthReport = makeReportFixture(2, 6);
+    node._doraAutoStrengthExpanded = {};
+    widget.computeSize(width);
+    assert.equal(widget._reportPage, 0);
+    assert.equal(widget._groupPages.size, 0);
   } finally {
     cleanup();
   }

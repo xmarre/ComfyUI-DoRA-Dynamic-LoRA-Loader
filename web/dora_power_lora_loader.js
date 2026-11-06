@@ -130,11 +130,17 @@ function fitText(ctx, text, maxWidth) {
   const s = String(text ?? "");
   if (maxWidth <= 8 || !s) return "";
   if (ctx.measureText(s).width <= maxWidth) return s;
-  let out = s;
-  while (out.length > 3 && ctx.measureText(`${out}…`).width > maxWidth) {
-    out = out.slice(0, -1);
+  // A linear truncation loop is quadratic in text length because each
+  // measureText() scans a shorter prefix. Long cohort descriptions are common.
+  if (ctx.measureText("…").width > maxWidth) return "";
+  let low = 0;
+  let high = s.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (ctx.measureText(`${s.slice(0, mid)}…`).width <= maxWidth) low = mid;
+    else high = mid - 1;
   }
-  return out.length ? `${out}…` : "";
+  return `${s.slice(0, low)}…`;
 }
 
 function syncNodeHeightToContent(node) {
@@ -152,6 +158,7 @@ function syncNodeHeightToContent(node) {
 }
 
 const DISPLAY_GROUP_LIMIT = 3;
+const REPORT_GROUP_PAGE_SIZE = 12;
 const DISPLAY_RATIO_EPS = 1e-3;
 const CLASSIC_DISPLAY_PREFIXES = [
   "lora_unet_",
@@ -345,6 +352,27 @@ function buildDisplayGroupSections(logicalGroups, expanded) {
     sections,
     hasMore: !expanded && sections.some((section) => section.visibleCount < section.totalCount),
   };
+}
+
+function paginateDisplaySections(sections, requestedPage) {
+  const count = sections.reduce((sum, section) => sum + section.items.length, 0);
+  const pageCount = Math.max(1, Math.ceil(count / REPORT_GROUP_PAGE_SIZE));
+  const page = clamp(Number(requestedPage) || 0, 0, pageCount - 1);
+  let skip = page * REPORT_GROUP_PAGE_SIZE;
+  let remaining = REPORT_GROUP_PAGE_SIZE;
+  const visible = [];
+  for (const section of sections) {
+    if (skip >= section.items.length) {
+      skip -= section.items.length;
+      continue;
+    }
+    const items = section.items.slice(skip, skip + remaining);
+    if (items.length) visible.push({ ...section, items, visibleCount: items.length });
+    remaining -= items.length;
+    skip = 0;
+    if (remaining === 0) break;
+  }
+  return { sections: visible, page, pageCount };
 }
 
 function parseExecutionOutputValue(output, key) {
@@ -1311,6 +1339,10 @@ class DoraAutoStrengthReportWidget {
     this.last_y = 0;
     this.hitAreas = [];
     this.hoverAreas = [];
+    this.pageNavAreas = [];
+    this.groupNavAreas = [];
+    this._reportPage = 0;
+    this._groupPages = new Map();
   }
 
   serializeValue() {
@@ -1330,24 +1362,42 @@ class DoraAutoStrengthReportWidget {
       this._cachedReport = report;
       this._cachedRows = this._rows().filter((row) => row && typeof row === "object");
       this._cachedLayouts = new Map();
+      this._reportPage = 0;
+      this._groupPages = new Map();
+      this._analyzedCount = this._cachedRows.reduce((count, row) =>
+        count + (row?.status === "analyzed" && Array.isArray(row.report?.logical_groups) ? 1 : 0), 0);
     }
     return this._cachedRows;
   }
 
+  _visibleRows() {
+    const rows = this._displayRows();
+    this._reportPage = clamp(this._reportPage, 0, Math.max(0, rows.length - 1));
+    return rows.slice(this._reportPage, this._reportPage + 1);
+  }
+
   _rowLayout(row) {
     const expanded = !!this.parentNode?._doraAutoStrengthExpanded?.[row.row_index];
+    const requestedPage = expanded ? (this._groupPages.get(row.row_index) || 0) : 0;
     const cached = this._cachedLayouts?.get(row);
-    if (cached && cached.expanded === expanded) return cached;
+    if (cached && cached.expanded === expanded && cached.requestedPage === requestedPage) return cached;
 
     const analyzed = row.status === "analyzed" && Array.isArray(row.report?.logical_groups);
     const logicalGroups = analyzed ? row.report.logical_groups : [];
     const grouped = analyzed ? buildDisplayGroupSections(logicalGroups, expanded) : { groups: [], sections: [], hasMore: false };
+    const paged = expanded ? paginateDisplaySections(grouped.sections, requestedPage) : null;
     const layout = {
       analyzed,
       expanded,
+      requestedPage,
+      groupPage: paged?.page ?? 0,
+      groupPages: paged?.pageCount ?? 1,
       displayGroups: grouped.groups,
-      sections: grouped.sections,
-      hasMore: grouped.hasMore,
+      sections: paged?.sections ?? grouped.sections,
+      hasMore: grouped.hasMore && !expanded,
+      cohortNames: Array.isArray(row.report?.cohorts)
+        ? row.report.cohorts.map((cohort) => `${cohort.group}/${cohort.family}`).join("  ·  ")
+        : "",
     };
     layout.height = this._estimateRowHeight(layout);
     this._cachedLayouts.set(row, layout);
@@ -1363,11 +1413,12 @@ class DoraAutoStrengthReportWidget {
       if (section.items.length) height += 6;
     }
     if (layout.hasMore) height += 18;
+    if (layout.expanded && layout.groupPages > 1) height += 24;
     return height;
   }
 
   computeSize(width) {
-    const rows = this._displayRows();
+    const rows = this._visibleRows();
     let height = 72;
     if (!rows.length) return [width || 320, height];
     for (const row of rows) {
@@ -1382,12 +1433,15 @@ class DoraAutoStrengthReportWidget {
     this.last_y = posY;
     this.hitAreas = [];
     this.hoverAreas = [];
+    this.pageNavAreas = [];
+    this.groupNavAreas = [];
     const colors = getThemeColors();
     const x = HORIZ_MARGIN;
     const cardWidth = width - HORIZ_MARGIN * 2;
     const report = this.parentNode?._doraAutoStrengthReport;
-    const rows = this._displayRows();
-    const analyzedCount = rows.reduce((count, row) => count + (row?.status === "analyzed" && Array.isArray(row.report?.logical_groups) ? 1 : 0), 0);
+    const allRows = this._displayRows();
+    const rows = this._visibleRows();
+    const analyzedCount = this._analyzedCount || 0;
 
     ctx.save();
     ctx.font = "12px Arial";
@@ -1404,6 +1458,25 @@ class DoraAutoStrengthReportWidget {
     ctx.textAlign = "left";
     ctx.fillText("Auto-strength analysis", x + 12, posY + 20);
 
+    if (allRows.length > 1) {
+      const leftX = x + cardWidth - 94;
+      const rightX = x + cardWidth - 26;
+      ctx.font = "bold 15px Arial";
+      ctx.textAlign = "center";
+      ctx.fillStyle = this._reportPage > 0 ? colors.text : colors.secondary;
+      ctx.fillText("‹", leftX + 10, posY + 20);
+      ctx.fillStyle = this._reportPage < allRows.length - 1 ? colors.text : colors.secondary;
+      ctx.fillText("›", rightX + 10, posY + 20);
+      ctx.font = "11px Arial";
+      ctx.fillStyle = colors.secondary;
+      ctx.fillText(`${this._reportPage + 1}/${allRows.length}`, x + cardWidth - 51, posY + 20);
+      ctx.textAlign = "left";
+      this.pageNavAreas = [
+        { x: leftX, y: posY + 8, w: 20, h: 24, direction: -1 },
+        { x: rightX, y: posY + 8, w: 20, h: 24, direction: 1 },
+      ];
+    }
+
     ctx.font = "11px Arial";
     ctx.fillStyle = colors.secondary;
     if (!report) {
@@ -1418,7 +1491,7 @@ class DoraAutoStrengthReportWidget {
     }
 
     const summary = [
-      `rows ${rows.length}`,
+      `rows ${allRows.length}`,
       `analyzed ${analyzedCount}`,
       `device ${report.auto_strength_device ?? "auto"}`,
       `window ${formatNumber(report.ratio_floor, 2)}–${formatNumber(report.ratio_ceiling, 2)}`,
@@ -1510,10 +1583,7 @@ class DoraAutoStrengthReportWidget {
       ].join("  ·  ");
       ctx.fillText(fitText(ctx, topLine, cardWidth - 24), x + 12, y + 48);
 
-      const cohortNames = Array.isArray(row.report?.cohorts)
-        ? row.report.cohorts.map((cohort) => `${cohort.group}/${cohort.family}`).join("  ·  ")
-        : "";
-      ctx.fillText(fitText(ctx, cohortNames, cardWidth - 24), x + 12, y + 66);
+      ctx.fillText(fitText(ctx, layout.cohortNames, cardWidth - 24), x + 12, y + 66);
 
       let rowY = y + 88;
       ctx.font = "bold 11px Arial";
@@ -1593,7 +1663,23 @@ class DoraAutoStrengthReportWidget {
       if (layout.hasMore) {
         ctx.textAlign = "left";
         ctx.fillStyle = colors.secondary;
-        ctx.fillText(`click header to ${layout.expanded ? "collapse" : `expand all ${displayGroups.length}`} display groups`, x + 12, rowY + 2);
+        ctx.fillText(`click header to explore all ${displayGroups.length} display groups`, x + 12, rowY + 2);
+      }
+      if (layout.expanded && layout.groupPages > 1) {
+        const footerY = y + cardHeight - 13;
+        const leftX = x + cardWidth - 80;
+        const rightX = x + cardWidth - 27;
+        ctx.fillStyle = colors.secondary;
+        ctx.textAlign = "left";
+        ctx.fillText(`Groups ${layout.groupPage + 1}/${layout.groupPages}`, x + 12, footerY);
+        ctx.textAlign = "center";
+        ctx.fillText("‹", leftX + 10, footerY);
+        ctx.fillText("›", rightX + 10, footerY);
+        ctx.textAlign = "left";
+        this.groupNavAreas = [
+          { x: leftX, y: footerY - 12, w: 20, h: 22, direction: -1, rowIndex: row.row_index, page: layout.groupPage, pages: layout.groupPages },
+          { x: rightX, y: footerY - 12, w: 20, h: 22, direction: 1, rowIndex: row.row_index, page: layout.groupPage, pages: layout.groupPages },
+        ];
       }
 
       y += cardHeight + 10;
@@ -1623,12 +1709,38 @@ class DoraAutoStrengthReportWidget {
     if (event.type !== "pointerdown") return false;
     const mx = pos[0];
     const my = pos[1];
+    for (const hit of this.pageNavAreas) {
+      if (mx >= hit.x && mx <= hit.x + hit.w && my >= hit.y && my <= hit.y + hit.h) {
+        const next = clamp(this._reportPage + hit.direction, 0, this._displayRows().length - 1);
+        if (next !== this._reportPage) {
+          this._reportPage = next;
+          syncNodeHeightToContent(this.parentNode);
+          this.triggerDraw?.();
+          this.parentNode.setDirtyCanvas?.(true, true);
+        }
+        return true;
+      }
+    }
+    for (const hit of this.groupNavAreas) {
+      if (mx >= hit.x && mx <= hit.x + hit.w && my >= hit.y && my <= hit.y + hit.h) {
+        const next = clamp(hit.page + hit.direction, 0, hit.pages - 1);
+        if (next !== hit.page) {
+          this._groupPages.set(hit.rowIndex, next);
+          syncNodeHeightToContent(this.parentNode);
+          this.triggerDraw?.();
+          this.parentNode.setDirtyCanvas?.(true, true);
+        }
+        return true;
+      }
+    }
     for (const hit of this.hitAreas) {
       if (mx >= hit.x && mx <= hit.x + hit.w && my >= hit.y && my <= hit.y + hit.h) {
         if (!hit.toggleable) return true;
         const expanded = this.parentNode._doraAutoStrengthExpanded || (this.parentNode._doraAutoStrengthExpanded = {});
         expanded[hit.rowIndex] = !expanded[hit.rowIndex];
+        this._groupPages.delete(hit.rowIndex);
         syncNodeHeightToContent(this.parentNode);
+        this.triggerDraw?.();
         this.parentNode.setDirtyCanvas?.(true, true);
         return true;
       }
