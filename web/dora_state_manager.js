@@ -5667,8 +5667,13 @@ function mutatePromptForStateSeedNode(promptPayload, node) {
     const workflowNode = findWorkflowNodeForStateSeed(promptPayload, node, promptId);
     const seedWidget = getStateSeedWidget(node);
     const seedWidgetIndex = seedWidget ? (node.widgets || []).indexOf(seedWidget) : 0;
-    if (workflowNode && Array.isArray(workflowNode.widgets_values) && seedWidgetIndex >= 0) {
-      workflowNode.widgets_values[seedWidgetIndex] = seedToUse;
+    if (workflowNode) {
+      if (Array.isArray(workflowNode.widgets_values) && seedWidgetIndex >= 0) {
+        workflowNode.widgets_values[seedWidgetIndex] = seedToUse;
+      }
+      if (workflowNode.widgets_values_named && typeof workflowNode.widgets_values_named === "object") {
+        workflowNode.widgets_values_named.seed = seedToUse;
+      }
     }
 
     changed = true;
@@ -5734,6 +5739,23 @@ function initializeStateSeedNode(node) {
   });
 }
 
+// Older queued workflow snapshots updated the positional value but left the named
+// value at -1/-2/-3. Newer ComfyUI frontends restore named values by default.
+function recoverLegacyQueuedStateSeed(node, serializedNode) {
+  const seedWidget = getStateSeedWidget(node);
+  const index = (node?.widgets || []).indexOf(seedWidget);
+  const namedSeed = serializedNode?.widgets_values_named?.seed;
+  const positionalSeed = index >= 0 && Array.isArray(serializedNode?.widgets_values)
+    ? serializedNode.widgets_values[index]
+    : undefined;
+  if (!seedWidget || !STATE_SEED_SPECIALS.includes(namedSeed)
+    || !Number.isSafeInteger(positionalSeed) || positionalSeed < 0 || positionalSeed > STATE_SEED_MAX
+    || normalizeSeedInteger(seedWidget.value, STATE_SEED_RANDOM) !== namedSeed) {
+    return false;
+  }
+  return setStateSeedWidgetValue(node, positionalSeed);
+}
+
 function patchStateSeedNodeDef(nodeType) {
   if (nodeType.prototype.__dsmStateSeedPatched) return;
   nodeType.prototype.__dsmStateSeedPatched = true;
@@ -5748,9 +5770,10 @@ function patchStateSeedNodeDef(nodeType) {
   };
 
   const originalOnConfigure = nodeType.prototype.onConfigure;
-  nodeType.prototype.onConfigure = function () {
+  nodeType.prototype.onConfigure = function (serializedNode) {
     const result = originalOnConfigure?.apply(this, arguments);
     initializeStateSeedNode(this);
+    recoverLegacyQueuedStateSeed(this, serializedNode);
     return result;
   };
 }
